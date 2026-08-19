@@ -40,7 +40,7 @@ sage remove nginx
 ```
 
 ### `sage rebuild`
-**Declarative System Reconcile**: Compares `/etc/distro/system.toml` against active LMDB state. Performs atomic swaps of core virtual providers (`virtual/init`, `virtual/udev`) and automatically re-generates all native daemon service scripts.
+**Declarative System Reconcile**: Compares `/etc/sage/system.toml` against active LMDB state. Performs atomic swaps of core virtual providers (`virtual/init`, `virtual/udev`) and automatically re-generates all native daemon service scripts.
 ```bash
 # Preview what rebuild would change
 sage rebuild --dry-run
@@ -56,8 +56,8 @@ Manages multi-layer Channel sources, scopes, and priorities.
 sage channel list
 
 # Add a remote channel repository
-sage channel add core https://pkg.distro.org/core --scope system --priority 100
-sage channel add rust-nightly https://pkg.distro.org/rust --scope toolchain --priority 50
+sage channel add core https://pkg.sage-linux.org/core --scope system --priority 100
+sage channel add rust-nightly https://pkg.sage-linux.org/rust --scope toolchain --priority 50
 
 # Sync channel metadata indexes
 sage channel sync

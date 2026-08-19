@@ -15,7 +15,7 @@ Usage: sage [OPTIONS] <COMMAND> [ARGS...]
 Commands:
   install <PKG...>         Install packages via PubGrub SAT solver & unpack archive
   remove <PKG...>          Remove installed package files and unregister state
-  rebuild                  Declarative reconcile (/etc/distro/system.toml vs LMDB)
+  rebuild                  Declarative reconcile (/etc/sage/system.toml vs LMDB)
   channel [COMMAND]        Manage multi-layer channels (list, add, sync)
   query [COMMAND]          Query packages, file ownership, and manifests (nanosecond LMDB)
   service [COMMAND]        Inspect and generate native init scripts (OpenRC/Runit/Systemd/Dinit/s6)
@@ -151,10 +151,10 @@ int cmd_query(int argc, char** argv) {
     }
 
     std::string sub = argv[2];
-    auto db_res = sage::db::Database::open("/var/lib/distro/data.mdb", true);
+    auto db_res = sage::db::Database::open("/var/lib/sage/data.mdb", true);
     if (!db_res) {
         // Fallback for unprivileged queries or new environments
-        sage::util::log_warn("Database at /var/lib/distro/data.mdb not yet initialized or inaccessible: {}", db_res.error());
+        sage::util::log_warn("Database at /var/lib/sage/data.mdb not yet initialized or inaccessible: {}", db_res.error());
         return 0;
     }
     auto& db = *db_res;
@@ -212,9 +212,9 @@ int cmd_service(int argc, char** argv) {
 
 int cmd_channel(int argc, char** argv) {
     if (argc < 3 || std::string_view(argv[2]) == "list") {
-        auto cfg = sage::config::SystemConfig::load_or_default("/etc/distro/system.toml");
+        auto cfg = sage::config::SystemConfig::load_or_default("/etc/sage");
         if (!cfg) {
-            sage::util::log_error("Failed to load configuration: {}", cfg.error());
+            sage::util::log_error("Failed to load /etc/sage configuration: {}", cfg.error());
             return 1;
         }
         std::println("Configured Channels:");
@@ -296,9 +296,9 @@ int cmd_rebuild(int argc, char** argv) {
         if (std::string_view(argv[i]) == "--dry-run") dry_run = true;
     }
 
-    auto cfg_res = sage::config::SystemConfig::load_or_default("/etc/distro/system.toml");
+    auto cfg_res = sage::config::SystemConfig::load_or_default("/etc/sage");
     if (!cfg_res) {
-        sage::util::log_error("Failed to load /etc/distro/system.toml: {}", cfg_res.error());
+        sage::util::log_error("Failed to load /etc/sage configuration: {}", cfg_res.error());
         return 1;
     }
 

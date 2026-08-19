@@ -18,17 +18,17 @@ Designed for absolute user control, radical simplicity, and microsecond-level ex
   - Core system structural components (`virtual/init`, `virtual/udev`, `virtual/libc`) are fully swappable.
   - Natural coexisting components (Linux Kernels, Shells, Awk, Core utilities) are managed as pure, independent packages.
 * **🔄 Declarative System Reconcile (`sage rebuild`)**:
-  - Automatically compares `/etc/distro/system.toml` against active LMDB state.
+  - Automatically compares `/etc/sage/system.toml` against active LMDB state.
   - Performs atomic package swaps (e.g., swapping `systemd` with `openrc` + `eudev`).
   - Automatically re-generates native service configurations for all installed daemons.
 * **🔌 Universal Service Specification (`service.toml`)**:
   - Package daemons are declared with a single init-agnostic spec, auto-compiled into **OpenRC**, **Runit**, **Systemd**, **Dinit**, or **s6** scripts.
-* **🧩 Native C++20 PubGrub / CDCL SAT Dependency Solver**:
+* **🧩 Native C++23 PubGrub / CDCL SAT Dependency Solver**:
   - Zero external solver dependencies.
   - Generates clear, human-readable conflict diagnostic cause trees.
-* **🛡️ 100% C++20 Modules & RAII Memory Safety**:
-  - Fully modular `.cppm` architecture with zero header pollution.
-  - Dynamic linking against system shared libraries (`liblmdb`, `libzstd`, `libtomlplusplus`).
+* **🛡️ 100% C++23 Modules & RAII Memory Safety**:
+  - Fully modular `.cppm` architecture with zero header pollution (`import std;`).
+  - Dynamic linking against system shared libraries (`liblmdb`, `libzstd`, `libtomlplusplus`, `libcurl`).
 
 ---
 
@@ -36,12 +36,12 @@ Designed for absolute user control, radical simplicity, and microsecond-level ex
 
 ```
 sage
- ├── 状态引擎: LMDB (零拷贝 mmap B+ 树，微秒级读写，Copy-on-Write ACID 事务)
- ├── 归档引擎: libzstd + 原生 C++20 流式 Tar 解包与打包器 (无 libarchive 依赖)
- ├── 求解引擎: 自研 C++20 PubGrub / CDCL SAT 依赖求解器 (顶级因果树报错)
+ ├── 状态引擎: LMDB (零拷贝 mmap B+ 树，/var/lib/sage/data.mdb，微秒级读写)
+ ├── 归档引擎: libzstd + 原生 C++23 流式 Tar 解包与打包器 (无 libarchive 依赖)
+ ├── 求解引擎: 自研 C++23 PubGrub / CDCL SAT 依赖求解器 (顶级因果树诊断)
  ├── 服务体系: 通用 service.toml -> OpenRC / Runit / Systemd / Dinit / s6 自动生成
  ├── 抽象收敛: 精简虚拟提供者 virtual/init, virtual/udev, virtual/libc
- └── 系统重构: sage rebuild 自动基于 system.toml 执行原子大件迁移与服务重构
+ └── 系统重构: sage rebuild 自动基于 /etc/sage/system.toml 执行原子大件迁移与服务重构
 ```
 
 ---
@@ -50,8 +50,8 @@ sage
 
 ### Requirements
 * **xmake** (>= 2.8.0)
-* **GCC** (>= 11.0 with C++20 modules) or **Clang** (>= 14.0)
-* Dynamic system libraries: `liblmdb`, `libzstd`, `libtomlplusplus`
+* **GCC** (>= 14.0 / 15.0 with C++23 modules) or **Clang** (>= 18.0)
+* Dynamic system libraries: `liblmdb`, `libzstd`, `libtomlplusplus`, `libcurl`
 
 ### Build with xmake
 ```bash
@@ -61,12 +61,16 @@ xmake
 
 # Run the compiled binary
 xmake run sage --help
+
+# Run internal engine test suite
+xmake run sage test-suite
 ```
 
 ---
 
 ## 📖 Documentation
 * [Architecture Specification](docs/ARCHITECTURE.md)
+* [Next Steps: Multi-Toolchain Coexistence & Sub-Channels Design](docs/NEXTSTEP.md)
 * [Module Reference & Dependency Topology](docs/MODULES.md)
 * [CLI Command Specification](docs/CLI_SPEC.md)
 * [Developer & AI Contributor Guide](AGENTS.md)

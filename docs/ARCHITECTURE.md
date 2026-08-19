@@ -13,7 +13,7 @@ Sage is structured as a layered, modular package manager designed around five co
 ```mermaid
 graph TB
     subgraph StorageLayer["1. 存储与状态层 (Storage Layer)"]
-        LMDB["<b>LMDB Zero-Copy Database</b><br/>/var/lib/distro/data.mdb<br/>(Packages, Files, Provides, Channels, System Providers)"]
+        LMDB["<b>LMDB Zero-Copy Database</b><br/>/var/lib/sage/data.mdb<br/>(Packages, Files, Provides, Channels, System Providers)"]
     end
 
     subgraph ChannelLayer["2. Channel 运行时层 (Channel Runtime Layer)"]
@@ -21,7 +21,7 @@ graph TB
         RuntimeChannel["<b>Runtime Channel (`/usr/lib/runtimes/`)</b><br/>Shared SDKs, LLVM, CUDA"]
         ToolchainChannel["<b>Toolchain Channel (`/opt/channels/`)</b><br/>Isolated Language Environments"]
         UserChannel["<b>User Channel (`~/.local/`)</b><br/>Non-root User Tools"]
-        ProfileEngine["<b>Profile Engine</b><br/>Symlinks & /etc/profile.d/distro-channels.sh"]
+        ProfileEngine["<b>Profile Engine</b><br/>Symlinks & /etc/profile.d/sage-channels.sh"]
     end
 
     subgraph ServiceLayer["3. 通用服务转换层 (Universal Service Layer)"]
@@ -30,7 +30,7 @@ graph TB
     end
 
     subgraph SolverLayer["4. 依赖求解与重构层 (Solver & Reconcile Layer)"]
-        PubGrub["<b>Native C++20 PubGrub / CDCL SAT Solver</b><br/>(Version Ranges, Virtual Providers, SONAMEs)"]
+        PubGrub["<b>Native C++23 PubGrub / CDCL SAT Solver</b><br/>(Version Ranges, Virtual Providers, SONAMEs)"]
         RebuildEngine["<b>Reconcile Engine (`sage rebuild`)</b><br/>(Diff system.toml vs LMDB -> Atomic Swap)"]
     end
 
@@ -51,7 +51,7 @@ graph TB
 
 ## 2. LMDB Database Schema
 
-The state database `/var/lib/distro/data.mdb` uses dedicated named databases (tables):
+The state database `/var/lib/sage/data.mdb` uses dedicated named databases (tables):
 
 | Table Name (DBI) | Key | Value | Purpose |
 | :--- | :--- | :--- | :--- |

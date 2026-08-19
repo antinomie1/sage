@@ -16,9 +16,11 @@ struct ChannelConfig {
 
 struct SystemConfig {
     std::filesystem::path root_dir{"/"};
-    std::filesystem::path db_path{"/var/lib/distro/data.mdb"};
-    std::filesystem::path cache_dir{"/var/cache/distro"};
-    std::filesystem::path system_config_path{"/etc/distro/system.toml"};
+    std::filesystem::path db_path{"/var/lib/sage/data.mdb"};
+    std::filesystem::path cache_dir{"/var/cache/sage"};
+    std::filesystem::path config_dir{"/etc/sage"};
+    std::filesystem::path system_config_path{"/etc/sage/system.toml"};
+    std::filesystem::path channels_config_path{"/etc/sage/channels.toml"};
 
     // Core minimal virtual providers
     // e.g. "virtual/init" -> "openrc", "virtual/udev" -> "eudev", "virtual/libc" -> "glibc"
@@ -34,7 +36,7 @@ struct SystemConfig {
 
         ChannelConfig core;
         core.name = "core";
-        core.url = "https://pkg.distro.org/core";
+        core.url = "https://pkg.sage-linux.org/core";
         core.scope = "system";
         core.priority = 100;
         core.enabled = true;
@@ -43,7 +45,7 @@ struct SystemConfig {
         return cfg;
     }
 
-    static std::expected<SystemConfig, std::string> parse_toml(std::string_view toml_str) {
+    static std::expected<SystemConfig, std::string> parse_system_toml(std::string_view toml_str) {
         auto tbl_res = vendor::toml::parse_string(toml_str);
         if (!tbl_res) return std::unexpected(tbl_res.error());
         const auto& tbl = *tbl_res;
@@ -52,8 +54,13 @@ struct SystemConfig {
 
         if (auto* sys = tbl.get_as<vendor::toml::table>("system")) {
             if (auto r = sys->get("root_dir")) cfg.root_dir = r->value_or("/");
-            if (auto d = sys->get("db_path")) cfg.db_path = d->value_or("/var/lib/distro/data.mdb");
-            if (auto c = sys->get("cache_dir")) cfg.cache_dir = c->value_or("/var/cache/distro");
+            if (auto d = sys->get("db_path")) cfg.db_path = d->value_or("/var/lib/sage/data.mdb");
+            if (auto c = sys->get("cache_dir")) cfg.cache_dir = c->value_or("/var/cache/sage");
+            if (auto cfg_d = sys->get("config_dir")) {
+                cfg.config_dir = cfg_d->value_or("/etc/sage");
+                cfg.system_config_path = cfg.config_dir / "system.toml";
+                cfg.channels_config_path = cfg.config_dir / "channels.toml";
+            }
         }
 
         if (auto* prov = tbl.get_as<vendor::toml::table>("providers")) {
@@ -68,6 +75,7 @@ struct SystemConfig {
             }
         }
 
+        // Also check if channels are defined inside system.toml
         if (auto* chs = tbl.get_as<vendor::toml::array>("channels")) {
             for (auto&& item : *chs) {
                 if (auto* ctab = item.as_table()) {
@@ -87,32 +95,82 @@ struct SystemConfig {
         return cfg;
     }
 
-    static std::expected<SystemConfig, std::string> load_or_default(const std::filesystem::path& path) {
-        if (!std::filesystem::exists(path)) {
-            return default_config();
-        }
-        auto tbl_res = vendor::toml::parse_file(path);
+    static std::expected<std::vector<ChannelConfig>, std::string> parse_channels_toml(std::string_view toml_str) {
+        auto tbl_res = vendor::toml::parse_string(toml_str);
         if (!tbl_res) return std::unexpected(tbl_res.error());
-        std::ifstream f(path);
-        std::stringstream ss;
-        ss << f.rdbuf();
-        return parse_toml(ss.str());
+        const auto& tbl = *tbl_res;
+
+        std::vector<ChannelConfig> list;
+        if (auto* chs = tbl.get_as<vendor::toml::array>("channels")) {
+            for (auto&& item : *chs) {
+                if (auto* ctab = item.as_table()) {
+                    ChannelConfig ch;
+                    ch.name = ctab->get("name")->value_or("");
+                    ch.url = ctab->get("url")->value_or("");
+                    ch.scope = ctab->get("scope")->value_or("system");
+                    ch.priority = static_cast<int>(ctab->get("priority")->value_or(50LL));
+                    ch.enabled = ctab->get("enabled")->value_or(true);
+                    if (!ch.name.empty()) {
+                        list.push_back(std::move(ch));
+                    }
+                }
+            }
+        }
+        return list;
     }
 
-    [[nodiscard]] std::string serialize_toml() const {
+    static std::expected<SystemConfig, std::string> load_or_default(const std::filesystem::path& config_dir = "/etc/sage") {
+        std::filesystem::path sys_path = config_dir / "system.toml";
+        std::filesystem::path chan_path = config_dir / "channels.toml";
+
+        SystemConfig cfg = default_config();
+        cfg.config_dir = config_dir;
+        cfg.system_config_path = sys_path;
+        cfg.channels_config_path = chan_path;
+
+        if (std::filesystem::exists(sys_path)) {
+            std::ifstream f(sys_path);
+            std::stringstream ss;
+            ss << f.rdbuf();
+            auto sys_res = parse_system_toml(ss.str());
+            if (!sys_res) return sys_res;
+            cfg = std::move(*sys_res);
+            cfg.config_dir = config_dir;
+            cfg.system_config_path = sys_path;
+            cfg.channels_config_path = chan_path;
+        }
+
+        if (std::filesystem::exists(chan_path)) {
+            std::ifstream f(chan_path);
+            std::stringstream ss;
+            ss << f.rdbuf();
+            auto ch_res = parse_channels_toml(ss.str());
+            if (ch_res && !ch_res->empty()) {
+                cfg.channels = std::move(*ch_res);
+            }
+        }
+
+        return cfg;
+    }
+
+    [[nodiscard]] std::string serialize_system_toml() const {
         std::ostringstream ss;
         ss << "[system]\n";
         ss << "root_dir = \"" << root_dir.string() << "\"\n";
         ss << "db_path = \"" << db_path.string() << "\"\n";
-        ss << "cache_dir = \"" << cache_dir.string() << "\"\n\n";
+        ss << "cache_dir = \"" << cache_dir.string() << "\"\n";
+        ss << "config_dir = \"" << config_dir.string() << "\"\n\n";
 
         ss << "[providers]\n";
         for (const auto& [k, v] : providers) {
             std::string short_key = k.starts_with("virtual/") ? k.substr(8) : k;
             ss << short_key << " = \"" << v << "\"\n";
         }
-        ss << "\n";
+        return ss.str();
+    }
 
+    [[nodiscard]] std::string serialize_channels_toml() const {
+        std::ostringstream ss;
         for (const auto& ch : channels) {
             ss << "[[channels]]\n";
             ss << "name = \"" << ch.name << "\"\n";
@@ -121,7 +179,6 @@ struct SystemConfig {
             ss << "priority = " << ch.priority << "\n";
             ss << "enabled = " << (ch.enabled ? "true" : "false") << "\n\n";
         }
-
         return ss.str();
     }
 };
