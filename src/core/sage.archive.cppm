@@ -422,4 +422,47 @@ inline std::expected<void, std::string> create_package(
     return write_compressed_chunk({}, true);
 }
 
+// ============================================================================
+// Local Repository Index Generator (index.toml)
+// ============================================================================
+
+inline std::expected<void, std::string> generate_repo_index(
+    const std::filesystem::path& repo_dir, 
+    std::string_view channel_name = "core") 
+{
+    if (!std::filesystem::exists(repo_dir)) {
+        return std::unexpected("Repository directory does not exist: " + repo_dir.string());
+    }
+
+    std::ostringstream ss;
+    ss << "schema_version = 1\n\n";
+    ss << "[channel]\n";
+    ss << "name = \"" << channel_name << "\"\n";
+    ss << "updated_at = \"" << "2026-08-20T00:00:00Z" << "\"\n\n";
+
+    size_t count = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(repo_dir)) {
+        if (entry.is_regular_file() && entry.path().string().ends_with(".pkg.tar.zst")) {
+            auto temp_sysroot = std::filesystem::temp_directory_path() / ("sage_idx_" + std::to_string(count));
+            std::filesystem::remove_all(temp_sysroot);
+            auto ext_res = extract_package(entry.path(), temp_sysroot);
+            std::filesystem::remove_all(temp_sysroot);
+            if (ext_res) {
+                ss << "[[packages]]\n";
+                ss << ext_res->manifest.serialize_toml() << "\n";
+                count++;
+            }
+        }
+    }
+
+    std::ofstream out(repo_dir / "index.toml");
+    if (!out.is_open()) {
+        return std::unexpected("Cannot write " + (repo_dir / "index.toml").string());
+    }
+    out << ss.str();
+    out.close();
+
+    return {};
+}
+
 } // namespace sage::archive

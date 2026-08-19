@@ -17,6 +17,7 @@ Commands:
   remove <PKG...>          Remove installed package files and unregister state
   rebuild                  Declarative reconcile (/etc/sage/system.toml vs LMDB)
   channel [COMMAND]        Manage multi-layer channels (list, add, sync)
+  repo index <DIR> [NAME]  Generate index.toml for local repository directory
   query [COMMAND]          Query packages, file ownership, and manifests (nanosecond LMDB)
   service [COMMAND]        Inspect and generate native init scripts (OpenRC/Runit/Systemd/Dinit/s6)
   build <RECIPE_DIR>       Build *.pkg.tar.zst package from recipe.toml with ELF scanner
@@ -138,6 +139,20 @@ int cmd_test_suite() {
         return 1;
     }
     sage::util::log_success("5. Declarative System Reconcile Engine (sage rebuild) OK");
+
+    // 6. Local Repository Indexing & Zero-Copy file:// Protocol Test
+    auto idx_res = sage::archive::generate_repo_index(temp_dir, "core");
+    if (!idx_res || !std::filesystem::exists(temp_dir / "index.toml")) {
+        sage::util::log_error("Local repository index generation failed");
+        return 1;
+    }
+
+    auto fetch_res = sage::vendor::curl::fetch_string("file://" + (temp_dir / "index.toml").string());
+    if (!fetch_res || fetch_res->find("schema_version = 1") == std::string::npos) {
+        sage::util::log_error("Local file:// protocol fetch failed");
+        return 1;
+    }
+    sage::util::log_success("6. Local Repository (file:// & /path) Indexer & Zero-Copy Fetch OK");
 
     std::filesystem::remove_all(temp_dir);
     sage::util::log_success("🎉 All Sage Subsystem Integration Tests Passed Successfully!");
@@ -323,6 +338,23 @@ int cmd_rebuild(int argc, char** argv) {
     return 0;
 }
 
+int cmd_repo(int argc, char** argv) {
+    if (argc < 4 || std::string_view(argv[2]) != "index") {
+        std::println("Usage: sage repo index <REPO_DIR> [CHANNEL_NAME]");
+        return 1;
+    }
+    std::filesystem::path repo_dir = argv[3];
+    std::string ch_name = (argc >= 5) ? argv[4] : "core";
+    sage::util::log_info("Generating index.toml for local repository at {}...", repo_dir.string());
+    auto res = sage::archive::generate_repo_index(repo_dir, ch_name);
+    if (!res) {
+        sage::util::log_error("Failed to generate repository index: {}", res.error());
+        return 1;
+    }
+    sage::util::log_success("Repository index successfully created: {}", (repo_dir / "index.toml").string());
+    return 0;
+}
+
 } // anonymous namespace
 
 int main(int argc, char** argv) {
@@ -352,6 +384,9 @@ int main(int argc, char** argv) {
     }
     if (command == "channel") {
         return cmd_channel(argc, argv);
+    }
+    if (command == "repo") {
+        return cmd_repo(argc, argv);
     }
     if (command == "build") {
         return cmd_build(argc, argv);

@@ -78,7 +78,27 @@ private:
 
 using ProgressCallback = std::function<void(size_t downloaded_bytes, size_t total_bytes)>;
 
+inline std::filesystem::path parse_local_url(std::string_view url) {
+    if (url.starts_with("file://")) {
+        return std::filesystem::path(url.substr(7));
+    }
+    if (url.starts_with("/")) {
+        return std::filesystem::path(url);
+    }
+    return {};
+}
+
 inline std::expected<std::string, std::string> fetch_string(std::string_view url, long timeout_secs = 30) {
+    if (auto local_p = parse_local_url(url); !local_p.empty()) {
+        if (std::filesystem::exists(local_p)) {
+            std::ifstream f(local_p);
+            std::stringstream ss;
+            ss << f.rdbuf();
+            return ss.str();
+        }
+        return std::unexpected("Local file does not exist: " + local_p.string());
+    }
+
     CurlEasy curl;
     if (!curl) return std::unexpected("Failed to initialize curl");
 
@@ -105,6 +125,17 @@ struct RemoteFileInfo {
 };
 
 inline std::expected<RemoteFileInfo, std::string> probe_remote_file(std::string_view url) {
+    if (auto local_p = parse_local_url(url); !local_p.empty()) {
+        if (std::filesystem::exists(local_p)) {
+            RemoteFileInfo info;
+            std::error_code ec;
+            info.content_length = std::filesystem::file_size(local_p, ec);
+            info.supports_ranges = false;
+            return info;
+        }
+        return std::unexpected("Local file does not exist: " + local_p.string());
+    }
+
     CurlEasy curl;
     if (!curl) return std::unexpected("Failed to initialize curl");
 
@@ -149,6 +180,20 @@ inline std::expected<void, std::string> download_file(
 {
     if (auto parent = dest_path.parent_path(); !parent.empty()) {
         std::filesystem::create_directories(parent);
+    }
+
+    if (auto local_p = parse_local_url(url); !local_p.empty()) {
+        if (std::filesystem::exists(local_p)) {
+            std::error_code ec;
+            std::filesystem::copy_file(local_p, dest_path, std::filesystem::copy_options::overwrite_existing, ec);
+            if (ec) return std::unexpected("Failed to copy local package: " + ec.message());
+            if (progress_cb) {
+                size_t sz = std::filesystem::file_size(dest_path, ec);
+                progress_cb(sz, sz);
+            }
+            return {};
+        }
+        return std::unexpected("Local source file does not exist: " + local_p.string());
     }
 
     auto probe = probe_remote_file(url);
