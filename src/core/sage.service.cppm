@@ -10,6 +10,9 @@ import sage.util;
 
 export namespace sage::service {
 
+using std::uint32_t;
+using std::size_t;
+
 enum class InitType {
     OpenRC,
     Runit,
@@ -40,6 +43,7 @@ inline std::string_view to_string(InitType t) noexcept {
 }
 
 struct ServiceSpec {
+    uint32_t schema_version{1};
     std::string name;
     std::string description;
     std::string exec_start;
@@ -60,6 +64,7 @@ struct ServiceSpec {
         const auto& tbl = *tbl_res;
 
         ServiceSpec s;
+        s.schema_version = static_cast<uint32_t>(tbl.get("schema_version")->value_or(1LL));
         if (auto* svc = tbl.get_as<vendor::toml::table>("service")) {
             s.name = svc->get("name")->value_or("");
             s.description = svc->get("description")->value_or("");

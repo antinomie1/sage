@@ -226,6 +226,7 @@ struct FileEntry {
 // ============================================================================
 
 struct PackageManifest {
+    uint32_t schema_version{1};
     std::string name;
     Version version;
     std::string description;
@@ -245,6 +246,8 @@ struct PackageManifest {
         const auto& tbl = *tbl_res;
 
         PackageManifest m;
+        m.schema_version = static_cast<uint32_t>(tbl.get("schema_version")->value_or(1LL));
+
         if (auto* pkg = tbl.get_as<vendor::toml::table>("package")) {
             m.name = pkg->get("name")->value_or("");
             std::string ver_str = pkg->get("version")->value_or("");
@@ -295,6 +298,7 @@ struct PackageManifest {
 
     [[nodiscard]] std::string serialize_toml() const {
         std::ostringstream ss;
+        ss << "schema_version = " << schema_version << "\n\n";
         ss << "[package]\n";
         ss << "name = \"" << name << "\"\n";
         ss << "version = \"" << version.ver << "\"\n";
@@ -333,6 +337,7 @@ struct PackageManifest {
 // ============================================================================
 
 struct Recipe {
+    uint32_t schema_version{1};
     std::string name;
     Version version;
     std::string description;
@@ -353,6 +358,8 @@ struct Recipe {
         const auto& tbl = *tbl_res;
 
         Recipe r;
+        r.schema_version = static_cast<uint32_t>(tbl.get("schema_version")->value_or(1LL));
+
         if (auto* pkg = tbl.get_as<vendor::toml::table>("package")) {
             r.name = pkg->get("name")->value_or("");
             r.version = Version::parse(pkg->get("version")->value_or(""));

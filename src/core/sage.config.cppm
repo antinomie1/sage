@@ -6,6 +6,9 @@ import sage.util;
 
 export namespace sage::config {
 
+using std::uint32_t;
+using std::size_t;
+
 struct ChannelConfig {
     std::string name;
     std::string url;
@@ -15,6 +18,7 @@ struct ChannelConfig {
 };
 
 struct SystemConfig {
+    uint32_t schema_version{1};
     std::filesystem::path root_dir{"/"};
     std::filesystem::path db_path{"/var/lib/sage/data.mdb"};
     std::filesystem::path cache_dir{"/var/cache/sage"};
@@ -155,6 +159,7 @@ struct SystemConfig {
 
     [[nodiscard]] std::string serialize_system_toml() const {
         std::ostringstream ss;
+        ss << "schema_version = " << schema_version << "\n\n";
         ss << "[system]\n";
         ss << "root_dir = \"" << root_dir.string() << "\"\n";
         ss << "db_path = \"" << db_path.string() << "\"\n";
@@ -171,6 +176,7 @@ struct SystemConfig {
 
     [[nodiscard]] std::string serialize_channels_toml() const {
         std::ostringstream ss;
+        ss << "schema_version = 1\n\n";
         for (const auto& ch : channels) {
             ss << "[[channels]]\n";
             ss << "name = \"" << ch.name << "\"\n";
