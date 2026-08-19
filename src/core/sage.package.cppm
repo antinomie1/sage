@@ -266,31 +266,42 @@ struct PackageManifest {
 
         if (m.name.empty()) return std::unexpected("Package name cannot be empty");
 
-        // Parse dependencies
-        if (auto* deps = tbl.get_as<vendor::toml::array>("dependencies")) {
-            for (auto&& d : *deps) {
-                if (auto str = d.value<std::string_view>()) {
-                    m.dependencies.push_back(Dependency::parse(*str));
+        auto parse_deps = [&](const vendor::toml::table& t, const char* key, std::vector<Dependency>& target) {
+            if (auto* arr = t.get_as<vendor::toml::array>(key)) {
+                for (auto&& d : *arr) {
+                    if (auto str = d.value<std::string_view>()) {
+                        target.push_back(Dependency::parse(*str));
+                    }
                 }
             }
+        };
+
+        auto parse_strings = [&](const vendor::toml::table& t, const char* key, std::vector<std::string>& target) {
+            if (auto* arr = t.get_as<vendor::toml::array>(key)) {
+                for (auto&& p : *arr) {
+                    if (auto str = p.value<std::string_view>()) {
+                        target.emplace_back(*str);
+                    }
+                }
+            }
+        };
+
+        // Parse dependencies (root or package section)
+        parse_deps(tbl, "dependencies", m.dependencies);
+        if (auto* pkg = tbl.get_as<vendor::toml::table>("package")) {
+            parse_deps(*pkg, "dependencies", m.dependencies);
         }
 
         // Parse provides
-        if (auto* provs = tbl.get_as<vendor::toml::array>("provides")) {
-            for (auto&& p : *provs) {
-                if (auto str = p.value<std::string_view>()) {
-                    m.provides.emplace_back(*str);
-                }
-            }
+        parse_strings(tbl, "provides", m.provides);
+        if (auto* pkg = tbl.get_as<vendor::toml::table>("package")) {
+            parse_strings(*pkg, "provides", m.provides);
         }
 
         // Parse conflicts
-        if (auto* confs = tbl.get_as<vendor::toml::array>("conflicts")) {
-            for (auto&& c : *confs) {
-                if (auto str = c.value<std::string_view>()) {
-                    m.conflicts.push_back(Dependency::parse(*str));
-                }
-            }
+        parse_deps(tbl, "conflicts", m.conflicts);
+        if (auto* pkg = tbl.get_as<vendor::toml::table>("package")) {
+            parse_deps(*pkg, "conflicts", m.conflicts);
         }
 
         // Parse files
@@ -300,6 +311,17 @@ struct PackageManifest {
                     FileEntry fe;
                     fe.path = std::string(*str);
                     m.files.push_back(std::move(fe));
+                }
+            }
+        }
+        if (auto* pkg = tbl.get_as<vendor::toml::table>("package")) {
+            if (auto* fls = pkg->get_as<vendor::toml::array>("files")) {
+                for (auto&& f : *fls) {
+                    if (auto str = f.value<std::string_view>()) {
+                        FileEntry fe;
+                        fe.path = std::string(*str);
+                        m.files.push_back(std::move(fe));
+                    }
                 }
             }
         }
@@ -397,28 +419,34 @@ struct Recipe {
             r.source_sha256 = src->get("sha256")->value_or("");
         }
 
-        if (auto* deps = tbl.get_as<vendor::toml::array>("dependencies")) {
-            for (auto&& d : *deps) {
-                if (auto str = d.value<std::string_view>()) {
-                    r.host_deps.push_back(Dependency::parse(*str));
+        auto parse_deps = [&](const vendor::toml::table& t, const char* key, std::vector<Dependency>& target) {
+            if (auto* arr = t.get_as<vendor::toml::array>(key)) {
+                for (auto&& d : *arr) {
+                    if (auto str = d.value<std::string_view>()) {
+                        target.push_back(Dependency::parse(*str));
+                    }
                 }
             }
-        }
+        };
 
-        if (auto* bld = tbl.get_as<vendor::toml::array>("build_dependencies")) {
-            for (auto&& b : *bld) {
-                if (auto str = b.value<std::string_view>()) {
-                    r.build_deps.emplace_back(*str);
+        auto parse_strings = [&](const vendor::toml::table& t, const char* key, std::vector<std::string>& target) {
+            if (auto* arr = t.get_as<vendor::toml::array>(key)) {
+                for (auto&& p : *arr) {
+                    if (auto str = p.value<std::string_view>()) {
+                        target.emplace_back(*str);
+                    }
                 }
             }
-        }
+        };
 
-        if (auto* provs = tbl.get_as<vendor::toml::array>("provides")) {
-            for (auto&& p : *provs) {
-                if (auto str = p.value<std::string_view>()) {
-                    r.provides.emplace_back(*str);
-                }
-            }
+        parse_deps(tbl, "dependencies", r.host_deps);
+        parse_strings(tbl, "build_dependencies", r.build_deps);
+        parse_strings(tbl, "provides", r.provides);
+
+        if (auto* pkg = tbl.get_as<vendor::toml::table>("package")) {
+            parse_deps(*pkg, "dependencies", r.host_deps);
+            parse_strings(*pkg, "build_dependencies", r.build_deps);
+            parse_strings(*pkg, "provides", r.provides);
         }
 
         auto extract_cmds = [&](const char* key, std::vector<std::string>& dest) {

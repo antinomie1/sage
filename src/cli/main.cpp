@@ -369,28 +369,118 @@ int cmd_remove(const CliOptions& opts) {
     }
     auto& db = *db_res;
 
+    auto all_installed = db.list_installed_packages();
+    std::map<std::string, sage::package::PackageManifest> installed_map;
+    for (const auto& pkg : all_installed) {
+        installed_map[pkg.name] = pkg;
+    }
+
+    std::set<std::string> to_remove_set;
+    for (const auto& pkg_name : opts.args) {
+        if (installed_map.contains(pkg_name)) {
+            to_remove_set.insert(pkg_name);
+        } else {
+            sage::util::log_warn("Package '{}' is not installed, skipping", pkg_name);
+        }
+    }
+
+    if (to_remove_set.empty()) {
+        sage::util::log_info("No matching installed packages found to remove.");
+        return 0;
+    }
+
+    // Iteratively discover orphaned dependencies
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (const auto& r_pkg_name : to_remove_set) {
+            const auto& r_pkg = installed_map.at(r_pkg_name);
+            for (const auto& dep : r_pkg.dependencies) {
+                for (const auto& [inst_name, inst_pkg] : installed_map) {
+                    if (to_remove_set.contains(inst_name)) continue;
+
+                    bool match = (inst_name == dep.name);
+                    if (!match) {
+                        for (const auto& prov : inst_pkg.provides) {
+                            if (prov == dep.name || prov.starts_with(dep.name + " ")) {
+                                match = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (match && dep.satisfies(inst_pkg.version)) {
+                        // Check if any remaining installed package outside to_remove_set still needs inst_name
+                        bool needed_by_others = false;
+                        for (const auto& [other_name, other_pkg] : installed_map) {
+                            if (to_remove_set.contains(other_name) || other_name == inst_name) continue;
+                            for (const auto& other_dep : other_pkg.dependencies) {
+                                bool other_match = (other_dep.name == inst_name);
+                                if (!other_match) {
+                                    for (const auto& prov : inst_pkg.provides) {
+                                        if (prov == other_dep.name || prov.starts_with(other_dep.name + " ")) {
+                                            other_match = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (other_match && other_dep.satisfies(inst_pkg.version)) {
+                                    needed_by_others = true;
+                                    break;
+                                }
+                            }
+                            if (needed_by_others) break;
+                        }
+
+                        // Also protect virtual system provider locks (e.g. virtual/init, virtual/libc)
+                        for (const auto& [iface, prov_target] : cfg.providers) {
+                            if (inst_name == prov_target) {
+                                needed_by_others = true;
+                                break;
+                            }
+                        }
+
+                        if (!needed_by_others) {
+                            to_remove_set.insert(inst_name);
+                            changed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (opts.dry_run) {
+        sage::util::log_info("Dry-run removal preview for {} packages (including orphaned dependencies):", to_remove_set.size());
+        for (const auto& name : to_remove_set) {
+            std::println("  - {}", name);
+        }
+        return 0;
+    }
+
     auto wtxn = db.begin_write_txn();
     if (!wtxn) return 1;
 
     std::vector<sage::package::FileEntry> removed_files;
 
-    for (const auto& pkg_name : opts.args) {
-        auto pkg = db.get_package(pkg_name);
-        if (!pkg) {
-            sage::util::log_warn("Package '{}' is not installed, skipping", pkg_name);
-            continue;
+    for (const auto& pkg_name : to_remove_set) {
+        const auto& pkg = installed_map.at(pkg_name);
+        if (std::find(opts.args.begin(), opts.args.end(), pkg_name) != opts.args.end()) {
+            sage::util::log_info("Removing package '{}'...", pkg_name);
+        } else {
+            sage::util::log_info("Auto-removing orphaned dependency '{}' (version {})...", pkg_name, pkg.version.to_string());
         }
 
-        sage::util::log_info("Removing package '{}'...", pkg_name);
         sage::channel::Channel ch;
-        auto spec = sage::channel::SubChannelSpec::parse(pkg->channel);
+        auto spec = sage::channel::SubChannelSpec::parse(pkg.channel);
         ch.scope = spec.scope;
         ch.category = spec.category;
         ch.slot = spec.slot;
         auto dest_root = ch.resolve_target_root(opts.target_root);
 
         // Delete physical files
-        auto files_to_delete = pkg->files;
+        auto files_to_delete = pkg.files;
         if (files_to_delete.empty()) {
             for (const auto& fp : db.get_package_files(pkg_name)) {
                 sage::package::FileEntry fe;
@@ -409,7 +499,7 @@ int cmd_remove(const CliOptions& opts) {
         }
 
         (void)db.unregister_files(*wtxn, files_to_delete);
-        (void)db.unregister_provides(*wtxn, pkg->provides);
+        (void)db.unregister_provides(*wtxn, pkg.provides);
         (void)db.del_package(*wtxn, pkg_name);
     }
 
@@ -417,7 +507,18 @@ int cmd_remove(const CliOptions& opts) {
     if (!commit_res) return 1;
 
     sage::rebuild::TriggerEngine::run_post_transaction_triggers(opts.target_root, removed_files);
-    sage::util::log_success("Successfully removed requested packages from {}", opts.target_root.string());
+    std::vector<sage::channel::Channel> active_channels;
+    for (const auto& ch_cfg : cfg.channels) {
+        sage::channel::Channel ch;
+        ch.name = ch_cfg.name;
+        ch.scope = sage::channel::parse_scope(ch_cfg.scope);
+        ch.enabled = ch_cfg.enabled;
+        active_channels.push_back(std::move(ch));
+    }
+    (void)sage::channel::ProfileManager::regenerate_fhs_profile(opts.target_root, active_channels);
+
+    sage::util::log_success("Successfully removed {} packages (including orphaned dependencies) from {}", 
+        to_remove_set.size(), opts.target_root.string());
     return 0;
 }
 
@@ -605,6 +706,126 @@ int cmd_test_suite() {
         return 1;
     }
     sage::util::log_success("9. End-to-End `sage install` & `sage remove` to Target Root OK");
+
+    // 10. Complete Closed-Loop: `sage build` -> `sage repo index` -> `sage install` -> `sage remove` with Orphan Cleanup
+    auto build_test_dir = temp_dir / "build_test";
+    std::filesystem::create_directories(build_test_dir / "libsample/pkg/usr/lib");
+    std::filesystem::create_directories(build_test_dir / "sample-app/pkg/usr/bin");
+    std::filesystem::create_directories(build_test_dir / "repo");
+
+    // 1. Write libsample recipe and dummy payload
+    std::ofstream lib_recipe(build_test_dir / "libsample/recipe.toml");
+    lib_recipe << R"(schema_version = 1
+[package]
+name = "libsample"
+version = "1.2.0"
+release = "1"
+description = "Sample dynamic library"
+license = "MIT"
+channel = "system"
+
+provides = ["libsample", "so:libsample.so.1"]
+)";
+    lib_recipe.close();
+    std::ofstream lib_so(build_test_dir / "libsample/pkg/usr/lib/libsample.so.1");
+    lib_so << "/* libsample binary */\n";
+    lib_so.close();
+
+    // 2. Write sample-app recipe and dummy payload
+    std::ofstream app_recipe(build_test_dir / "sample-app/recipe.toml");
+    app_recipe << R"(schema_version = 1
+[package]
+name = "sample-app"
+version = "2.0.0"
+release = "1"
+description = "Sample user application"
+license = "GPL-3.0"
+channel = "system"
+
+dependencies = ["libsample >= 1.0.0"]
+)";
+    app_recipe.close();
+    std::ofstream app_bin(build_test_dir / "sample-app/pkg/usr/bin/sample-app");
+    app_bin << "#!/bin/sh\necho 'running sample-app'\n";
+    app_bin.close();
+    std::filesystem::permissions(build_test_dir / "sample-app/pkg/usr/bin/sample-app", 
+        std::filesystem::perms::owner_all | std::filesystem::perms::group_read | std::filesystem::perms::group_exec);
+
+    // 3. Execute `sage build` on both packages
+    CliOptions build_lib_opts;
+    build_lib_opts.args = {(build_test_dir / "libsample").string()};
+    if (cmd_build(build_lib_opts) != 0) {
+        sage::util::log_error("Failed to build libsample");
+        return 1;
+    }
+
+    CliOptions build_app_opts;
+    build_app_opts.args = {(build_test_dir / "sample-app").string()};
+    if (cmd_build(build_app_opts) != 0) {
+        sage::util::log_error("Failed to build sample-app");
+        return 1;
+    }
+
+    // Move built packages to repo/
+    std::filesystem::copy_file(build_test_dir / "libsample/libsample-1.2.0-1.pkg.tar.zst", 
+        build_test_dir / "repo/libsample-1.2.0-1.pkg.tar.zst", std::filesystem::copy_options::overwrite_existing);
+    std::filesystem::copy_file(build_test_dir / "sample-app/sample-app-2.0.0-1.pkg.tar.zst", 
+        build_test_dir / "repo/sample-app-2.0.0-1.pkg.tar.zst", std::filesystem::copy_options::overwrite_existing);
+
+    // 4. Generate local repo index
+    auto build_idx_res = sage::archive::generate_repo_index(build_test_dir / "repo", "core");
+    if (!build_idx_res) {
+        sage::util::log_error("Failed to generate index for built packages");
+        return 1;
+    }
+
+    // 5. Point isolated target to the newly built repo
+    auto loop_target = build_test_dir / "target_root";
+    std::filesystem::create_directories(loop_target / "etc/sage");
+    std::ofstream loop_chan(loop_target / "etc/sage/channels.toml");
+    loop_chan << "schema_version = 1\n\n[[channels]]\nname = \"core\"\nurl = \"file://" << (build_test_dir / "repo").string() << "\"\nscope = \"system\"\npriority = 100\nenabled = true\n";
+    loop_chan.close();
+
+    // 6. Install sample-app (which requires libsample)
+    CliOptions loop_inst_opts;
+    loop_inst_opts.target_root = loop_target;
+    loop_inst_opts.args = {"sample-app"};
+    if (cmd_install(loop_inst_opts) != 0) {
+        sage::util::log_error("Failed to install built sample-app");
+        return 1;
+    }
+
+    // Verify files on disk and packages in LMDB
+    if (!std::filesystem::exists(loop_target / "usr/bin/sample-app") || 
+        !std::filesystem::exists(loop_target / "usr/lib/libsample.so.1")) {
+        sage::util::log_error("Files from sample-app and libsample were not properly installed to target root");
+        return 1;
+    }
+
+    // 7. Remove sample-app and verify libsample is auto-removed as an orphan!
+    CliOptions loop_rem_opts;
+    loop_rem_opts.target_root = loop_target;
+    loop_rem_opts.args = {"sample-app"};
+    if (cmd_remove(loop_rem_opts) != 0) {
+        sage::util::log_error("Failed to remove sample-app");
+        return 1;
+    }
+
+    // Verify all files from both sample-app and libsample are gone from disk!
+    if (std::filesystem::exists(loop_target / "usr/bin/sample-app") || 
+        std::filesystem::exists(loop_target / "usr/lib/libsample.so.1")) {
+        sage::util::log_error("Orphaned dependency libsample or sample-app file still exists on disk after removal");
+        return 1;
+    }
+
+    // Verify LMDB is clean
+    auto loop_db = sage::db::Database::open(loop_target / "var/lib/sage/data.mdb");
+    if (loop_db && !loop_db->list_installed_packages().empty()) {
+        sage::util::log_error("LMDB still contains packages after cascaded removal");
+        return 1;
+    }
+
+    sage::util::log_success("10. Complete Build -> Index -> Install -> Remove (Auto Orphan Cleanup) Closed-Loop OK");
 
     std::filesystem::remove_all(temp_dir);
     sage::util::log_success("🎉 All Sage Master Architecture & Subsystem Integration Tests Passed Successfully!");
