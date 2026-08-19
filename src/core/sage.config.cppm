@@ -1,16 +1,6 @@
-module;
-
-#include <string>
-#include <string_view>
-#include <vector>
-#include <map>
-#include <optional>
-#include <expected>
-#include <filesystem>
-#include <sstream>
-
 export module sage.config;
 
+import std;
 import sage.vendor.toml;
 import sage.util;
 

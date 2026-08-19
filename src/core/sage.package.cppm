@@ -1,23 +1,15 @@
-module;
-
-#include <string>
-#include <string_view>
-#include <vector>
-#include <optional>
-#include <expected>
-#include <compare>
-#include <format>
-#include <sstream>
-#include <cstdint>
-#include <cctype>
-#include <algorithm>
-
 export module sage.package;
 
+import std;
 import sage.vendor.toml;
 import sage.util;
 
 export namespace sage::package {
+
+using std::uint8_t;
+using std::uint32_t;
+using std::uint64_t;
+using std::size_t;
 
 // ============================================================================
 // Version Model with standard epoch-ver-rel ordering
@@ -36,7 +28,7 @@ struct Version {
         if (auto colon = s.find(':'); colon != std::string_view::npos) {
             uint32_t ep = 0;
             for (char c : s.substr(0, colon)) {
-                if (std::isdigit(c)) ep = ep * 10 + (c - '0');
+                if (std::isdigit(static_cast<unsigned char>(c))) ep = ep * 10 + (c - '0');
             }
             v.epoch = ep;
             s = s.substr(colon + 1);
@@ -64,8 +56,8 @@ struct Version {
     static int compare_segments(std::string_view a, std::string_view b) noexcept {
         size_t i = 0, j = 0;
         while (i < a.size() || j < b.size()) {
-            while (i < a.size() && !std::isalnum(a[i])) ++i;
-            while (j < b.size() && !std::isalnum(b[j])) ++j;
+            while (i < a.size() && !std::isalnum(static_cast<unsigned char>(a[i]))) ++i;
+            while (j < b.size() && !std::isalnum(static_cast<unsigned char>(b[j]))) ++j;
             if (i >= a.size() && j >= b.size()) break;
 
             bool a_digit = (i < a.size() && std::isdigit(static_cast<unsigned char>(a[i])));
@@ -74,8 +66,8 @@ struct Version {
             if (a_digit && b_digit) {
                 // Numeric comparison
                 size_t start_i = i, start_j = j;
-                while (i < a.size() && std::isdigit(a[i])) ++i;
-                while (j < b.size() && std::isdigit(b[j])) ++j;
+                while (i < a.size() && std::isdigit(static_cast<unsigned char>(a[i]))) ++i;
+                while (j < b.size() && std::isdigit(static_cast<unsigned char>(b[j]))) ++j;
 
                 std::string_view sa = a.substr(start_i, i - start_i);
                 std::string_view sb = b.substr(start_j, j - start_j);
@@ -92,8 +84,8 @@ struct Version {
             } else {
                 // Alpha segment comparison
                 size_t start_i = i, start_j = j;
-                while (i < a.size() && std::isalpha(a[i])) ++i;
-                while (j < b.size() && std::isalpha(b[j])) ++j;
+                while (i < a.size() && std::isalpha(static_cast<unsigned char>(a[i]))) ++i;
+                while (j < b.size() && std::isalpha(static_cast<unsigned char>(b[j]))) ++j;
 
                 std::string_view sa = a.substr(start_i, i - start_i);
                 std::string_view sb = b.substr(start_j, j - start_j);

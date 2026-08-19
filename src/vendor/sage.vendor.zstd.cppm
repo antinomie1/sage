@@ -1,15 +1,10 @@
 module;
 
 #include <zstd.h>
-#include <string>
-#include <string_view>
-#include <vector>
-#include <span>
-#include <cstdint>
-#include <expected>
-#include <utility>
 
 export module sage.vendor.zstd;
+
+import std;
 
 export namespace sage::vendor::zstd {
 
@@ -116,13 +111,13 @@ private:
     int level_{3};
 };
 
-inline std::expected<std::vector<uint8_t>, std::string> compress_block(
-    std::span<const uint8_t> src, 
+inline std::expected<std::vector<std::uint8_t>, std::string> compress_block(
+    std::span<const std::uint8_t> src, 
     int level = 3) 
 {
-    size_t max_dest = ZSTD_compressBound(src.size());
-    std::vector<uint8_t> dest(max_dest);
-    size_t written = ZSTD_compress(dest.data(), max_dest, src.data(), src.size(), level);
+    std::size_t max_dest = ZSTD_compressBound(src.size());
+    std::vector<std::uint8_t> dest(max_dest);
+    std::size_t written = ZSTD_compress(dest.data(), max_dest, src.data(), src.size(), level);
     if (ZSTD_isError(written)) {
         return std::unexpected(ZSTD_getErrorName(written));
     }
@@ -130,15 +125,15 @@ inline std::expected<std::vector<uint8_t>, std::string> compress_block(
     return dest;
 }
 
-inline std::expected<std::vector<uint8_t>, std::string> decompress_block(
-    std::span<const uint8_t> src) 
+inline std::expected<std::vector<std::uint8_t>, std::string> decompress_block(
+    std::span<const std::uint8_t> src) 
 {
     unsigned long long const r_size = ZSTD_getFrameContentSize(src.data(), src.size());
     if (r_size == ZSTD_CONTENTSIZE_ERROR || r_size == ZSTD_CONTENTSIZE_UNKNOWN) {
         return std::unexpected("Invalid or unknown ZSTD content size");
     }
-    std::vector<uint8_t> dest(static_cast<size_t>(r_size));
-    size_t actual = ZSTD_decompress(dest.data(), dest.size(), src.data(), src.size());
+    std::vector<std::uint8_t> dest(static_cast<std::size_t>(r_size));
+    std::size_t actual = ZSTD_decompress(dest.data(), dest.size(), src.data(), src.size());
     if (ZSTD_isError(actual)) {
         return std::unexpected(ZSTD_getErrorName(actual));
     }

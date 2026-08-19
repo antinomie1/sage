@@ -1,6 +1,7 @@
 # Build and temporary artifacts
 build/
 .xmake/
+gcm.cache/
 *.o
 *.a
 *.so

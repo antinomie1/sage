@@ -1,17 +1,10 @@
 module;
 
-#include <string>
-#include <string_view>
-#include <vector>
-#include <expected>
-#include <filesystem>
-#include <fstream>
-#include <sstream>
-#include <format>
 #include <sys/stat.h>
 
 export module sage.service;
 
+import std;
 import sage.vendor.toml;
 import sage.util;
 
@@ -210,7 +203,6 @@ struct ServiceSpec {
     }
 };
 
-// Generate and write service file to disk according to init system
 inline std::expected<std::filesystem::path, std::string> generate_service(
     const ServiceSpec& spec,
     InitType init_type,

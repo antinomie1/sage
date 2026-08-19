@@ -1,16 +1,14 @@
 module;
 
 #include <lmdb.h>
-#include <string>
-#include <string_view>
-#include <optional>
-#include <expected>
-#include <filesystem>
-#include <utility>
 
 export module sage.vendor.lmdb;
 
+import std;
+
 export namespace sage::vendor::lmdb {
+
+using std::size_t;
 
 inline constexpr unsigned int flag_rdonly = MDB_RDONLY;
 inline constexpr unsigned int flag_create = MDB_CREATE;

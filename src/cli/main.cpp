@@ -1,10 +1,9 @@
+import std;
 import sage;
-
-using namespace sage;
 
 int main(int argc, char** argv) {
     (void)argc; (void)argv;
-    sage::util::log_info("Running Sage Phase 0 & 1 Verification Tests...");
+    sage::util::log_info("Running Sage Phase 0 & 1 Verification Tests (Pure C++23 std module)...");
 
     // Test 1: Version comparison
     sage::package::Version v1 = sage::package::Version::parse("1.2.3-1");
@@ -26,18 +25,18 @@ int main(int argc, char** argv) {
     svc.description = "OpenSSH Daemon";
     svc.exec_start = "/usr/sbin/sshd -D";
     svc.after = {"net", "syslog"};
-    sage::string openrc_out = svc.render_openrc();
-    sage::string systemd_out = svc.render_systemd();
-    if (openrc_out.find("#!/sbin/openrc-run") == sage::string::npos ||
-        systemd_out.find("[Service]") == sage::string::npos) {
+    std::string openrc_out = svc.render_openrc();
+    std::string systemd_out = svc.render_systemd();
+    if (openrc_out.find("#!/sbin/openrc-run") == std::string::npos ||
+        systemd_out.find("[Service]") == std::string::npos) {
         sage::util::log_error("Service rendering failed");
         return 1;
     }
     sage::util::log_success("Test 2: Universal service generator OK");
 
     // Test 3: LMDB Database operations
-    auto temp_db_dir = sage::fs::temp_directory_path() / "sage_test_db";
-    sage::fs::remove_all(temp_db_dir);
+    auto temp_db_dir = std::filesystem::temp_directory_path() / "sage_test_db";
+    std::filesystem::remove_all(temp_db_dir);
 
     auto db_res = sage::db::Database::open(temp_db_dir);
     if (!db_res) {
@@ -111,9 +110,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    sage::fs::remove_all(temp_db_dir);
+    std::filesystem::remove_all(temp_db_dir);
     sage::util::log_success("Test 3: LMDB ACID Database & Zero-Copy Queries OK");
 
-    sage::util::log_success("All Phase 0 & Phase 1 module tests passed successfully!");
+    sage::util::log_success("All Phase 0 & Phase 1 module tests passed successfully with pure import std!");
     return 0;
 }

@@ -1,25 +1,17 @@
 module;
 
 #include <curl/curl.h>
-#include <string>
-#include <string_view>
-#include <vector>
-#include <expected>
-#include <filesystem>
-#include <functional>
-#include <fstream>
-#include <thread>
-#include <atomic>
-#include <future>
-#include <mutex>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
-#include <utility>
 
 export module sage.vendor.curl;
 
+import std;
+
 export namespace sage::vendor::curl {
+
+using std::size_t;
 
 class CurlGlobal {
 public:
@@ -205,7 +197,6 @@ inline std::expected<void, std::string> download_file(
     if (fd < 0) return std::unexpected("Failed to create destination file");
 
     if (::posix_fallocate(fd, 0, static_cast<off_t>(total_size)) != 0) {
-        // Fallback ftruncate
         if (::ftruncate(fd, static_cast<off_t>(total_size)) != 0) {
             // Ignore if filesystem already handles write offsets
         }

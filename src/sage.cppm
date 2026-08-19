@@ -14,16 +14,3 @@ export import sage.package;
 export import sage.config;
 export import sage.service;
 export import sage.db;
-
-export namespace sage {
-    using util::string;
-    using util::string_view;
-    using util::vector;
-    using util::span;
-    using util::optional;
-    using util::expected;
-    using util::unexpected;
-    using util::operator==;
-    using util::operator!=;
-    namespace fs = util::fs;
-}

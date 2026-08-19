@@ -1,22 +1,13 @@
-module;
-
-#include <string>
-#include <string_view>
-#include <vector>
-#include <map>
-#include <optional>
-#include <expected>
-#include <filesystem>
-#include <format>
-#include <utility>
-
 export module sage.db;
 
+import std;
 import sage.vendor.lmdb;
 import sage.package;
 import sage.util;
 
 export namespace sage::db {
+
+using std::size_t;
 
 class Database {
 public:

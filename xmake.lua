@@ -10,7 +10,6 @@ set_description("Sage: High-performance, modular, multi-layer universal Linux pa
 
 set_languages("c++23")
 set_warnings("all", "extra")
-set_policy("build.c++.modules.std", false)
 
 -- Enable optimization for release mode
 if is_mode("release") then
