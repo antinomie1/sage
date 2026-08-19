@@ -53,8 +53,17 @@ public:
             std::filesystem::path ldc = sysroot / "sbin/ldconfig";
             if (std::filesystem::exists(ldc)) {
                 util::log_info("Running post-transaction trigger: /sbin/ldconfig");
-                int ret = std::system((ldc.string() + " -r " + sysroot.string()).c_str());
-                (void)ret;
+                // For sysroots other than "/" run the chroot's own ldconfig
+                // INSIDE the chroot, so its loader and glibc match the target
+                // (running it host-side with -r can silently fail when the
+                // host glibc is older than the target's).
+                std::string cmd = (sysroot == "/")
+                    ? ldc.string()
+                    : "chroot " + sysroot.string() + " /sbin/ldconfig";
+                int ret = std::system(cmd.c_str());
+                if (ret != 0) {
+                    util::log_warn("ldconfig trigger failed (exit {}): {}", ret, cmd);
+                }
             }
         }
         if (run_ca) {

@@ -344,10 +344,7 @@ int cmd_install(const CliOptions& opts) {
         return 1;
     }
 
-    // 4. Post-Transaction File Triggers & Profile Refresh
-    sage::rebuild::TriggerEngine::run_post_transaction_triggers(opts.target_root, all_installed_files);
-
-    // 5. Auto-activate installed toolchain channels
+    // 4. Auto-activate installed toolchain channels
     std::set<std::pair<std::string, std::string>> activated_toolchains;
     for (const auto& pkg : unique_to_install) {
         auto spec = sage::channel::SubChannelSpec::parse(pkg.channel);
@@ -362,7 +359,7 @@ int cmd_install(const CliOptions& opts) {
         }
     }
 
-    // 6. Regenerate FHS profile for all active channels
+    // 5. Regenerate FHS profile for all active channels
     std::vector<sage::channel::Channel> active_channels;
     for (const auto& ch_cfg : cfg.channels) {
         sage::channel::Channel ch;
@@ -372,6 +369,11 @@ int cmd_install(const CliOptions& opts) {
         active_channels.push_back(std::move(ch));
     }
     (void)sage::channel::ProfileManager::regenerate_fhs_profile(opts.target_root, active_channels);
+
+    // 6. Post-Transaction File Triggers (ldconfig, ca-certificates, mime).
+    // Runs AFTER toolchain activation so freshly written
+    // /etc/ld.so.conf.d/sage-*.conf entries are picked up by ldconfig.
+    sage::rebuild::TriggerEngine::run_post_transaction_triggers(opts.target_root, all_installed_files);
 
     sage::util::log_success("Successfully installed {} packages into {}", unique_to_install.size(), opts.target_root.string());
     return 0;
