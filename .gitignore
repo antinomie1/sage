@@ -1,0 +1,18 @@
+# Build and temporary artifacts
+build/
+.xmake/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.pkg.tar.zst
+data.mdb
+lock.mdb
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
