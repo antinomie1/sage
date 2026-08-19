@@ -25,7 +25,8 @@ public:
         bool read_only = false,
         size_t map_size = 10ULL * 1024 * 1024 * 1024) 
     {
-        auto env_res = vendor::lmdb::MdbEnv::create(db_path, map_size, 32, read_only ? vendor::lmdb::flag_rdonly : 0);
+        std::filesystem::path actual_dir = (db_path.extension() == ".mdb") ? db_path.parent_path() : db_path;
+        auto env_res = vendor::lmdb::MdbEnv::create(actual_dir, map_size, 32, read_only ? vendor::lmdb::flag_rdonly : 0);
         if (!env_res) return std::unexpected(env_res.error());
 
         Database db;
@@ -58,10 +59,8 @@ public:
         if (!dbi_sys) return std::unexpected("Failed to open system table: " + dbi_sys.error());
         db.dbi_system_ = *dbi_sys;
 
-        if (!read_only) {
-            auto commit_res = txn.commit();
-            if (!commit_res) return std::unexpected(commit_res.error());
-        }
+        auto commit_res = txn.commit();
+        if (!commit_res) return std::unexpected(commit_res.error());
 
         return db;
     }

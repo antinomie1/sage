@@ -457,6 +457,15 @@ struct Recipe {
                     }
                 }
             }
+            if (auto* pkg = tbl.get_as<vendor::toml::table>("package")) {
+                if (auto* arr = pkg->get_as<vendor::toml::array>(key)) {
+                    for (auto&& c : *arr) {
+                        if (auto str = c.value<std::string_view>()) {
+                            dest.emplace_back(*str);
+                        }
+                    }
+                }
+            }
         };
 
         extract_cmds("prepare", r.prepare_cmds);

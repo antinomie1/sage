@@ -152,6 +152,14 @@ struct SystemConfig {
             if (ch_res && !ch_res->empty()) {
                 cfg.channels = std::move(*ch_res);
             }
+        } else if (config_dir != "/etc/sage" && std::filesystem::exists("/etc/sage/channels.toml")) {
+            std::ifstream f("/etc/sage/channels.toml");
+            std::stringstream ss;
+            ss << f.rdbuf();
+            auto ch_res = parse_channels_toml(ss.str());
+            if (ch_res && !ch_res->empty()) {
+                cfg.channels = std::move(*ch_res);
+            }
         }
 
         return cfg;
@@ -162,6 +170,7 @@ struct SystemConfig {
         std::filesystem::path config_dir = (norm_root == "/") ? "/etc/sage" : (norm_root / "etc/sage");
         auto res = load_or_default(config_dir);
         if (!res) return res;
+
         res->root_dir = norm_root;
         if (norm_root != "/") {
             res->db_path = norm_root / "var/lib/sage/data.mdb";

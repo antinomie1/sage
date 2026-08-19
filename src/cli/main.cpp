@@ -123,12 +123,14 @@ int cmd_build(const CliOptions& opts) {
 
     // 2. Prepare, Build & Install Phases
     std::filesystem::create_directories(pkg_dir);
+    std::filesystem::path work_dir = std::filesystem::exists(src_dir) ? src_dir : recipe_dir;
+
     auto run_phase = [&](std::string_view phase_name, const std::vector<std::string>& cmds) -> bool {
         if (cmds.empty()) return true;
         sage::util::log_info("Executing {} phase...", phase_name);
         for (const auto& cmd_line : cmds) {
-            std::string full_cmd = std::format("cd \"{}\" && DESTDIR=\"{}\" {}", 
-                src_dir.string(), pkg_dir.string(), cmd_line);
+            std::string full_cmd = std::format("export DESTDIR=\"{}\" PREFIX=\"/usr\" RECIPE_DIR=\"{}\" SRCDIR=\"{}\" PKGDIR=\"{}\"; cd \"{}\" && {}", 
+                pkg_dir.string(), recipe_dir.string(), src_dir.string(), pkg_dir.string(), work_dir.string(), cmd_line);
             int ret = std::system(full_cmd.c_str());
             if (ret != 0) {
                 sage::util::log_error("Command failed in {} phase: {}", phase_name, cmd_line);
