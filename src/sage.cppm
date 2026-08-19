@@ -9,8 +9,16 @@ export import sage.vendor.curl;
 // Layer 1: Foundation & Utilities
 export import sage.util;
 
-// Layer 2 & 3: Domain Models & Storage
+// Layer 2: Domain Models & Services
 export import sage.package;
 export import sage.config;
 export import sage.service;
+export import sage.channel;
+
+// Layer 3: Storage & Archiving
 export import sage.db;
+export import sage.archive;
+
+// Layer 4: Orchestration & Dependency Solving
+export import sage.solver;
+export import sage.rebuild;
