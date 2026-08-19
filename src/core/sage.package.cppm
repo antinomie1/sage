@@ -297,11 +297,17 @@ struct PackageManifest {
         if (auto* pkg = tbl.get_as<vendor::toml::table>("package")) {
             parse_strings(*pkg, "provides", m.provides);
         }
+        if (auto* src = tbl.get_as<vendor::toml::table>("source")) {
+            parse_strings(*src, "provides", m.provides);
+        }
 
         // Parse conflicts
         parse_deps(tbl, "conflicts", m.conflicts);
         if (auto* pkg = tbl.get_as<vendor::toml::table>("package")) {
             parse_deps(*pkg, "conflicts", m.conflicts);
+        }
+        if (auto* src = tbl.get_as<vendor::toml::table>("source")) {
+            parse_deps(*src, "conflicts", m.conflicts);
         }
 
         // Parse files
@@ -449,6 +455,12 @@ struct Recipe {
             parse_strings(*pkg, "provides", r.provides);
         }
 
+        if (auto* src = tbl.get_as<vendor::toml::table>("source")) {
+            parse_deps(*src, "dependencies", r.host_deps);
+            parse_strings(*src, "build_dependencies", r.build_deps);
+            parse_strings(*src, "provides", r.provides);
+        }
+
         auto extract_cmds = [&](const char* key, std::vector<std::string>& dest) {
             if (auto* arr = tbl.get_as<vendor::toml::array>(key)) {
                 for (auto&& c : *arr) {
@@ -459,6 +471,15 @@ struct Recipe {
             }
             if (auto* pkg = tbl.get_as<vendor::toml::table>("package")) {
                 if (auto* arr = pkg->get_as<vendor::toml::array>(key)) {
+                    for (auto&& c : *arr) {
+                        if (auto str = c.value<std::string_view>()) {
+                            dest.emplace_back(*str);
+                        }
+                    }
+                }
+            }
+            if (auto* src = tbl.get_as<vendor::toml::table>("source")) {
+                if (auto* arr = src->get_as<vendor::toml::array>(key)) {
                     for (auto&& c : *arr) {
                         if (auto str = c.value<std::string_view>()) {
                             dest.emplace_back(*str);

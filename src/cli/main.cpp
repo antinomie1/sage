@@ -122,6 +122,8 @@ int cmd_build(const CliOptions& opts) {
     }
 
     // 2. Prepare, Build & Install Phases
+    std::error_code ec;
+    std::filesystem::remove_all(pkg_dir, ec);
     std::filesystem::create_directories(pkg_dir);
     std::filesystem::path work_dir = std::filesystem::exists(src_dir) ? src_dir : recipe_dir;
 
@@ -155,7 +157,8 @@ int cmd_build(const CliOptions& opts) {
     manifest.provides = r.provides;
 
     if (std::filesystem::exists(pkg_dir)) {
-        for (const auto& entry : std::filesystem::recursive_directory_iterator(pkg_dir)) {
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(pkg_dir, std::filesystem::directory_options::skip_permission_denied)) {
+            if (entry.is_symlink()) continue;
             if (entry.is_regular_file()) {
                 auto elf_res = sage::util::scan_elf(entry.path());
                 if (elf_res) {
@@ -269,9 +272,16 @@ int cmd_install(const CliOptions& opts) {
         return 1;
     }
 
-    const auto& to_install = *solve_res;
-    sage::util::log_info("Resolved {} packages to install into target root '{}':", to_install.size(), opts.target_root.string());
-    for (const auto& pkg : to_install) {
+    std::vector<sage::package::PackageManifest> unique_to_install;
+    std::unordered_set<std::string> seen_install_names;
+    for (const auto& pkg : *solve_res) {
+        if (seen_install_names.insert(pkg.name).second) {
+            unique_to_install.push_back(pkg);
+        }
+    }
+
+    sage::util::log_info("Resolved {} packages to install into target root '{}':", unique_to_install.size(), opts.target_root.string());
+    for (const auto& pkg : unique_to_install) {
         std::println("  + {:<20} {:<15} [{}]", pkg.name, pkg.version.to_string(), pkg.channel);
     }
 
@@ -289,7 +299,7 @@ int cmd_install(const CliOptions& opts) {
     std::vector<sage::package::FileEntry> all_installed_files;
 
     // 3. Streaming Unpack & LMDB State Registration
-    for (const auto& pkg : to_install) {
+    for (const auto& pkg : unique_to_install) {
         auto archive_it = package_archive_map.find(pkg.name);
         if (archive_it == package_archive_map.end() || !std::filesystem::exists(archive_it->second)) {
             sage::util::log_error("Package archive for '{}' not found at {}", pkg.name, 
@@ -297,16 +307,10 @@ int cmd_install(const CliOptions& opts) {
             return 1;
         }
 
-        sage::channel::Channel ch;
-        ch.name = pkg.channel;
-        auto spec = sage::channel::SubChannelSpec::parse(pkg.channel);
-        ch.scope = spec.scope;
-        ch.category = spec.category;
-        ch.slot = spec.slot;
-        auto dest_root = ch.resolve_target_root(opts.target_root);
-
-        sage::util::log_info("Unpacking {} -> {}...", pkg.name, dest_root.string());
-        auto ext_res = sage::archive::extract_package(archive_it->second, dest_root);
+        // Archives always contain paths relative to sysroot (e.g. usr/bin/bash or
+        // opt/channels/gcc/15/bin/gcc), so always extract to the target root directly.
+        sage::util::log_info("Unpacking {} -> {}...", pkg.name, opts.target_root.string());
+        auto ext_res = sage::archive::extract_package(archive_it->second, opts.target_root);
         if (!ext_res) {
             sage::util::log_error("Failed to extract package '{}': {}", pkg.name, ext_res.error());
             return 1;
@@ -316,11 +320,20 @@ int cmd_install(const CliOptions& opts) {
         installed_pkg.files = ext_res->extracted_files;
 
         auto p_res = db.put_package(*wtxn, installed_pkg);
-        if (!p_res) return 1;
+        if (!p_res) {
+            sage::util::log_error("Failed to register package '{}' in DB: {}", installed_pkg.name, p_res.error());
+            return 1;
+        }
         auto f_res = db.register_files(*wtxn, installed_pkg.name, installed_pkg.channel, installed_pkg.files);
-        if (!f_res) return 1;
+        if (!f_res) {
+            sage::util::log_error("Failed to register files for '{}': {}", installed_pkg.name, f_res.error());
+            return 1;
+        }
         auto prov_res = db.register_provides(*wtxn, installed_pkg.name, installed_pkg.provides);
-        if (!prov_res) return 1;
+        if (!prov_res) {
+            sage::util::log_error("Failed to register provides for '{}': {}", installed_pkg.name, prov_res.error());
+            return 1;
+        }
 
         all_installed_files.insert(all_installed_files.end(), installed_pkg.files.begin(), installed_pkg.files.end());
     }
@@ -333,6 +346,23 @@ int cmd_install(const CliOptions& opts) {
 
     // 4. Post-Transaction File Triggers & Profile Refresh
     sage::rebuild::TriggerEngine::run_post_transaction_triggers(opts.target_root, all_installed_files);
+
+    // 5. Auto-activate installed toolchain channels
+    std::set<std::pair<std::string, std::string>> activated_toolchains;
+    for (const auto& pkg : unique_to_install) {
+        auto spec = sage::channel::SubChannelSpec::parse(pkg.channel);
+        if (spec.scope == sage::channel::ChannelScope::Toolchain && !spec.category.empty() && !spec.slot.empty()) {
+            auto key = std::make_pair(spec.category, spec.slot);
+            if (activated_toolchains.insert(key).second) {
+                auto act_res = sage::channel::ProfileManager::switch_active_toolchain(opts.target_root, spec.category, spec.slot);
+                if (!act_res) {
+                    sage::util::log_warn("Failed to activate toolchain '{}:{}': {}", spec.category, spec.slot, act_res.error());
+                }
+            }
+        }
+    }
+
+    // 6. Regenerate FHS profile for all active channels
     std::vector<sage::channel::Channel> active_channels;
     for (const auto& ch_cfg : cfg.channels) {
         sage::channel::Channel ch;
@@ -343,7 +373,7 @@ int cmd_install(const CliOptions& opts) {
     }
     (void)sage::channel::ProfileManager::regenerate_fhs_profile(opts.target_root, active_channels);
 
-    sage::util::log_success("Successfully installed {} packages into {}", to_install.size(), opts.target_root.string());
+    sage::util::log_success("Successfully installed {} packages into {}", unique_to_install.size(), opts.target_root.string());
     return 0;
 }
 

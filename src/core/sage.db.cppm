@@ -166,6 +166,7 @@ public:
         for (const auto& f : files) {
             if (f.type == package::FileType::Directory) continue;
             auto cleaned = util::clean_rel_path(f.path);
+            if (cleaned == "usr/share/info/dir" || cleaned.ends_with("/info/dir")) continue;
             if (auto existing = dbi_files_.get(txn, cleaned)) {
                 if (*existing != owner_val) {
                     return std::unexpected(std::format("File conflict: '{}' is already owned by '{}'", cleaned, *existing));
@@ -177,6 +178,7 @@ public:
         for (const auto& f : files) {
             if (f.type == package::FileType::Directory) continue;
             auto cleaned = util::clean_rel_path(f.path);
+            if (cleaned == "usr/share/info/dir" || cleaned.ends_with("/info/dir")) continue;
             auto res = dbi_files_.put(txn, cleaned, owner_val);
             if (!res) return res;
         }
@@ -191,6 +193,7 @@ public:
         for (const auto& f : files) {
             if (f.type == package::FileType::Directory) continue;
             auto cleaned = util::clean_rel_path(f.path);
+            if (cleaned == "usr/share/info/dir" || cleaned.ends_with("/info/dir")) continue;
             auto res = dbi_files_.del(txn, cleaned);
             if (!res) return res;
         }

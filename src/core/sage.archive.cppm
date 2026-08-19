@@ -388,16 +388,16 @@ inline std::expected<void, std::string> create_package(
 
     // 3. Append data/... filesystem payload
     if (std::filesystem::exists(data_dir)) {
-        for (const auto& entry : std::filesystem::recursive_directory_iterator(data_dir)) {
-            auto rel = std::filesystem::relative(entry.path(), data_dir).string();
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(data_dir, std::filesystem::directory_options::none)) {
+            auto rel = entry.path().lexically_relative(data_dir).generic_string();
             std::string tar_name = "data/" + rel;
 
-            if (entry.is_directory()) {
-                auto r = append_tar_entry(tar_name + "/", {}, 0755, '5');
-                if (!r) return r;
-            } else if (entry.is_symlink()) {
-                auto target = std::filesystem::read_symlink(entry.path()).string();
+            if (entry.is_symlink()) {
+                auto target = std::filesystem::read_symlink(entry.path()).generic_string();
                 auto r = append_tar_entry(tar_name, {}, 0777, '2', target);
+                if (!r) return r;
+            } else if (entry.is_directory()) {
+                auto r = append_tar_entry(tar_name + "/", {}, 0755, '5');
                 if (!r) return r;
             } else if (entry.is_regular_file()) {
                 std::ifstream f(entry.path(), std::ios::binary);

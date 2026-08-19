@@ -276,6 +276,48 @@ public:
             }
         }
 
+        // Aggregate shared libraries (libstdc++, libgcc_s, etc.) into profile/lib
+        auto src_lib = toolchain_dir / "lib";
+        if (std::filesystem::exists(src_lib)) {
+            for (const auto& entry : std::filesystem::directory_iterator(src_lib)) {
+                auto fname = entry.path().filename().string();
+                if ((entry.is_regular_file() || entry.is_symlink()) && fname.find(".so") != std::string::npos) {
+                    auto dest_link = profile_lib / fname;
+                    std::error_code ec;
+                    std::filesystem::remove(dest_link, ec);
+                    std::filesystem::create_symlink(entry.path(), dest_link, ec);
+                }
+            }
+            // Also scan lib64/ if present
+            auto src_lib64 = toolchain_dir / "lib64";
+            if (std::filesystem::exists(src_lib64)) {
+                for (const auto& entry : std::filesystem::directory_iterator(src_lib64)) {
+                    auto fname = entry.path().filename().string();
+                    if ((entry.is_regular_file() || entry.is_symlink()) && fname.find(".so") != std::string::npos) {
+                        auto dest_link = profile_lib / fname;
+                        std::error_code ec;
+                        std::filesystem::remove(dest_link, ec);
+                        std::filesystem::create_symlink(entry.path(), dest_link, ec);
+                    }
+                }
+            }
+        }
+
+        // Register toolchain lib path in /etc/ld.so.conf.d/ for dynamic linker
+        {
+            auto ld_conf_dir = sysroot / "etc/ld.so.conf.d";
+            std::filesystem::create_directories(ld_conf_dir);
+            auto conf_file = ld_conf_dir / std::format("sage-{}-{}.conf", category, slot);
+            std::ofstream ofs(conf_file);
+            if (ofs.is_open()) {
+                ofs << (toolchain_dir / "lib").string() << "\n";
+                auto lib64 = toolchain_dir / "lib64";
+                if (std::filesystem::exists(lib64)) {
+                    ofs << lib64.string() << "\n";
+                }
+            }
+        }
+
         // Special compiler alias mapping
         if (category == "llvm" || category == "clang") {
             std::error_code ec;
