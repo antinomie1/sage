@@ -12,6 +12,10 @@ export module sage.vendor.lmdb;
 
 export namespace sage::vendor::lmdb {
 
+inline constexpr unsigned int flag_rdonly = MDB_RDONLY;
+inline constexpr unsigned int flag_create = MDB_CREATE;
+inline constexpr unsigned int flag_nosync = MDB_NOSYNC;
+
 inline MDB_val to_val(std::string_view sv) noexcept {
     return MDB_val{
         .mv_size = sv.size(),

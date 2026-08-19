@@ -1,6 +1,7 @@
 module;
 
 #include <elf.h>
+#include <new>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -19,6 +20,34 @@ module;
 export module sage.util;
 
 export namespace sage::util {
+
+using std::string;
+using std::string_view;
+using std::vector;
+using std::span;
+using std::optional;
+using std::expected;
+using std::unexpected;
+
+namespace fs {
+    using std::filesystem::path;
+    using std::filesystem::exists;
+    using std::filesystem::create_directories;
+    using std::filesystem::remove;
+    using std::filesystem::remove_all;
+    using std::filesystem::temp_directory_path;
+    using std::filesystem::file_size;
+    using std::filesystem::copy_file;
+    using std::filesystem::directory_iterator;
+    using std::filesystem::recursive_directory_iterator;
+}
+
+inline bool operator==(const string& a, const char* b) noexcept { return a.compare(b) == 0; }
+inline bool operator!=(const string& a, const char* b) noexcept { return a.compare(b) != 0; }
+inline bool operator==(const char* a, const string& b) noexcept { return b.compare(a) == 0; }
+inline bool operator!=(const char* a, const string& b) noexcept { return b.compare(a) != 0; }
+inline bool operator==(const string& a, string_view b) noexcept { return a.compare(b) == 0; }
+inline bool operator!=(const string& a, string_view b) noexcept { return a.compare(b) != 0; }
 
 // ============================================================================
 // ANSI Styling & Terminal Output
