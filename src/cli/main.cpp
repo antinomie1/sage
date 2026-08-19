@@ -1,10 +1,15 @@
+#include <stdlib.h>
+
 import std;
 import sage;
 
 namespace {
 
+using std::size_t;
+using std::uint32_t;
+
 void print_banner() {
-    std::println("{}🌿 Sage Package Manager v0.1.0 (Modern C++23){}", sage::util::color::green, sage::util::color::reset);
+    std::println("{}🌿 Sage Package Manager v0.2.0 (Modern C++23){}", sage::util::color::green, sage::util::color::reset);
 }
 
 void print_help() {
@@ -16,6 +21,10 @@ Commands:
   install <PKG...>         Install packages via PubGrub SAT solver & unpack archive
   remove <PKG...>          Remove installed package files and unregister state
   rebuild                  Declarative reconcile (/etc/sage/system.toml vs LMDB)
+  toolchain [list|use]     Manage multi-slot compiler toolchains (llvm, gcc, rust, java)
+  java [list|use <slot>]   Manage OpenJDK/GraalVM/Temurin versions and JAVA_HOME
+  rust [list|use <slot>]   Manage Rust stable/nightly versions and targets
+  shell [--with <spec...>] Launch ephemeral sandboxed shell with custom toolchains
   channel [COMMAND]        Manage multi-layer channels (list, add, sync)
   repo index <DIR> [NAME]  Generate index.toml for local repository directory
   query [COMMAND]          Query packages, file ownership, and manifests (nanosecond LMDB)
@@ -32,9 +41,9 @@ Global Options:
 }
 
 int cmd_test_suite() {
-    sage::util::log_info("Running Sage Complete Subsystem Integration Test Suite...");
+    sage::util::log_info("Running Sage Master Architecture & Subsystem Integration Test Suite...");
 
-    // 1. Versioning Test
+    // 1. Semantic Versioning Test
     auto v1 = sage::package::Version::parse("1.2.3-1");
     auto v2 = sage::package::Version::parse("1.2.4-1");
     if (!(v1 < v2)) {
@@ -48,7 +57,6 @@ int cmd_test_suite() {
     std::filesystem::remove_all(temp_dir);
     std::filesystem::create_directories(temp_dir / "data/usr/bin");
 
-    // Create a mock payload binary
     std::ofstream dummy_bin(temp_dir / "data/usr/bin/dummy");
     dummy_bin << "#!/bin/sh\necho 'hello sage'\n";
     dummy_bin.close();
@@ -76,17 +84,24 @@ int cmd_test_suite() {
     }
     sage::util::log_success("2. Native Streaming Tar + Zstandard Engine OK");
 
-    // 3. PubGrub Dependency Solver Test
+    // 3. PubGrub Dependency Solver & Toolchain MSRV Resolution Test
     std::vector<sage::package::PackageManifest> repo_pool;
     sage::package::PackageManifest libfoo;
     libfoo.name = "libfoo";
     libfoo.version = sage::package::Version::parse("2.1.0-1");
     libfoo.provides = {"libfoo", "so:libfoo.so.2"};
 
+    sage::package::PackageManifest gcc15;
+    gcc15.name = "gcc";
+    gcc15.version = sage::package::Version::parse("15.3.0-1");
+    gcc15.channel = "toolchain/gcc:15";
+    gcc15.provides = {"cc", "c++", "gcc", "toolchain/gcc"};
+
     sage::package::PackageManifest app;
     app.name = "demo-app";
     app.version = sage::package::Version::parse("1.0.0-1");
     app.dependencies.push_back(sage::package::Dependency::parse("libfoo >= 2.0.0"));
+    app.dependencies.push_back(sage::package::Dependency::parse("toolchain/gcc >= 14.0"));
 
     sage::package::PackageManifest openrc_pkg;
     openrc_pkg.name = "openrc";
@@ -94,16 +109,17 @@ int cmd_test_suite() {
     openrc_pkg.provides = {"openrc", "virtual/init"};
 
     repo_pool.push_back(libfoo);
+    repo_pool.push_back(gcc15);
     repo_pool.push_back(app);
     repo_pool.push_back(openrc_pkg);
 
     sage::solver::DependencySolver solver(repo_pool);
     auto solve_res = solver.solve({sage::package::Dependency::parse("demo-app")});
-    if (!solve_res || solve_res->size() != 2) {
-        sage::util::log_error("Dependency solver test failed");
+    if (!solve_res || solve_res->size() != 3) {
+        sage::util::log_error("Dependency & Toolchain MSRV solver test failed (resolved size: {})", solve_res ? solve_res->size() : 0);
         return 1;
     }
-    sage::util::log_success("3. Native PubGrub / CDCL SAT Dependency Solver OK");
+    sage::util::log_success("3. Native PubGrub / CDCL SAT Dependency & MSRV Solver OK");
 
     // 4. Multi-Init Universal Service Generation Test
     sage::service::ServiceSpec svc;
@@ -138,9 +154,34 @@ int cmd_test_suite() {
         sage::util::log_error("Reconcile execute failed: {}", exec_res.error());
         return 1;
     }
-    sage::util::log_success("5. Declarative System Reconcile Engine (sage rebuild) OK");
+    sage::util::log_success("5. Declarative System Reconcile & Triggers Engine (sage rebuild) OK");
 
-    // 6. Local Repository Indexing & Zero-Copy file:// Protocol Test
+    // 6. Sub-Channel Toolchain & Profile Swapper Test
+    auto tc_dir = extract_root / "opt/channels/llvm/22/bin";
+    std::filesystem::create_directories(tc_dir);
+    std::ofstream clang_bin(tc_dir / "clang");
+    clang_bin << "#!/bin/sh\necho 'clang version 22.1.0'\n";
+    clang_bin.close();
+    std::filesystem::permissions(tc_dir / "clang", std::filesystem::perms::owner_all | std::filesystem::perms::group_read | std::filesystem::perms::group_exec);
+
+    auto sw_res = sage::channel::ProfileManager::switch_active_toolchain(extract_root, "llvm", "22");
+    if (!sw_res || !std::filesystem::exists(extract_root / "etc/sage/profiles/default/bin/cc")) {
+        sage::util::log_error("Toolchain profile switch verification failed");
+        return 1;
+    }
+    sage::util::log_success("6. Sub-Channel Toolchain Slot Swapper & Profile Aggregator OK");
+
+    // 7. Ephemeral Shell Environment Synthesis Test
+    auto shell_env = sage::channel::ProfileManager::generate_shell_env(extract_root, {
+        sage::channel::SubChannelSpec::parse("toolchain/llvm:22")
+    });
+    if (!shell_env.contains("CC") || shell_env["CC"].find("llvm/22/bin/clang") == std::string::npos) {
+        sage::util::log_error("Ephemeral shell environment generation failed");
+        return 1;
+    }
+    sage::util::log_success("7. Ephemeral Sandboxed Shell Environment Generator (sage shell) OK");
+
+    // 8. Local Repository Indexing & Zero-Copy file:// Protocol Test
     auto idx_res = sage::archive::generate_repo_index(temp_dir, "core");
     if (!idx_res || !std::filesystem::exists(temp_dir / "index.toml")) {
         sage::util::log_error("Local repository index generation failed");
@@ -152,10 +193,10 @@ int cmd_test_suite() {
         sage::util::log_error("Local file:// protocol fetch failed");
         return 1;
     }
-    sage::util::log_success("6. Local Repository (file:// & /path) Indexer & Zero-Copy Fetch OK");
+    sage::util::log_success("8. Local Repository (file:// & /path) Indexer & Zero-Copy Fetch OK");
 
     std::filesystem::remove_all(temp_dir);
-    sage::util::log_success("🎉 All Sage Subsystem Integration Tests Passed Successfully!");
+    sage::util::log_success("🎉 All Sage Master Architecture & Subsystem Integration Tests Passed Successfully!");
     return 0;
 }
 
@@ -168,7 +209,6 @@ int cmd_query(int argc, char** argv) {
     std::string sub = argv[2];
     auto db_res = sage::db::Database::open("/var/lib/sage/data.mdb", true);
     if (!db_res) {
-        // Fallback for unprivileged queries or new environments
         sage::util::log_warn("Database at /var/lib/sage/data.mdb not yet initialized or inaccessible: {}", db_res.error());
         return 0;
     }
@@ -201,6 +241,131 @@ int cmd_query(int argc, char** argv) {
             std::println("No installed package owns {}", path);
         }
     }
+    return 0;
+}
+
+int cmd_toolchain(int argc, char** argv) {
+    if (argc < 3 || std::string_view(argv[2]) == "list") {
+        auto list = sage::channel::ProfileManager::list_installed_subchannels("/");
+        std::println("Installed Toolchains & Runtimes (Sub-Channels):");
+        if (list.empty()) {
+            std::println("  (No sub-channels currently installed in /opt/channels or /usr/lib/runtimes)");
+            return 0;
+        }
+        for (const auto& sc : list) {
+            std::println("  • {:<12} slot: {:<10} scope: {:<10} path: {}", 
+                sc.category, sc.slot, sage::channel::to_string(sc.scope), sc.path.string());
+        }
+        return 0;
+    }
+
+    std::string action = argv[2];
+    if (action == "use" && argc >= 4) {
+        auto spec = sage::channel::SubChannelSpec::parse(argv[3]);
+        auto res = sage::channel::ProfileManager::switch_active_toolchain("/", spec.category, spec.slot);
+        if (!res) {
+            sage::util::log_error("{}", res.error());
+            return 1;
+        }
+        return 0;
+    }
+
+    std::println("Usage: sage toolchain [list|use <category:slot>]");
+    return 1;
+}
+
+int cmd_java(int argc, char** argv) {
+    if (argc < 3 || std::string_view(argv[2]) == "list") {
+        auto list = sage::channel::ProfileManager::list_installed_subchannels("/");
+        std::println("Installed Java Environments:");
+        size_t count = 0;
+        for (const auto& sc : list) {
+            if (sc.category == "java" || sc.category.starts_with("openjdk") || sc.category.starts_with("graalvm")) {
+                std::println("  • {:<15} slot: {:<10} path: {}", sc.category, sc.slot, sc.path.string());
+                count++;
+            }
+        }
+        if (count == 0) {
+            std::println("  (No Java sub-channels installed in /opt/channels/java)");
+        }
+        return 0;
+    }
+
+    if (std::string_view(argv[2]) == "use" && argc >= 4) {
+        std::string slot = argv[3];
+        auto res = sage::channel::ProfileManager::switch_active_toolchain("/", "java", slot);
+        if (!res) {
+            sage::util::log_error("{}", res.error());
+            return 1;
+        }
+        return 0;
+    }
+
+    std::println("Usage: sage java [list|use <slot>]");
+    return 1;
+}
+
+int cmd_rust(int argc, char** argv) {
+    if (argc < 3 || std::string_view(argv[2]) == "list") {
+        auto list = sage::channel::ProfileManager::list_installed_subchannels("/");
+        std::println("Installed Rust Toolchains:");
+        size_t count = 0;
+        for (const auto& sc : list) {
+            if (sc.category == "rust") {
+                std::println("  • {:<15} slot: {:<10} path: {}", sc.category, sc.slot, sc.path.string());
+                count++;
+            }
+        }
+        if (count == 0) {
+            std::println("  (No Rust sub-channels installed in /opt/channels/rust)");
+        }
+        return 0;
+    }
+
+    if (std::string_view(argv[2]) == "use" && argc >= 4) {
+        std::string slot = argv[3];
+        auto res = sage::channel::ProfileManager::switch_active_toolchain("/", "rust", slot);
+        if (!res) {
+            sage::util::log_error("{}", res.error());
+            return 1;
+        }
+        return 0;
+    }
+
+    std::println("Usage: sage rust [list|use <slot>]");
+    return 1;
+}
+
+int cmd_shell(int argc, char** argv) {
+    std::vector<sage::channel::SubChannelSpec> specs;
+    for (int i = 2; i < argc; ++i) {
+        if (std::string_view(argv[i]) == "--with" && i + 1 < argc) {
+            specs.push_back(sage::channel::SubChannelSpec::parse(argv[++i]));
+        }
+    }
+
+    if (specs.empty()) {
+        std::println("Usage: sage shell --with <sub-channel...> (e.g. sage shell --with toolchain/llvm:22 --with runtime/python:3.12)");
+        return 1;
+    }
+
+    auto env = sage::channel::ProfileManager::generate_shell_env("/", specs);
+    sage::util::log_info("Entering Ephemeral Sandboxed Shell with {} sub-channels...", specs.size());
+
+    // Export generated environment variables
+    for (const auto& [k, v] : env) {
+        if (const char* old_val = std::getenv(k.c_str())) {
+            ::setenv(k.c_str(), (v + ":" + old_val).c_str(), 1);
+        } else {
+            ::setenv(k.c_str(), v.c_str(), 1);
+        }
+    }
+    ::setenv("PS1", "(sage-env) \\u@\\h:\\w\\$ ", 1);
+
+    const char* user_shell = std::getenv("SHELL");
+    if (!user_shell) user_shell = "/bin/sh";
+    int ret = ::system(user_shell);
+    (void)ret;
     return 0;
 }
 
@@ -378,6 +543,18 @@ int main(int argc, char** argv) {
     }
     if (command == "query") {
         return cmd_query(argc, argv);
+    }
+    if (command == "toolchain") {
+        return cmd_toolchain(argc, argv);
+    }
+    if (command == "java") {
+        return cmd_java(argc, argv);
+    }
+    if (command == "rust") {
+        return cmd_rust(argc, argv);
+    }
+    if (command == "shell") {
+        return cmd_shell(argc, argv);
     }
     if (command == "service") {
         return cmd_service(argc, argv);

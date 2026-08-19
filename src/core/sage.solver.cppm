@@ -158,14 +158,24 @@ private:
     std::vector<package::PackageManifest> find_candidates(const package::Dependency& req) {
         std::vector<package::PackageManifest> res;
 
-        // Check if direct name match
+        // 1. Direct name match
         if (auto it = by_name_.find(req.name); it != by_name_.end()) {
             for (const auto& pkg : it->second) {
                 res.push_back(pkg);
             }
         }
 
-        // Check if virtual provider / symbol match
+        // 2. Sub-Channel toolchain/runtime prefix matching (e.g. "toolchain/gcc", "runtime/python")
+        if (req.name.starts_with("toolchain/") || req.name.starts_with("runtime/")) {
+            std::string prefix = req.name;
+            for (const auto& pkg : pool_) {
+                if (pkg.channel.starts_with(prefix) || pkg.name == prefix.substr(prefix.find('/') + 1)) {
+                    res.push_back(pkg);
+                }
+            }
+        }
+
+        // 3. Check if virtual provider / symbol match
         if (auto it = by_provides_.find(req.name); it != by_provides_.end()) {
             // If active provider declared in system.toml, prefer that provider!
             if (auto p_it = active_providers_.find(req.name); p_it != active_providers_.end()) {

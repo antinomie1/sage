@@ -27,6 +27,55 @@ struct ReconcilePlan {
     bool has_changes{false};
 };
 
+class TriggerEngine {
+public:
+    static void run_post_transaction_triggers(
+        const std::filesystem::path& sysroot, 
+        const std::vector<package::FileEntry>& touched_files) 
+    {
+        bool run_ldconfig = false;
+        bool run_ca = false;
+        bool run_mime = false;
+
+        for (const auto& f : touched_files) {
+            if (f.path.starts_with("usr/lib/") || f.path.starts_with("lib/")) {
+                if (f.path.find(".so") != std::string::npos) run_ldconfig = true;
+            }
+            if (f.path.starts_with("etc/ssl/certs/") || f.path.starts_with("usr/share/ca-certificates/")) {
+                run_ca = true;
+            }
+            if (f.path.starts_with("usr/share/mime/")) {
+                run_mime = true;
+            }
+        }
+
+        if (run_ldconfig) {
+            std::filesystem::path ldc = sysroot / "sbin/ldconfig";
+            if (std::filesystem::exists(ldc)) {
+                util::log_info("Running post-transaction trigger: /sbin/ldconfig");
+                int ret = std::system((ldc.string() + " -r " + sysroot.string()).c_str());
+                (void)ret;
+            }
+        }
+        if (run_ca) {
+            std::filesystem::path ca = sysroot / "usr/sbin/update-ca-certificates";
+            if (std::filesystem::exists(ca)) {
+                util::log_info("Running post-transaction trigger: update-ca-certificates");
+                int ret = std::system(ca.c_str());
+                (void)ret;
+            }
+        }
+        if (run_mime) {
+            std::filesystem::path mime = sysroot / "usr/bin/update-mime-database";
+            if (std::filesystem::exists(mime)) {
+                util::log_info("Running post-transaction trigger: update-mime-database");
+                int ret = std::system((mime.string() + " " + (sysroot / "usr/share/mime").string()).c_str());
+                (void)ret;
+            }
+        }
+    }
+};
+
 class ReconcileEngine {
 public:
     static std::expected<ReconcilePlan, std::string> calculate_diff(
@@ -158,6 +207,13 @@ public:
                 gen_count++;
             }
         }
+
+        // 5. Execute post-transaction file triggers (ldconfig, ca-certificates, mime)
+        std::vector<package::FileEntry> touched_files;
+        for (const auto& pkg : plan.packages_to_install) {
+            touched_files.insert(touched_files.end(), pkg.files.begin(), pkg.files.end());
+        }
+        TriggerEngine::run_post_transaction_triggers(sysroot, touched_files);
 
         util::log_success("Reconcile completed! Regenerated {} native service scripts for {}", 
             gen_count, service::to_string(plan.target_init));
