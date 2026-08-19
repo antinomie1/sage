@@ -264,6 +264,13 @@ public:
         std::filesystem::create_directories(profile_lib);
         std::filesystem::create_directories(profile_runtimes);
 
+        // Symlink targets and ld.so.conf paths must be chroot-relative:
+        // when installed with `--root /mnt` the toolchain lives at
+        // /mnt/opt/channels/..., but inside the chroot it is /opt/channels/...
+        auto chroot_abs = [&](const std::filesystem::path& p) -> std::filesystem::path {
+            return std::filesystem::path("/") / p.lexically_relative(sysroot);
+        };
+
         auto src_bin = toolchain_dir / "bin";
         if (std::filesystem::exists(src_bin)) {
             for (const auto& entry : std::filesystem::directory_iterator(src_bin)) {
@@ -271,7 +278,7 @@ public:
                     auto dest_link = profile_bin / entry.path().filename();
                     std::error_code ec;
                     std::filesystem::remove(dest_link, ec);
-                    std::filesystem::create_symlink(entry.path(), dest_link, ec);
+                    std::filesystem::create_symlink(chroot_abs(entry.path()), dest_link, ec);
                 }
             }
         }
@@ -285,7 +292,7 @@ public:
                     auto dest_link = profile_lib / fname;
                     std::error_code ec;
                     std::filesystem::remove(dest_link, ec);
-                    std::filesystem::create_symlink(entry.path(), dest_link, ec);
+                    std::filesystem::create_symlink(chroot_abs(entry.path()), dest_link, ec);
                 }
             }
             // Also scan lib64/ if present
@@ -297,7 +304,7 @@ public:
                         auto dest_link = profile_lib / fname;
                         std::error_code ec;
                         std::filesystem::remove(dest_link, ec);
-                        std::filesystem::create_symlink(entry.path(), dest_link, ec);
+                        std::filesystem::create_symlink(chroot_abs(entry.path()), dest_link, ec);
                     }
                 }
             }
@@ -310,10 +317,10 @@ public:
             auto conf_file = ld_conf_dir / std::format("sage-{}-{}.conf", category, slot);
             std::ofstream ofs(conf_file);
             if (ofs.is_open()) {
-                ofs << (toolchain_dir / "lib").string() << "\n";
+                ofs << chroot_abs(toolchain_dir / "lib").string() << "\n";
                 auto lib64 = toolchain_dir / "lib64";
                 if (std::filesystem::exists(lib64)) {
-                    ofs << lib64.string() << "\n";
+                    ofs << chroot_abs(lib64).string() << "\n";
                 }
             }
         }
@@ -324,26 +331,26 @@ public:
             std::filesystem::remove(profile_bin / "cc", ec);
             std::filesystem::remove(profile_bin / "c++", ec);
             if (std::filesystem::exists(src_bin / "clang")) {
-                std::filesystem::create_symlink(src_bin / "clang", profile_bin / "cc", ec);
+                std::filesystem::create_symlink(chroot_abs(src_bin / "clang"), profile_bin / "cc", ec);
             }
             if (std::filesystem::exists(src_bin / "clang++")) {
-                std::filesystem::create_symlink(src_bin / "clang++", profile_bin / "c++", ec);
+                std::filesystem::create_symlink(chroot_abs(src_bin / "clang++"), profile_bin / "c++", ec);
             }
         } else if (category == "gcc") {
             std::error_code ec;
             std::filesystem::remove(profile_bin / "cc", ec);
             std::filesystem::remove(profile_bin / "c++", ec);
             if (std::filesystem::exists(src_bin / "gcc")) {
-                std::filesystem::create_symlink(src_bin / "gcc", profile_bin / "cc", ec);
+                std::filesystem::create_symlink(chroot_abs(src_bin / "gcc"), profile_bin / "cc", ec);
             }
             if (std::filesystem::exists(src_bin / "g++")) {
-                std::filesystem::create_symlink(src_bin / "g++", profile_bin / "c++", ec);
+                std::filesystem::create_symlink(chroot_abs(src_bin / "g++"), profile_bin / "c++", ec);
             }
         } else if (category == "java") {
             std::error_code ec;
             auto java_home_link = profile_runtimes / "java";
             std::filesystem::remove(java_home_link, ec);
-            std::filesystem::create_symlink(toolchain_dir, java_home_link, ec);
+            std::filesystem::create_symlink(chroot_abs(toolchain_dir), java_home_link, ec);
         }
 
         util::log_success("Switched active toolchain to '{}:{}'", category, slot);
@@ -430,6 +437,9 @@ public:
         std::filesystem::create_directories(include_dir);
 
         // Aggregate symlinks from active toolchains & runtimes in priority order
+        auto chroot_abs = [&](const std::filesystem::path& p) -> std::filesystem::path {
+            return std::filesystem::path("/") / p.lexically_relative(sysroot);
+        };
         for (const auto& ch : active_channels) {
             if (!ch.enabled || ch.scope == ChannelScope::System) continue;
 
@@ -441,7 +451,7 @@ public:
                         auto dest_link = bin_dir / entry.path().filename();
                         std::error_code ec;
                         std::filesystem::remove(dest_link, ec);
-                        std::filesystem::create_symlink(entry.path(), dest_link, ec);
+                        std::filesystem::create_symlink(chroot_abs(entry.path()), dest_link, ec);
                     }
                 }
             }
@@ -453,7 +463,7 @@ public:
                         auto dest_link = lib_dir / entry.path().filename();
                         std::error_code ec;
                         std::filesystem::remove(dest_link, ec);
-                        std::filesystem::create_symlink(entry.path(), dest_link, ec);
+                        std::filesystem::create_symlink(chroot_abs(entry.path()), dest_link, ec);
                     }
                 }
             }
