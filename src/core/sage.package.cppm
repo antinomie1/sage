@@ -293,6 +293,17 @@ struct PackageManifest {
             }
         }
 
+        // Parse files
+        if (auto* fls = tbl.get_as<vendor::toml::array>("files")) {
+            for (auto&& f : *fls) {
+                if (auto str = f.value<std::string_view>()) {
+                    FileEntry fe;
+                    fe.path = std::string(*str);
+                    m.files.push_back(std::move(fe));
+                }
+            }
+        }
+
         return m;
     }
 
@@ -326,7 +337,15 @@ struct PackageManifest {
         for (const auto& c : conflicts) {
             ss << "    \"" << c.to_string() << "\",\n";
         }
-        ss << "]\n";
+        ss << "]\n\n";
+
+        if (!files.empty()) {
+            ss << "files = [\n";
+            for (const auto& f : files) {
+                ss << "    \"" << f.path << "\",\n";
+            }
+            ss << "]\n";
+        }
 
         return ss.str();
     }

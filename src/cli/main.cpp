@@ -8,6 +8,14 @@ namespace {
 using std::size_t;
 using std::uint32_t;
 
+struct CliOptions {
+    std::string command;
+    std::vector<std::string> args;
+    std::filesystem::path target_root{"/"};
+    bool dry_run{false};
+    bool verbose{false};
+};
+
 void print_banner() {
     std::println("{}🌿 Sage Package Manager v0.2.0 (Modern C++23){}", sage::util::color::green, sage::util::color::reset);
 }
@@ -15,10 +23,10 @@ void print_banner() {
 void print_help() {
     print_banner();
     std::println(R"(
-Usage: sage [OPTIONS] <COMMAND> [ARGS...]
+Usage: sage [GLOBAL OPTIONS] <COMMAND> [ARGS...]
 
 Commands:
-  install <PKG...>         Install packages via PubGrub SAT solver & unpack archive
+  install <PKG...>         Install packages into target root via PubGrub SAT solver
   remove <PKG...>          Remove installed package files and unregister state
   rebuild                  Declarative reconcile (/etc/sage/system.toml vs LMDB)
   toolchain [list|use]     Manage multi-slot compiler toolchains (llvm, gcc, rust, java)
@@ -29,16 +37,393 @@ Commands:
   repo index <DIR> [NAME]  Generate index.toml for local repository directory
   query [COMMAND]          Query packages, file ownership, and manifests (nanosecond LMDB)
   service [COMMAND]        Inspect and generate native init scripts (OpenRC/Runit/Systemd/Dinit/s6)
-  build <RECIPE_DIR>       Build *.pkg.tar.zst package from recipe.toml with ELF scanner
+  build <RECIPE_DIR>       Build package from recipe.toml (fetch source, check sha256, build, scan ELF)
   test-suite               Run internal engine self-test suite
 
 Global Options:
+  --root, --sysroot <DIR>  Operate on target root directory (default: /)
+  --dry-run                Simulate actions without modifying filesystem
+  --verbose, -v            Enable verbose diagnostics
   --help, -h               Show this help message
   --version, -V            Show version information
-  --verbose, -v            Enable verbose diagnostics
-  --dry-run                Simulate actions without modifying filesystem
 )");
 }
+
+// ============================================================================
+// Enhanced `sage build` Implementation
+// ============================================================================
+
+int cmd_build(const CliOptions& opts) {
+    if (opts.args.empty()) {
+        std::println("Usage: sage build <RECIPE_DIR>");
+        return 1;
+    }
+    std::filesystem::path recipe_dir = opts.args[0];
+    std::filesystem::path recipe_file = recipe_dir / "recipe.toml";
+    if (!std::filesystem::exists(recipe_file)) {
+        sage::util::log_error("recipe.toml not found in directory: {}", recipe_dir.string());
+        return 1;
+    }
+
+    std::ifstream rf(recipe_file);
+    std::stringstream ss;
+    ss << rf.rdbuf();
+    auto recipe_res = sage::package::Recipe::parse_toml(ss.str());
+    if (!recipe_res) {
+        sage::util::log_error("Failed to parse recipe: {}", recipe_res.error());
+        return 1;
+    }
+    const auto& r = *recipe_res;
+    sage::util::log_info("Building package '{}' version {} (channel: {})...", r.name, r.version.to_string(), r.channel);
+
+    std::filesystem::path dist_dir = recipe_dir / "distfiles";
+    std::filesystem::path src_dir = recipe_dir / "src";
+    std::filesystem::path pkg_dir = recipe_dir / "pkg";
+
+    // 1. Source Fetch & SHA256 Verification
+    if (!r.source_url.empty()) {
+        std::filesystem::create_directories(dist_dir);
+        std::string filename = std::filesystem::path(r.source_url).filename().string();
+        if (filename.empty()) filename = "source.tar.gz";
+        std::filesystem::path archive_path = dist_dir / filename;
+
+        if (!std::filesystem::exists(archive_path)) {
+            sage::util::log_info("Fetching source archive from {}...", r.source_url);
+            auto dl_res = sage::vendor::curl::download_file(r.source_url, archive_path);
+            if (!dl_res) {
+                sage::util::log_error("Failed to download source: {}", dl_res.error());
+                return 1;
+            }
+        }
+
+        // Verify SHA256
+        if (!r.source_sha256.empty()) {
+            auto hash_res = sage::util::compute_file_sha256(archive_path);
+            if (!hash_res) {
+                sage::util::log_error("Failed to compute SHA256 for source: {}", hash_res.error());
+                return 1;
+            }
+            if (*hash_res != r.source_sha256) {
+                sage::util::log_error("SHA256 checksum mismatch!\n  Expected: {}\n  Actual:   {}", r.source_sha256, *hash_res);
+                return 1;
+            }
+            sage::util::log_success("Source SHA256 checksum verified: {}", *hash_res);
+        }
+
+        // Unpack source if src_dir doesn't exist
+        if (!std::filesystem::exists(src_dir)) {
+            std::filesystem::create_directories(src_dir);
+            sage::util::log_info("Unpacking source to {}...", src_dir.string());
+            std::string cmd = std::format("tar -xf \"{}\" -C \"{}\" --strip-components=1 2>/dev/null || tar -xf \"{}\" -C \"{}\"", 
+                archive_path.string(), src_dir.string(), archive_path.string(), src_dir.string());
+            int ret = std::system(cmd.c_str());
+            (void)ret;
+        }
+    }
+
+    // 2. Prepare, Build & Install Phases
+    std::filesystem::create_directories(pkg_dir);
+    auto run_phase = [&](std::string_view phase_name, const std::vector<std::string>& cmds) -> bool {
+        if (cmds.empty()) return true;
+        sage::util::log_info("Executing {} phase...", phase_name);
+        for (const auto& cmd_line : cmds) {
+            std::string full_cmd = std::format("cd \"{}\" && DESTDIR=\"{}\" {}", 
+                src_dir.string(), pkg_dir.string(), cmd_line);
+            int ret = std::system(full_cmd.c_str());
+            if (ret != 0) {
+                sage::util::log_error("Command failed in {} phase: {}", phase_name, cmd_line);
+                return false;
+            }
+        }
+        return true;
+    };
+
+    if (!run_phase("prepare", r.prepare_cmds)) return 1;
+    if (!run_phase("build", r.build_cmds)) return 1;
+    if (!run_phase("install", r.install_cmds)) return 1;
+
+    // 3. Automated ELF Scanner for DT_SONAME & DT_NEEDED
+    sage::package::PackageManifest manifest;
+    manifest.name = r.name;
+    manifest.version = r.version;
+    manifest.description = r.description;
+    manifest.license = r.license;
+    manifest.channel = r.channel;
+    manifest.dependencies = r.host_deps;
+    manifest.provides = r.provides;
+
+    if (std::filesystem::exists(pkg_dir)) {
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(pkg_dir)) {
+            if (entry.is_regular_file()) {
+                auto elf_res = sage::util::scan_elf(entry.path());
+                if (elf_res) {
+                    if (!elf_res->soname.empty()) {
+                        manifest.provides.push_back("so:" + elf_res->soname);
+                    }
+                    for (const auto& needed : elf_res->needed) {
+                        manifest.dependencies.push_back(sage::package::Dependency::parse("so:" + needed));
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Archive Creation
+    std::string out_name = std::format("{}-{}-{}.pkg.tar.zst", r.name, r.version.ver, r.version.rel);
+    std::filesystem::path out_path = recipe_dir / out_name;
+    auto pack_res = sage::archive::create_package(manifest, pkg_dir, out_path);
+    if (!pack_res) {
+        sage::util::log_error("Package packaging failed: {}", pack_res.error());
+        return 1;
+    }
+
+    sage::util::log_success("Package built successfully: {}", out_path.string());
+    return 0;
+}
+
+// ============================================================================
+// End-to-End `sage install <PKG...>` Implementation
+// ============================================================================
+
+int cmd_install(const CliOptions& opts) {
+    if (opts.args.empty()) {
+        std::println("Usage: sage install <PKG...>");
+        return 1;
+    }
+
+    auto cfg_res = sage::config::SystemConfig::load_from_root(opts.target_root);
+    if (!cfg_res) {
+        sage::util::log_error("Failed to load configuration: {}", cfg_res.error());
+        return 1;
+    }
+    const auto& cfg = *cfg_res;
+
+    auto db_res = sage::db::Database::open(cfg.db_path);
+    if (!db_res) {
+        sage::util::log_error("Failed to open database at {}: {}", cfg.db_path.string(), db_res.error());
+        return 1;
+    }
+    auto& db = *db_res;
+
+    // 1. Gather Available Package Pool from Channels and Local Repos
+    std::vector<sage::package::PackageManifest> pool;
+    std::map<std::string, std::filesystem::path> package_archive_map;
+
+    for (const auto& ch_cfg : cfg.channels) {
+        if (!ch_cfg.enabled) continue;
+        sage::channel::Channel ch;
+        ch.name = ch_cfg.name;
+        ch.url = ch_cfg.url;
+        ch.scope = sage::channel::parse_scope(ch_cfg.scope);
+
+        // Fetch channel index
+        auto idx_res = sage::channel::ProfileManager::sync_channel(ch, cfg.cache_dir);
+        if (idx_res) {
+            for (const auto& pkg : idx_res->available_packages) {
+                pool.push_back(pkg);
+                // Map archive url / path
+                std::filesystem::path dir_base;
+                if (ch.url.starts_with("file://")) {
+                    dir_base = std::filesystem::path(ch.url.substr(7));
+                } else if (ch.url.starts_with("/")) {
+                    dir_base = std::filesystem::path(ch.url);
+                } else {
+                    dir_base = cfg.cache_dir / "pkg";
+                }
+
+                std::filesystem::path local_p = dir_base / std::format("{}-{}-{}-{}.pkg.tar.zst", pkg.name, pkg.version.ver, pkg.version.rel, pkg.arch);
+                if (!std::filesystem::exists(local_p)) {
+                    local_p = dir_base / std::format("{}-{}-{}.pkg.tar.zst", pkg.name, pkg.version.ver, pkg.version.rel);
+                }
+                if (!std::filesystem::exists(local_p)) {
+                    local_p = dir_base / std::format("{}-{}.pkg.tar.zst", pkg.name, pkg.version.ver);
+                }
+                package_archive_map[pkg.name] = local_p;
+            }
+        }
+    }
+
+    // Check if any arguments are direct .pkg.tar.zst archive files
+    std::vector<sage::package::Dependency> root_reqs;
+    for (const auto& arg : opts.args) {
+        if (arg.ends_with(".pkg.tar.zst") && std::filesystem::exists(arg)) {
+            auto ext_res = sage::archive::extract_package(arg, std::filesystem::temp_directory_path() / "sage_probe");
+            std::filesystem::remove_all(std::filesystem::temp_directory_path() / "sage_probe");
+            if (ext_res) {
+                pool.push_back(ext_res->manifest);
+                package_archive_map[ext_res->manifest.name] = std::filesystem::absolute(arg);
+                root_reqs.push_back(sage::package::Dependency::parse(ext_res->manifest.name));
+            }
+        } else {
+            root_reqs.push_back(sage::package::Dependency::parse(arg));
+        }
+    }
+
+    // 2. PubGrub SAT Dependency Solver
+    sage::solver::DependencySolver solver(pool, cfg.providers);
+    auto solve_res = solver.solve(root_reqs);
+    if (!solve_res) {
+        sage::util::log_error("Dependency resolution failed:\n{}", solve_res.error());
+        return 1;
+    }
+
+    const auto& to_install = *solve_res;
+    sage::util::log_info("Resolved {} packages to install into target root '{}':", to_install.size(), opts.target_root.string());
+    for (const auto& pkg : to_install) {
+        std::println("  + {:<20} {:<15} [{}]", pkg.name, pkg.version.to_string(), pkg.channel);
+    }
+
+    if (opts.dry_run) {
+        sage::util::log_info("Dry-run preview completed successfully (no changes written).");
+        return 0;
+    }
+
+    auto wtxn = db.begin_write_txn();
+    if (!wtxn) {
+        sage::util::log_error("Failed to open database write transaction: {}", wtxn.error());
+        return 1;
+    }
+
+    std::vector<sage::package::FileEntry> all_installed_files;
+
+    // 3. Streaming Unpack & LMDB State Registration
+    for (const auto& pkg : to_install) {
+        auto archive_it = package_archive_map.find(pkg.name);
+        if (archive_it == package_archive_map.end() || !std::filesystem::exists(archive_it->second)) {
+            sage::util::log_error("Package archive for '{}' not found at {}", pkg.name, 
+                (archive_it != package_archive_map.end()) ? archive_it->second.string() : "<unknown>");
+            return 1;
+        }
+
+        sage::channel::Channel ch;
+        ch.name = pkg.channel;
+        auto spec = sage::channel::SubChannelSpec::parse(pkg.channel);
+        ch.scope = spec.scope;
+        ch.category = spec.category;
+        ch.slot = spec.slot;
+        auto dest_root = ch.resolve_target_root(opts.target_root);
+
+        sage::util::log_info("Unpacking {} -> {}...", pkg.name, dest_root.string());
+        auto ext_res = sage::archive::extract_package(archive_it->second, dest_root);
+        if (!ext_res) {
+            sage::util::log_error("Failed to extract package '{}': {}", pkg.name, ext_res.error());
+            return 1;
+        }
+
+        auto installed_pkg = pkg;
+        installed_pkg.files = ext_res->extracted_files;
+
+        auto p_res = db.put_package(*wtxn, installed_pkg);
+        if (!p_res) return 1;
+        auto f_res = db.register_files(*wtxn, installed_pkg.name, installed_pkg.channel, installed_pkg.files);
+        if (!f_res) return 1;
+        auto prov_res = db.register_provides(*wtxn, installed_pkg.name, installed_pkg.provides);
+        if (!prov_res) return 1;
+
+        all_installed_files.insert(all_installed_files.end(), installed_pkg.files.begin(), installed_pkg.files.end());
+    }
+
+    auto commit_res = wtxn->commit();
+    if (!commit_res) {
+        sage::util::log_error("Failed to commit database transaction: {}", commit_res.error());
+        return 1;
+    }
+
+    // 4. Post-Transaction File Triggers & Profile Refresh
+    sage::rebuild::TriggerEngine::run_post_transaction_triggers(opts.target_root, all_installed_files);
+    std::vector<sage::channel::Channel> active_channels;
+    for (const auto& ch_cfg : cfg.channels) {
+        sage::channel::Channel ch;
+        ch.name = ch_cfg.name;
+        ch.scope = sage::channel::parse_scope(ch_cfg.scope);
+        ch.enabled = ch_cfg.enabled;
+        active_channels.push_back(std::move(ch));
+    }
+    (void)sage::channel::ProfileManager::regenerate_fhs_profile(opts.target_root, active_channels);
+
+    sage::util::log_success("Successfully installed {} packages into {}", to_install.size(), opts.target_root.string());
+    return 0;
+}
+
+// ============================================================================
+// End-to-End `sage remove <PKG...>` Implementation
+// ============================================================================
+
+int cmd_remove(const CliOptions& opts) {
+    if (opts.args.empty()) {
+        std::println("Usage: sage remove <PKG...>");
+        return 1;
+    }
+
+    auto cfg_res = sage::config::SystemConfig::load_from_root(opts.target_root);
+    if (!cfg_res) {
+        sage::util::log_error("Failed to load configuration: {}", cfg_res.error());
+        return 1;
+    }
+    const auto& cfg = *cfg_res;
+
+    auto db_res = sage::db::Database::open(cfg.db_path);
+    if (!db_res) {
+        sage::util::log_error("Failed to open database: {}", db_res.error());
+        return 1;
+    }
+    auto& db = *db_res;
+
+    auto wtxn = db.begin_write_txn();
+    if (!wtxn) return 1;
+
+    std::vector<sage::package::FileEntry> removed_files;
+
+    for (const auto& pkg_name : opts.args) {
+        auto pkg = db.get_package(pkg_name);
+        if (!pkg) {
+            sage::util::log_warn("Package '{}' is not installed, skipping", pkg_name);
+            continue;
+        }
+
+        sage::util::log_info("Removing package '{}'...", pkg_name);
+        sage::channel::Channel ch;
+        auto spec = sage::channel::SubChannelSpec::parse(pkg->channel);
+        ch.scope = spec.scope;
+        ch.category = spec.category;
+        ch.slot = spec.slot;
+        auto dest_root = ch.resolve_target_root(opts.target_root);
+
+        // Delete physical files
+        auto files_to_delete = pkg->files;
+        if (files_to_delete.empty()) {
+            for (const auto& fp : db.get_package_files(pkg_name)) {
+                sage::package::FileEntry fe;
+                fe.path = fp;
+                files_to_delete.push_back(std::move(fe));
+            }
+        }
+
+        for (const auto& file_entry : files_to_delete) {
+            std::filesystem::path p = dest_root / file_entry.path;
+            std::error_code ec;
+            if (!std::filesystem::is_directory(p, ec)) {
+                std::filesystem::remove(p, ec);
+            }
+            removed_files.push_back(file_entry);
+        }
+
+        (void)db.unregister_files(*wtxn, files_to_delete);
+        (void)db.unregister_provides(*wtxn, pkg->provides);
+        (void)db.del_package(*wtxn, pkg_name);
+    }
+
+    auto commit_res = wtxn->commit();
+    if (!commit_res) return 1;
+
+    sage::rebuild::TriggerEngine::run_post_transaction_triggers(opts.target_root, removed_files);
+    sage::util::log_success("Successfully removed requested packages from {}", opts.target_root.string());
+    return 0;
+}
+
+// ============================================================================
+// Other Commands & Test Suite
+// ============================================================================
 
 int cmd_test_suite() {
     sage::util::log_info("Running Sage Master Architecture & Subsystem Integration Test Suite...");
@@ -195,33 +580,60 @@ int cmd_test_suite() {
     }
     sage::util::log_success("8. Local Repository (file:// & /path) Indexer & Zero-Copy Fetch OK");
 
+    // 9. End-to-End `sage install` & `sage remove` into isolated Target Root Test
+    auto isolated_target = temp_dir / "target_root";
+    std::filesystem::create_directories(isolated_target / "etc/sage");
+    std::ofstream chan_f(isolated_target / "etc/sage/channels.toml");
+    chan_f << "schema_version = 1\n\n[[channels]]\nname = \"core\"\nurl = \"file://" << temp_dir.string() << "\"\nscope = \"system\"\npriority = 100\nenabled = true\n";
+    chan_f.close();
+
+    CliOptions inst_opts;
+    inst_opts.target_root = isolated_target;
+    inst_opts.args = {"dummy-tool"};
+    int inst_ret = cmd_install(inst_opts);
+    if (inst_ret != 0 || !std::filesystem::exists(isolated_target / "usr/bin/dummy")) {
+        sage::util::log_error("End-to-end sage install to target root failed");
+        return 1;
+    }
+
+    CliOptions rem_opts;
+    rem_opts.target_root = isolated_target;
+    rem_opts.args = {"dummy-tool"};
+    int rem_ret = cmd_remove(rem_opts);
+    if (rem_ret != 0 || std::filesystem::exists(isolated_target / "usr/bin/dummy")) {
+        sage::util::log_error("End-to-end sage remove from target root failed");
+        return 1;
+    }
+    sage::util::log_success("9. End-to-End `sage install` & `sage remove` to Target Root OK");
+
     std::filesystem::remove_all(temp_dir);
     sage::util::log_success("🎉 All Sage Master Architecture & Subsystem Integration Tests Passed Successfully!");
     return 0;
 }
 
-int cmd_query(int argc, char** argv) {
-    if (argc < 3) {
+int cmd_query(const CliOptions& opts) {
+    if (opts.args.empty()) {
         std::println("Usage: sage query [installed|info <pkg>|owner <path>]");
         return 1;
     }
 
-    std::string sub = argv[2];
-    auto db_res = sage::db::Database::open("/var/lib/sage/data.mdb", true);
+    std::string sub = opts.args[0];
+    auto cfg_res = sage::config::SystemConfig::load_from_root(opts.target_root);
+    auto db_res = sage::db::Database::open(cfg_res ? cfg_res->db_path : std::filesystem::path("/var/lib/sage/data.mdb"), true);
     if (!db_res) {
-        sage::util::log_warn("Database at /var/lib/sage/data.mdb not yet initialized or inaccessible: {}", db_res.error());
+        sage::util::log_warn("Database not yet initialized or inaccessible: {}", db_res.error());
         return 0;
     }
     auto& db = *db_res;
 
     if (sub == "installed") {
         auto list = db.list_installed_packages();
-        std::println("Installed packages ({} total):", list.size());
+        std::println("Installed packages in '{}' ({} total):", opts.target_root.string(), list.size());
         for (const auto& pkg : list) {
             std::println("  • {:<20} {:<15} [{}]", pkg.name, pkg.version.to_string(), pkg.channel);
         }
-    } else if (sub == "info" && argc >= 4) {
-        std::string pkg_name = argv[3];
+    } else if (sub == "info" && opts.args.size() >= 2) {
+        std::string pkg_name = opts.args[1];
         if (auto pkg = db.get_package(pkg_name)) {
             std::println("Package:     {}", pkg->name);
             std::println("Version:     {}", pkg->version.to_string());
@@ -233,8 +645,8 @@ int cmd_query(int argc, char** argv) {
             sage::util::log_error("Package '{}' is not installed", pkg_name);
             return 1;
         }
-    } else if (sub == "owner" && argc >= 4) {
-        std::string path = argv[3];
+    } else if (sub == "owner" && opts.args.size() >= 2) {
+        std::string path = opts.args[1];
         if (auto owner = db.get_file_owner(path)) {
             std::println("{} is owned by {}", path, *owner);
         } else {
@@ -244,10 +656,10 @@ int cmd_query(int argc, char** argv) {
     return 0;
 }
 
-int cmd_toolchain(int argc, char** argv) {
-    if (argc < 3 || std::string_view(argv[2]) == "list") {
-        auto list = sage::channel::ProfileManager::list_installed_subchannels("/");
-        std::println("Installed Toolchains & Runtimes (Sub-Channels):");
+int cmd_toolchain(const CliOptions& opts) {
+    if (opts.args.empty() || opts.args[0] == "list") {
+        auto list = sage::channel::ProfileManager::list_installed_subchannels(opts.target_root);
+        std::println("Installed Toolchains & Runtimes in '{}':", opts.target_root.string());
         if (list.empty()) {
             std::println("  (No sub-channels currently installed in /opt/channels or /usr/lib/runtimes)");
             return 0;
@@ -259,10 +671,9 @@ int cmd_toolchain(int argc, char** argv) {
         return 0;
     }
 
-    std::string action = argv[2];
-    if (action == "use" && argc >= 4) {
-        auto spec = sage::channel::SubChannelSpec::parse(argv[3]);
-        auto res = sage::channel::ProfileManager::switch_active_toolchain("/", spec.category, spec.slot);
+    if (opts.args[0] == "use" && opts.args.size() >= 2) {
+        auto spec = sage::channel::SubChannelSpec::parse(opts.args[1]);
+        auto res = sage::channel::ProfileManager::switch_active_toolchain(opts.target_root, spec.category, spec.slot);
         if (!res) {
             sage::util::log_error("{}", res.error());
             return 1;
@@ -274,10 +685,10 @@ int cmd_toolchain(int argc, char** argv) {
     return 1;
 }
 
-int cmd_java(int argc, char** argv) {
-    if (argc < 3 || std::string_view(argv[2]) == "list") {
-        auto list = sage::channel::ProfileManager::list_installed_subchannels("/");
-        std::println("Installed Java Environments:");
+int cmd_java(const CliOptions& opts) {
+    if (opts.args.empty() || opts.args[0] == "list") {
+        auto list = sage::channel::ProfileManager::list_installed_subchannels(opts.target_root);
+        std::println("Installed Java Environments in '{}':", opts.target_root.string());
         size_t count = 0;
         for (const auto& sc : list) {
             if (sc.category == "java" || sc.category.starts_with("openjdk") || sc.category.starts_with("graalvm")) {
@@ -291,9 +702,9 @@ int cmd_java(int argc, char** argv) {
         return 0;
     }
 
-    if (std::string_view(argv[2]) == "use" && argc >= 4) {
-        std::string slot = argv[3];
-        auto res = sage::channel::ProfileManager::switch_active_toolchain("/", "java", slot);
+    if (opts.args[0] == "use" && opts.args.size() >= 2) {
+        std::string slot = opts.args[1];
+        auto res = sage::channel::ProfileManager::switch_active_toolchain(opts.target_root, "java", slot);
         if (!res) {
             sage::util::log_error("{}", res.error());
             return 1;
@@ -305,10 +716,10 @@ int cmd_java(int argc, char** argv) {
     return 1;
 }
 
-int cmd_rust(int argc, char** argv) {
-    if (argc < 3 || std::string_view(argv[2]) == "list") {
-        auto list = sage::channel::ProfileManager::list_installed_subchannels("/");
-        std::println("Installed Rust Toolchains:");
+int cmd_rust(const CliOptions& opts) {
+    if (opts.args.empty() || opts.args[0] == "list") {
+        auto list = sage::channel::ProfileManager::list_installed_subchannels(opts.target_root);
+        std::println("Installed Rust Toolchains in '{}':", opts.target_root.string());
         size_t count = 0;
         for (const auto& sc : list) {
             if (sc.category == "rust") {
@@ -322,9 +733,9 @@ int cmd_rust(int argc, char** argv) {
         return 0;
     }
 
-    if (std::string_view(argv[2]) == "use" && argc >= 4) {
-        std::string slot = argv[3];
-        auto res = sage::channel::ProfileManager::switch_active_toolchain("/", "rust", slot);
+    if (opts.args[0] == "use" && opts.args.size() >= 2) {
+        std::string slot = opts.args[1];
+        auto res = sage::channel::ProfileManager::switch_active_toolchain(opts.target_root, "rust", slot);
         if (!res) {
             sage::util::log_error("{}", res.error());
             return 1;
@@ -336,11 +747,11 @@ int cmd_rust(int argc, char** argv) {
     return 1;
 }
 
-int cmd_shell(int argc, char** argv) {
+int cmd_shell(const CliOptions& opts) {
     std::vector<sage::channel::SubChannelSpec> specs;
-    for (int i = 2; i < argc; ++i) {
-        if (std::string_view(argv[i]) == "--with" && i + 1 < argc) {
-            specs.push_back(sage::channel::SubChannelSpec::parse(argv[++i]));
+    for (size_t i = 0; i < opts.args.size(); ++i) {
+        if (opts.args[i] == "--with" && i + 1 < opts.args.size()) {
+            specs.push_back(sage::channel::SubChannelSpec::parse(opts.args[++i]));
         }
     }
 
@@ -349,7 +760,7 @@ int cmd_shell(int argc, char** argv) {
         return 1;
     }
 
-    auto env = sage::channel::ProfileManager::generate_shell_env("/", specs);
+    auto env = sage::channel::ProfileManager::generate_shell_env(opts.target_root, specs);
     sage::util::log_info("Entering Ephemeral Sandboxed Shell with {} sub-channels...", specs.size());
 
     // Export generated environment variables
@@ -369,20 +780,20 @@ int cmd_shell(int argc, char** argv) {
     return 0;
 }
 
-int cmd_service(int argc, char** argv) {
-    if (argc < 3) {
+int cmd_service(const CliOptions& opts) {
+    if (opts.args.empty()) {
         std::println("Usage: sage service [list|generate <name>]");
         return 1;
     }
-    std::string sub = argv[2];
+    std::string sub = opts.args[0];
     if (sub == "list") {
         sage::util::log_info("Available native init targets: OpenRC, Runit, Systemd, Dinit, s6");
-    } else if (sub == "generate" && argc >= 4) {
-        std::string name = argv[3];
+    } else if (sub == "generate" && opts.args.size() >= 2) {
+        std::string name = opts.args[1];
         sage::service::ServiceSpec spec;
         spec.name = name;
         spec.exec_start = "/usr/bin/" + name;
-        auto res = sage::service::generate_service(spec, sage::service::InitType::OpenRC);
+        auto res = sage::service::generate_service(spec, sage::service::InitType::OpenRC, opts.target_root);
         if (res) {
             sage::util::log_success("Generated OpenRC service script at {}", res->string());
         }
@@ -390,95 +801,24 @@ int cmd_service(int argc, char** argv) {
     return 0;
 }
 
-int cmd_channel(int argc, char** argv) {
-    if (argc < 3 || std::string_view(argv[2]) == "list") {
-        auto cfg = sage::config::SystemConfig::load_or_default("/etc/sage");
-        if (!cfg) {
-            sage::util::log_error("Failed to load /etc/sage configuration: {}", cfg.error());
-            return 1;
-        }
-        std::println("Configured Channels:");
-        for (const auto& ch : cfg->channels) {
-            std::println("  • {:<15} {:<35} scope: {:<10} priority: {}", 
-                ch.name, ch.url, ch.scope, ch.priority);
-        }
-        return 0;
+int cmd_channel(const CliOptions& opts) {
+    auto cfg = sage::config::SystemConfig::load_from_root(opts.target_root);
+    if (!cfg) {
+        sage::util::log_error("Failed to load configuration: {}", cfg.error());
+        return 1;
+    }
+    std::println("Configured Channels for '{}':", opts.target_root.string());
+    for (const auto& ch : cfg->channels) {
+        std::println("  • {:<15} {:<35} scope: {:<10} priority: {}", 
+            ch.name, ch.url, ch.scope, ch.priority);
     }
     return 0;
 }
 
-int cmd_build(int argc, char** argv) {
-    if (argc < 3) {
-        std::println("Usage: sage build <RECIPE_DIR>");
-        return 1;
-    }
-    std::filesystem::path recipe_dir = argv[2];
-    std::filesystem::path recipe_file = recipe_dir / "recipe.toml";
-    if (!std::filesystem::exists(recipe_file)) {
-        sage::util::log_error("recipe.toml not found in directory: {}", recipe_dir.string());
-        return 1;
-    }
-
-    std::ifstream rf(recipe_file);
-    std::stringstream ss;
-    ss << rf.rdbuf();
-    auto recipe_res = sage::package::Recipe::parse_toml(ss.str());
-    if (!recipe_res) {
-        sage::util::log_error("Failed to parse recipe: {}", recipe_res.error());
-        return 1;
-    }
-    const auto& r = *recipe_res;
-    sage::util::log_info("Building package '{}' version {}...", r.name, r.version.to_string());
-
-    // Create manifest and package archive
-    sage::package::PackageManifest manifest;
-    manifest.name = r.name;
-    manifest.version = r.version;
-    manifest.description = r.description;
-    manifest.license = r.license;
-    manifest.channel = r.channel;
-    manifest.dependencies = r.host_deps;
-    manifest.provides = r.provides;
-
-    // Scan ELF binaries in data directory if present
-    std::filesystem::path pkg_data = recipe_dir / "pkg";
-    if (std::filesystem::exists(pkg_data)) {
-        for (const auto& entry : std::filesystem::recursive_directory_iterator(pkg_data)) {
-            if (entry.is_regular_file()) {
-                auto elf_res = sage::util::scan_elf(entry.path());
-                if (elf_res) {
-                    if (!elf_res->soname.empty()) {
-                        manifest.provides.push_back("so:" + elf_res->soname);
-                    }
-                    for (const auto& needed : elf_res->needed) {
-                        manifest.dependencies.push_back(sage::package::Dependency::parse("so:" + needed));
-                    }
-                }
-            }
-        }
-    }
-
-    std::string out_name = std::format("{}-{}-{}.pkg.tar.zst", r.name, r.version.ver, r.version.rel);
-    std::filesystem::path out_path = recipe_dir / out_name;
-    auto pack_res = sage::archive::create_package(manifest, pkg_data, out_path);
-    if (!pack_res) {
-        sage::util::log_error("Package build failed: {}", pack_res.error());
-        return 1;
-    }
-
-    sage::util::log_success("Package built successfully: {}", out_path.string());
-    return 0;
-}
-
-int cmd_rebuild(int argc, char** argv) {
-    bool dry_run = false;
-    for (int i = 2; i < argc; ++i) {
-        if (std::string_view(argv[i]) == "--dry-run") dry_run = true;
-    }
-
-    auto cfg_res = sage::config::SystemConfig::load_or_default("/etc/sage");
+int cmd_rebuild(const CliOptions& opts) {
+    auto cfg_res = sage::config::SystemConfig::load_from_root(opts.target_root);
     if (!cfg_res) {
-        sage::util::log_error("Failed to load /etc/sage configuration: {}", cfg_res.error());
+        sage::util::log_error("Failed to load configuration: {}", cfg_res.error());
         return 1;
     }
 
@@ -488,14 +828,14 @@ int cmd_rebuild(int argc, char** argv) {
         return 1;
     }
 
-    std::vector<sage::package::PackageManifest> pool; // repository pool
+    std::vector<sage::package::PackageManifest> pool;
     auto plan_res = sage::rebuild::ReconcileEngine::calculate_diff(*db_res, *cfg_res, pool);
     if (!plan_res) {
         sage::util::log_error("Failed to calculate reconcile plan: {}", plan_res.error());
         return 1;
     }
 
-    auto exec_res = sage::rebuild::ReconcileEngine::execute(*db_res, *plan_res, cfg_res->root_dir, dry_run);
+    auto exec_res = sage::rebuild::ReconcileEngine::execute(*db_res, *plan_res, opts.target_root, opts.dry_run);
     if (!exec_res) {
         sage::util::log_error("Reconcile execution failed: {}", exec_res.error());
         return 1;
@@ -503,13 +843,13 @@ int cmd_rebuild(int argc, char** argv) {
     return 0;
 }
 
-int cmd_repo(int argc, char** argv) {
-    if (argc < 4 || std::string_view(argv[2]) != "index") {
+int cmd_repo(const CliOptions& opts) {
+    if (opts.args.empty() || opts.args[0] != "index" || opts.args.size() < 2) {
         std::println("Usage: sage repo index <REPO_DIR> [CHANNEL_NAME]");
         return 1;
     }
-    std::filesystem::path repo_dir = argv[3];
-    std::string ch_name = (argc >= 5) ? argv[4] : "core";
+    std::filesystem::path repo_dir = opts.args[1];
+    std::string ch_name = (opts.args.size() >= 3) ? opts.args[2] : "core";
     sage::util::log_info("Generating index.toml for local repository at {}...", repo_dir.string());
     auto res = sage::archive::generate_repo_index(repo_dir, ch_name);
     if (!res) {
@@ -528,52 +868,71 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    std::string_view command = argv[1];
+    CliOptions opts;
+    for (int i = 1; i < argc; ++i) {
+        std::string_view arg = argv[i];
+        if (arg == "--help" || arg == "-h") {
+            print_help();
+            return 0;
+        }
+        if (arg == "--version" || arg == "-V") {
+            print_banner();
+            return 0;
+        }
+        if (arg == "--dry-run") {
+            opts.dry_run = true;
+        } else if (arg == "--verbose" || arg == "-v") {
+            opts.verbose = true;
+        } else if ((arg == "--root" || arg == "--sysroot") && i + 1 < argc) {
+            opts.target_root = argv[++i];
+        } else if (opts.command.empty()) {
+            opts.command = std::string(arg);
+        } else {
+            opts.args.push_back(std::string(arg));
+        }
+    }
 
-    if (command == "--help" || command == "-h") {
-        print_help();
-        return 0;
-    }
-    if (command == "--version" || command == "-V") {
-        print_banner();
-        return 0;
-    }
-    if (command == "test-suite" || command == "test") {
+    if (opts.command == "test-suite" || opts.command == "test") {
         return cmd_test_suite();
     }
-    if (command == "query") {
-        return cmd_query(argc, argv);
+    if (opts.command == "install") {
+        return cmd_install(opts);
     }
-    if (command == "toolchain") {
-        return cmd_toolchain(argc, argv);
+    if (opts.command == "remove") {
+        return cmd_remove(opts);
     }
-    if (command == "java") {
-        return cmd_java(argc, argv);
+    if (opts.command == "build") {
+        return cmd_build(opts);
     }
-    if (command == "rust") {
-        return cmd_rust(argc, argv);
+    if (opts.command == "rebuild") {
+        return cmd_rebuild(opts);
     }
-    if (command == "shell") {
-        return cmd_shell(argc, argv);
+    if (opts.command == "query") {
+        return cmd_query(opts);
     }
-    if (command == "service") {
-        return cmd_service(argc, argv);
+    if (opts.command == "toolchain") {
+        return cmd_toolchain(opts);
     }
-    if (command == "channel") {
-        return cmd_channel(argc, argv);
+    if (opts.command == "java") {
+        return cmd_java(opts);
     }
-    if (command == "repo") {
-        return cmd_repo(argc, argv);
+    if (opts.command == "rust") {
+        return cmd_rust(opts);
     }
-    if (command == "build") {
-        return cmd_build(argc, argv);
+    if (opts.command == "shell") {
+        return cmd_shell(opts);
     }
-    if (command == "rebuild") {
-        return cmd_rebuild(argc, argv);
+    if (opts.command == "service") {
+        return cmd_service(opts);
+    }
+    if (opts.command == "channel") {
+        return cmd_channel(opts);
+    }
+    if (opts.command == "repo") {
+        return cmd_repo(opts);
     }
 
-    // Default: show help for unimplemented or unknown
-    std::println(std::cerr, "Unknown or unhandled command: '{}'", command);
+    std::println(std::cerr, "Unknown command: '{}'", opts.command);
     print_help();
     return 1;
 }

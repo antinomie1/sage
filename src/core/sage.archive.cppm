@@ -448,8 +448,22 @@ inline std::expected<void, std::string> generate_repo_index(
             auto ext_res = extract_package(entry.path(), temp_sysroot);
             std::filesystem::remove_all(temp_sysroot);
             if (ext_res) {
+                const auto& m = ext_res->manifest;
                 ss << "[[packages]]\n";
-                ss << ext_res->manifest.serialize_toml() << "\n";
+                ss << "name = \"" << m.name << "\"\n";
+                ss << "version = \"" << m.version.ver << "\"\n";
+                ss << "release = \"" << m.version.rel << "\"\n";
+                ss << "description = \"" << m.description << "\"\n";
+                ss << "license = \"" << m.license << "\"\n";
+                ss << "channel = \"" << m.channel << "\"\n";
+                ss << "arch = \"" << m.arch << "\"\n";
+                ss << "installed_size = " << m.installed_size << "\n";
+                ss << "dependencies = [\n";
+                for (const auto& d : m.dependencies) ss << "    \"" << d.to_string() << "\",\n";
+                ss << "]\n";
+                ss << "provides = [\n";
+                for (const auto& p : m.provides) ss << "    \"" << p << "\",\n";
+                ss << "]\n\n";
                 count++;
             }
         }

@@ -136,6 +136,24 @@ public:
         return std::nullopt;
     }
 
+    std::vector<std::string> get_package_files(std::string_view package_name) {
+        std::vector<std::string> files;
+        auto txn = begin_read_txn();
+        if (!txn) return files;
+        auto cur_res = vendor::lmdb::MdbCursor::open(*txn, dbi_files_);
+        if (!cur_res) return files;
+        auto& cursor = *cur_res;
+        std::string_view k, v;
+        if (cursor.first(k, v)) {
+            do {
+                if (v == package_name || v.starts_with(std::string(package_name) + ":")) {
+                    files.emplace_back(k);
+                }
+            } while (cursor.next(k, v));
+        }
+        return files;
+    }
+
     // Register package files into LMDB with atomic conflict checking
     std::expected<void, std::string> register_files(
         vendor::lmdb::MdbTxn& txn,

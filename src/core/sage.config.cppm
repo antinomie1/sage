@@ -157,6 +157,22 @@ struct SystemConfig {
         return cfg;
     }
 
+    static std::expected<SystemConfig, std::string> load_from_root(const std::filesystem::path& target_root = "/") {
+        std::filesystem::path norm_root = target_root.empty() ? "/" : target_root;
+        std::filesystem::path config_dir = (norm_root == "/") ? "/etc/sage" : (norm_root / "etc/sage");
+        auto res = load_or_default(config_dir);
+        if (!res) return res;
+        res->root_dir = norm_root;
+        if (norm_root != "/") {
+            res->db_path = norm_root / "var/lib/sage/data.mdb";
+            res->cache_dir = norm_root / "var/cache/sage";
+            res->config_dir = config_dir;
+            res->system_config_path = config_dir / "system.toml";
+            res->channels_config_path = config_dir / "channels.toml";
+        }
+        return res;
+    }
+
     [[nodiscard]] std::string serialize_system_toml() const {
         std::ostringstream ss;
         ss << "schema_version = " << schema_version << "\n\n";
