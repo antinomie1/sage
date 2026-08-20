@@ -925,11 +925,31 @@ dependencies = ["libsample >= 1.0.0"]
         return 1;
     }
 
-    // Move built packages to repo/
-    std::filesystem::copy_file(build_test_dir / "libsample/libsample-1.2.0-1.pkg.tar.zst", 
-        build_test_dir / "repo/libsample-1.2.0-1.pkg.tar.zst", std::filesystem::copy_options::overwrite_existing);
-    std::filesystem::copy_file(build_test_dir / "sample-app/sample-app-2.0.0-1.pkg.tar.zst", 
-        build_test_dir / "repo/sample-app-2.0.0-1.pkg.tar.zst", std::filesystem::copy_options::overwrite_existing);
+    // Move built packages to repo/. The names carry the arch suffix that
+    // `cmd_build` emits; the recipes above declare no `arch`, so both land on
+    // the PackageManifest default. Reported rather than thrown, so a future
+    // naming change fails with a readable diagnostic instead of terminating
+    // on an uncaught filesystem_error.
+    auto stage_package = [&](const std::filesystem::path& built,
+                             const std::filesystem::path& into) -> bool {
+        std::error_code ec;
+        std::filesystem::copy_file(built, into, std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) {
+            sage::util::log_error("Failed to stage {} into the test repo: {}",
+                built.filename().string(), ec.message());
+            return false;
+        }
+        return true;
+    };
+
+    if (!stage_package(build_test_dir / "libsample/libsample-1.2.0-1-x86_64.pkg.tar.zst",
+                       build_test_dir / "repo/libsample-1.2.0-1-x86_64.pkg.tar.zst")) {
+        return 1;
+    }
+    if (!stage_package(build_test_dir / "sample-app/sample-app-2.0.0-1-x86_64.pkg.tar.zst",
+                       build_test_dir / "repo/sample-app-2.0.0-1-x86_64.pkg.tar.zst")) {
+        return 1;
+    }
 
     // 4. Generate local repo index
     auto build_idx_res = sage::archive::generate_repo_index(build_test_dir / "repo", "core");
