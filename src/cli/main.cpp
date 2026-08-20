@@ -14,6 +14,9 @@ struct CliOptions {
     std::filesystem::path target_root{"/"};
     bool dry_run{false};
     bool verbose{false};
+    bool force{false};        // --force, -f, --nodeps, -d
+    bool cascade{false};      // --cascade, -c
+    bool no_recursive{false};  // --no-recursive
 };
 
 void print_banner() {
@@ -490,7 +493,7 @@ int cmd_install(const CliOptions& opts) {
 
 int cmd_remove(const CliOptions& opts) {
     if (opts.args.empty()) {
-        std::println("Usage: sage remove <PKG...>");
+        std::println("Usage: sage remove [--cascade|-c] [--nodeps|-d] <PKG...>");
         return 1;
     }
 
@@ -528,61 +531,166 @@ int cmd_remove(const CliOptions& opts) {
         return 0;
     }
 
-    // Iteratively discover orphaned dependencies
-    bool changed = true;
-    while (changed) {
-        changed = false;
+    // 1. Core System Provider Protection (unless --nodeps/--force is specified)
+    if (!opts.force) {
+        for (const auto& pkg_name : to_remove_set) {
+            for (const auto& [iface, prov_target] : cfg.providers) {
+                if (pkg_name == prov_target) {
+                    sage::util::log_error("Cannot remove core system package '{}' (active provider for interface '{}').", pkg_name, iface);
+                    sage::util::log_info("Tip: update /etc/sage/system.toml and run 'sage rebuild' to swap providers, or pass '--nodeps' to bypass.");
+                    return 1;
+                }
+            }
+        }
+    }
+
+    // 2. Cascade Expansion OR Reverse Dependency Protection Check
+    if (opts.cascade) {
+        // Cascade: recursively add all packages that depend on anything in to_remove_set
+        bool cascaded = true;
+        while (cascaded) {
+            cascaded = false;
+            for (const auto& [inst_name, inst_pkg] : installed_map) {
+                if (to_remove_set.contains(inst_name)) continue;
+                for (const auto& dep : inst_pkg.dependencies) {
+                    for (const auto& r_pkg_name : to_remove_set) {
+                        const auto& r_pkg = installed_map.at(r_pkg_name);
+                        bool match = (dep.name == r_pkg.name);
+                        if (!match) {
+                            for (const auto& prov : r_pkg.provides) {
+                                if (prov == dep.name || prov.starts_with(dep.name + " ")) {
+                                    match = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (match && dep.satisfies(r_pkg.version)) {
+                            to_remove_set.insert(inst_name);
+                            cascaded = true;
+                            break;
+                        }
+                    }
+                    if (cascaded) break;
+                }
+            }
+        }
+    } else if (!opts.force) {
+        // Reverse Dependency Protection: ensure no remaining package depends on the package(s) being removed
+        std::map<std::string, std::vector<std::string>> broken_deps;
+
         for (const auto& r_pkg_name : to_remove_set) {
             const auto& r_pkg = installed_map.at(r_pkg_name);
-            for (const auto& dep : r_pkg.dependencies) {
-                for (const auto& [inst_name, inst_pkg] : installed_map) {
-                    if (to_remove_set.contains(inst_name)) continue;
+            for (const auto& [inst_name, inst_pkg] : installed_map) {
+                if (to_remove_set.contains(inst_name)) continue;
 
-                    bool match = (inst_name == dep.name);
+                for (const auto& dep : inst_pkg.dependencies) {
+                    bool match = (dep.name == r_pkg.name);
                     if (!match) {
-                        for (const auto& prov : inst_pkg.provides) {
+                        for (const auto& prov : r_pkg.provides) {
                             if (prov == dep.name || prov.starts_with(dep.name + " ")) {
                                 match = true;
                                 break;
                             }
                         }
                     }
-
-                    if (match && dep.satisfies(inst_pkg.version)) {
-                        // Check if any remaining installed package outside to_remove_set still needs inst_name
-                        bool needed_by_others = false;
-                        for (const auto& [other_name, other_pkg] : installed_map) {
-                            if (to_remove_set.contains(other_name) || other_name == inst_name) continue;
-                            for (const auto& other_dep : other_pkg.dependencies) {
-                                bool other_match = (other_dep.name == inst_name);
-                                if (!other_match) {
-                                    for (const auto& prov : inst_pkg.provides) {
-                                        if (prov == other_dep.name || prov.starts_with(other_dep.name + " ")) {
-                                            other_match = true;
-                                            break;
-                                        }
+                    if (match && dep.satisfies(r_pkg.version)) {
+                        // Check if another remaining package satisfies this dependency (alternative provider)
+                        bool alt_available = false;
+                        for (const auto& [alt_name, alt_pkg] : installed_map) {
+                            if (to_remove_set.contains(alt_name) || alt_name == r_pkg_name) continue;
+                            bool alt_match = (dep.name == alt_pkg.name);
+                            if (!alt_match) {
+                                for (const auto& prov : alt_pkg.provides) {
+                                    if (prov == dep.name || prov.starts_with(dep.name + " ")) {
+                                        alt_match = true;
+                                        break;
                                     }
                                 }
-                                if (other_match && other_dep.satisfies(inst_pkg.version)) {
-                                    needed_by_others = true;
-                                    break;
-                                }
                             }
-                            if (needed_by_others) break;
-                        }
-
-                        // Also protect virtual system provider locks (e.g. virtual/init, virtual/libc)
-                        for (const auto& [iface, prov_target] : cfg.providers) {
-                            if (inst_name == prov_target) {
-                                needed_by_others = true;
+                            if (alt_match && dep.satisfies(alt_pkg.version)) {
+                                alt_available = true;
                                 break;
                             }
                         }
 
-                        if (!needed_by_others) {
-                            to_remove_set.insert(inst_name);
-                            changed = true;
-                            break;
+                        if (!alt_available) {
+                            broken_deps[r_pkg_name].push_back(std::format("{} (requires '{}')", inst_name, dep.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!broken_deps.empty()) {
+            sage::util::log_error("Failed to prepare transaction: breaking dependencies for installed packages");
+            for (const auto& [pkg_name, requirers] : broken_deps) {
+                std::println(std::cerr, "  :: Unable to remove '{}', required by:", pkg_name);
+                for (const auto& req : requirers) {
+                    std::println(std::cerr, "     - {}", req);
+                }
+            }
+            std::println(std::cerr, "Tip: use 'sage remove --cascade <PKG>' to remove dependent packages as well, or '--nodeps' to force removal.");
+            return 1;
+        }
+    }
+
+    // 3. Iteratively discover orphaned dependencies
+    if (!opts.no_recursive) {
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (const auto& r_pkg_name : to_remove_set) {
+                const auto& r_pkg = installed_map.at(r_pkg_name);
+                for (const auto& dep : r_pkg.dependencies) {
+                    for (const auto& [inst_name, inst_pkg] : installed_map) {
+                        if (to_remove_set.contains(inst_name)) continue;
+
+                        bool match = (inst_name == dep.name);
+                        if (!match) {
+                            for (const auto& prov : inst_pkg.provides) {
+                                if (prov == dep.name || prov.starts_with(dep.name + " ")) {
+                                    match = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (match && dep.satisfies(inst_pkg.version)) {
+                            // Check if any remaining installed package outside to_remove_set still needs inst_name
+                            bool needed_by_others = false;
+                            for (const auto& [other_name, other_pkg] : installed_map) {
+                                if (to_remove_set.contains(other_name) || other_name == inst_name) continue;
+                                for (const auto& other_dep : other_pkg.dependencies) {
+                                    bool other_match = (other_dep.name == inst_name);
+                                    if (!other_match) {
+                                        for (const auto& prov : other_pkg.provides) {
+                                            if (prov == other_dep.name || prov.starts_with(other_dep.name + " ")) {
+                                                other_match = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if (other_match && other_dep.satisfies(inst_pkg.version)) {
+                                        needed_by_others = true;
+                                        break;
+                                    }
+                                }
+                                if (needed_by_others) break;
+                            }
+
+                            // Also protect virtual system provider locks (e.g. virtual/init, virtual/libc)
+                            for (const auto& [iface, prov_target] : cfg.providers) {
+                                if (inst_name == prov_target) {
+                                    needed_by_others = true;
+                                    break;
+                                }
+                            }
+
+                            if (!needed_by_others) {
+                                to_remove_set.insert(inst_name);
+                                changed = true;
+                                break;
+                            }
                         }
                     }
                 }
@@ -871,7 +979,6 @@ int cmd_test_suite() {
     std::filesystem::create_directories(build_test_dir / "libsample");
     std::filesystem::create_directories(build_test_dir / "sample-app");
     std::filesystem::create_directories(build_test_dir / "repo");
-
     // Both recipes produce their payload from an `install` phase writing into
     // $DESTDIR. `cmd_build` clears <recipe>/pkg/ before running the phases, so
     // a payload staged there beforehand would be deleted and the package would
@@ -936,9 +1043,7 @@ install = [
 
     // Move built packages to repo/. The names carry the arch suffix that
     // `cmd_build` emits; the recipes above declare no `arch`, so both land on
-    // the PackageManifest default. Reported rather than thrown, so a future
-    // naming change fails with a readable diagnostic instead of terminating
-    // on an uncaught filesystem_error.
+    // the PackageManifest default.
     auto stage_package = [&](const std::filesystem::path& built,
                              const std::filesystem::path& into) -> bool {
         std::error_code ec;
@@ -990,19 +1095,26 @@ install = [
         return 1;
     }
 
-    // 7. Remove sample-app and verify libsample is auto-removed as an orphan!
-    CliOptions loop_rem_opts;
-    loop_rem_opts.target_root = loop_target;
-    loop_rem_opts.args = {"sample-app"};
-    if (cmd_remove(loop_rem_opts) != 0) {
-        sage::util::log_error("Failed to remove sample-app");
+    // 7. Verify Reverse Dependency Protection: Attempting to remove libsample directly while sample-app depends on it must fail!
+    CliOptions direct_lib_rem;
+    direct_lib_rem.target_root = loop_target;
+    direct_lib_rem.args = {"libsample"};
+    if (cmd_remove(direct_lib_rem) == 0) {
+        sage::util::log_error("Direct removal of libsample should have been blocked by reverse dependency protection!");
+        return 1;
+    }
+
+    // 8. Remove with --cascade: should remove both libsample and sample-app!
+    direct_lib_rem.cascade = true;
+    if (cmd_remove(direct_lib_rem) != 0) {
+        sage::util::log_error("Failed to cascaded-remove libsample and sample-app");
         return 1;
     }
 
     // Verify all files from both sample-app and libsample are gone from disk!
     if (std::filesystem::exists(loop_target / "usr/bin/sample-app") || 
         std::filesystem::exists(loop_target / "usr/lib/libsample.so.1")) {
-        sage::util::log_error("Orphaned dependency libsample or sample-app file still exists on disk after removal");
+        sage::util::log_error("Files still exist on disk after cascade removal");
         return 1;
     }
 
@@ -1014,6 +1126,7 @@ install = [
     }
 
     sage::util::log_success("10. Complete Build -> Index -> Install -> Remove (Auto Orphan Cleanup) Closed-Loop OK");
+    sage::util::log_success("11. Reverse Dependency Protection & Cascade Removal Safety Locks OK");
 
     std::filesystem::remove_all(temp_dir);
     sage::util::log_success("🎉 All Sage Master Architecture & Subsystem Integration Tests Passed Successfully!");
@@ -1342,6 +1455,12 @@ int main(int argc, char** argv) {
             opts.dry_run = true;
         } else if (arg == "--verbose" || arg == "-v") {
             opts.verbose = true;
+        } else if (arg == "--force" || arg == "-f" || arg == "--nodeps" || arg == "-d") {
+            opts.force = true;
+        } else if (arg == "--cascade" || arg == "-c") {
+            opts.cascade = true;
+        } else if (arg == "--no-recursive") {
+            opts.no_recursive = true;
         } else if ((arg == "--root" || arg == "--sysroot") && i + 1 < argc) {
             opts.target_root = argv[++i];
         } else if (opts.command.empty()) {
