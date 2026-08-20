@@ -36,10 +36,14 @@ public:
         bool run_ldconfig = false;
         bool run_ca = false;
         bool run_mime = false;
+        bool run_initramfs = false;
 
         for (const auto& f : touched_files) {
             if (f.path.starts_with("usr/lib/") || f.path.starts_with("lib/")) {
                 if (f.path.find(".so") != std::string::npos) run_ldconfig = true;
+            }
+            if (f.path.starts_with("usr/lib/modules/") || f.path.starts_with("boot/vmlinuz")) {
+                run_initramfs = true;
             }
             if (f.path.starts_with("etc/ssl/certs/") || f.path.starts_with("usr/share/ca-certificates/")) {
                 run_ca = true;
@@ -71,9 +75,10 @@ public:
             }
         };
 
-        if (run_ldconfig) run_target_tool("/sbin/ldconfig");
-        if (run_ca)       run_target_tool("/usr/sbin/update-ca-certificates");
-        if (run_mime)     run_target_tool("/usr/bin/update-mime-database", "/usr/share/mime");
+        if (run_ldconfig)  run_target_tool("/sbin/ldconfig");
+        if (run_initramfs) run_target_tool("/usr/bin/sage-initramfs-generate");
+        if (run_ca)        run_target_tool("/usr/sbin/update-ca-certificates");
+        if (run_mime)      run_target_tool("/usr/bin/update-mime-database", "/usr/share/mime");
     }
 };
 
