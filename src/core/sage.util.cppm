@@ -224,7 +224,11 @@ inline std::expected<ElfMetadata, std::string> scan_elf(const std::filesystem::p
 
         auto get_string = [&](uint64_t offset) -> std::string {
             if (offset >= strsz) return {};
-            return std::string(strtab.data() + offset);
+            std::string_view sv(strtab.data() + offset, strsz - offset);
+            if (auto nul = sv.find('\0'); nul != std::string_view::npos) {
+                sv = sv.substr(0, nul);
+            }
+            return std::string(sv);
         };
 
         if (soname_offset) {

@@ -316,16 +316,17 @@ inline std::expected<void, std::string> create_package(
         TarHeader hdr{};
         std::memset(&hdr, 0, sizeof(hdr));
 
-        if (name.size() > 100) {
-            size_t slash = name.rfind('/', 100);
-            if (slash != std::string_view::npos && slash < 155) {
-                std::memcpy(hdr.prefix, name.data(), slash);
-                std::memcpy(hdr.name, name.data() + slash + 1, name.size() - slash - 1);
+        if (name.size() > sizeof(hdr.name)) {
+            size_t slash = name.rfind('/', sizeof(hdr.name));
+            if (slash != std::string_view::npos && slash < sizeof(hdr.prefix)) {
+                std::memcpy(hdr.prefix, name.data(), std::min(slash, sizeof(hdr.prefix)));
+                size_t remainder = name.size() - slash - 1;
+                std::memcpy(hdr.name, name.data() + slash + 1, std::min(remainder, sizeof(hdr.name)));
             } else {
-                std::memcpy(hdr.name, name.data(), 100);
+                std::memcpy(hdr.name, name.data(), std::min(name.size(), sizeof(hdr.name)));
             }
         } else {
-            std::memcpy(hdr.name, name.data(), name.size());
+            std::memcpy(hdr.name, name.data(), std::min(name.size(), sizeof(hdr.name)));
         }
 
         write_octal(hdr.mode, sizeof(hdr.mode), mode);
