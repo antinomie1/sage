@@ -1,7 +1,7 @@
 # Sage Architecture Specification
 **Version:** 2.0  
 **Status:** Approved  
-**Language:** Modern C++20 (100% C++20 Modules)  
+**Language:** Modern C++23 (100% C++23 Modules)  
 **Build System:** xmake  
 
 ---

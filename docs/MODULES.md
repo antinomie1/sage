@@ -1,6 +1,6 @@
-# Sage C++20 Module Reference & Dependency Topology
+# Sage C++23 Module Reference & Dependency Topology
 
-**Sage** is architected using **100% C++20 Modules (`.cppm`)**. There are zero legacy header files in business logic.
+**Sage** is architected using **100% C++23 Modules (`.cppm`)**. There are zero legacy header files in business logic.
 
 ---
 
@@ -28,7 +28,7 @@ graph TD
 
     subgraph Layer3["Layer 3: Storage & Archiving (src/core/)"]
         DB["sage.db<br/>(LMDB zero-copy ACID state & file ownership engine)"]
-        ARCH["sage.archive<br/>(Native C++20 streaming Tar + Zstd extractor & packager)"]
+        ARCH["sage.archive<br/>(Native C++23 streaming Tar + Zstd extractor & packager)"]
     end
 
     subgraph Layer4["Layer 4: High-Level Orchestration (src/core/)"]
