@@ -1,6 +1,6 @@
 -- Sage Package Manager build configuration
 -- Build system: xmake (https://xmake.io)
--- Standards: Modern C++20 with full C++20 Modules (.cppm)
+-- Standards: Modern C++23 with full C++23 Modules (.cppm)
 -- Linking: Fully dynamically linked to system shared libraries
 
 set_project("sage")

@@ -6,7 +6,7 @@ Welcome to the **Sage** project! This document establishes the engineering rules
 
 ## 1. Project Overview & Philosophy
 
-**Sage** is a modern, blazingly fast, modular, multi-layer universal Linux package manager written from scratch in **Modern C++20**.
+**Sage** is a modern, blazingly fast, modular, multi-layer universal Linux package manager written from scratch in **Modern C++23**.
 
 ### Key Architectural Pillars:
 * **Universal Multi-Layer Channel System**: Manages system root (`/`), shared runtimes (`/usr/lib/runtimes`), toolchains (`/opt/channels`), and user-level packages (`~/.local`) with strict FHS compliance via profile symlink aggregation.
@@ -14,8 +14,8 @@ Welcome to the **Sage** project! This document establishes the engineering rules
 * **Declarative Reconcile Engine (`sage rebuild`)**: Reads `/etc/sage/system.toml`, calculates state diffs in LMDB, performs atomic package swaps, and auto-regenerates native service scripts for the active init system.
 * **Universal Service Specification (`service.toml`)**: Decouples services from any single init daemon, auto-compiling into OpenRC, Runit, Systemd, Dinit, and s6 configurations.
 * **Zero-Copy ACID State Storage (LMDB)**: Ultra-fast memory-mapped B+ tree database with nanosecond reads and Copy-on-Write transaction safety.
-* **Native C++20 Streaming Archive Engine**: Self-contained streaming Tar reader/writer directly compressed with `libzstd` (no `libarchive` bloat).
-* **Native C++20 PubGrub / CDCL SAT Solver**: Mathematically complete dependency resolution with world-class human-readable conflict diagnostic cause trees.
+* **Native C++23 Streaming Archive Engine**: Self-contained streaming Tar reader/writer directly compressed with `libzstd` (no `libarchive` bloat).
+* **Native C++23 PubGrub / CDCL SAT Solver**: Mathematically complete dependency resolution with world-class human-readable conflict diagnostic cause trees.
 * **Dynamic Linking by Default**: Dynamically links against system shared libraries (`liblmdb`, `libzstd`, `libtomlplusplus`, `libc`), with automated ELF `DT_NEEDED` and `DT_SONAME` scanning.
 
 ---
@@ -38,8 +38,8 @@ All code contributions MUST strictly adhere to these 5 rules:
 * Common utilities (path normalization, binary serialization, ELF SONAME extraction, string manipulation, formatting) must be written once in `sage.util` and reused everywhere.
 * Use `constexpr`, `inline`, and templates to ensure code reuse introduces zero runtime overhead.
 
-### Rule 4: 100% C++20 Module System (Zero Headers in Business Logic)
-* All application code, domain models, and engines must be implemented as `.cppm` C++20 module interface files.
+### Rule 4: 100% C++23 Module System (Zero Headers in Business Logic)
+* All application code, domain models, and engines must be implemented as `.cppm` C++23 module interface files.
 * Third-party C/C++ library headers (`lmdb.h`, `zstd.h`, `toml++/toml.hpp`) are isolated exclusively within `src/vendor/` module partitions using Global Module Fragments (`module; #include <...>; export module ...;`).
 * Application code and the CLI entry point must NEVER `#include` third-party headers; use `import sage.*;` or `import sage;`.
 
@@ -64,7 +64,7 @@ sage/
 │   ├── vendor/                   # 3rd-party library RAII bridge modules
 │   │   ├── sage.vendor.lmdb.cppm # LMDB RAII wrapper (zero-copy B+ tree)
 │   │   ├── sage.vendor.zstd.cppm # Zstandard streaming RAII wrapper
-│   │   └── sage.vendor.toml.cppm # tomlplusplus C++20 module bridge
+│   │   └── sage.vendor.toml.cppm # tomlplusplus C++23 module bridge
 │   ├── core/                     # Core domain logic modules
 │   │   ├── sage.util.cppm        # Common utilities, ELF SONAME scanner, paths, formatting
 │   │   ├── sage.config.cppm      # /etc/sage/system.toml & provider configuration
@@ -72,7 +72,7 @@ sage/
 │   │   ├── sage.channel.cppm     # Multi-layer Channel runtime & FHS Profile aggregator
 │   │   ├── sage.service.cppm     # Universal service generator (OpenRC/Runit/Systemd/Dinit/s6)
 │   │   ├── sage.db.cppm          # LMDB package registry, file ownership & transaction engine
-│   │   ├── sage.archive.cppm     # Native C++20 streaming Tar + Zstd extractor & packager
+│   │   ├── sage.archive.cppm     # Native C++23 streaming Tar + Zstd extractor & packager
 │   │   ├── sage.solver.cppm      # Native PubGrub / CDCL SAT dependency solver
 │   │   └── sage.rebuild.cppm     # System reconcile & atomic rebuild orchestration
 │   ├── sage.cppm                 # Primary root module aggregating and re-exporting all modules
@@ -104,7 +104,7 @@ xmake test
 
 ## 5. Summary Checklist Before Any Contribution
 
-- [ ] Does the code use C++20 modules (`.cppm`) without legacy `#include` leaking into business logic?
+- [ ] Does the code use C++23 modules (`.cppm`) without legacy `#include` leaking into business logic?
 - [ ] Is all memory and OS resource management 100% RAII-compliant with zero manual memory management?
 - [ ] Are third-party dependencies limited exclusively to dynamic `liblmdb`, `libzstd`, and `libtomlplusplus`?
 - [ ] Is error handling monadic using `std::expected` / `std::optional` where applicable?

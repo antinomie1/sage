@@ -1,8 +1,8 @@
 # 🌿 Sage Package Manager
 
-**Sage** is a high-performance, modular, multi-layer universal Linux package manager written from scratch in **Modern C++20**.
+**Sage** is a high-performance, modular, multi-layer universal Linux package manager written from scratch in **Modern C++23**.
 
-Designed for absolute user control, radical simplicity, and microsecond-level execution speed, Sage introduces a unified **Channel-based architecture**, full **FHS compliance**, **declarative system reconciliation**, and a **pure C++20 module-first design**.
+Designed for absolute user control, radical simplicity, and microsecond-level execution speed, Sage introduces a unified **Channel-based architecture**, full **FHS compliance**, **declarative system reconciliation**, and a **pure C++23 module-first design**.
 
 ---
 
@@ -10,7 +10,7 @@ Designed for absolute user control, radical simplicity, and microsecond-level ex
 
 * **⚡ Ultra-High Performance & Zero-Copy**:
   - Powered by **LMDB** (Memory-Mapped B+ Tree) for nanosecond package queries and Copy-on-Write ACID transactional safety.
-  - Native **C++20 streaming archive engine** over **libzstd**, eliminating heavy legacy tar libraries.
+  - Native **C++23 streaming archive engine** over **libzstd**, eliminating heavy legacy tar libraries.
 * **🌐 Universal Multi-Layer Channel System**:
   - Manages multiple OS layers seamlessly: System root (`/`), shared runtimes (`/usr/lib/runtimes`), toolchains (`/opt/channels`), and user-level apps (`~/.local`).
   - Adheres strictly to **FHS (Filesystem Hierarchy Standard)** via declarative profile symlinks and environment hooks.
