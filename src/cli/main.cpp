@@ -308,6 +308,7 @@ int cmd_install(const CliOptions& opts) {
     for (auto& pkg : unique_to_install) {
         auto it = installed_by_name.find(pkg.name);
         if (it != installed_by_name.end() && it->second.version >= pkg.version) {
+            auto db_files = it->second.files.empty() ? db.get_package_files(pkg.name) : std::vector<std::string>{};
             bool files_present = true;
             if (!it->second.files.empty()) {
                 for (const auto& f : it->second.files) {
@@ -318,6 +319,15 @@ int cmd_install(const CliOptions& opts) {
                         }
                     }
                 }
+            } else if (!db_files.empty()) {
+                for (const auto& fpath : db_files) {
+                    if (!std::filesystem::exists(opts.target_root / fpath)) {
+                        files_present = false;
+                        break;
+                    }
+                }
+            } else {
+                files_present = false;
             }
             if (files_present) {
                 sage::util::log_info("  ~ {:<20} {:<15} [already installed]", pkg.name, pkg.version.to_string());
