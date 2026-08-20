@@ -38,6 +38,7 @@ Commands:
   query [COMMAND]          Query packages, file ownership, and manifests (nanosecond LMDB)
   service [COMMAND]        Inspect and generate native init scripts (OpenRC/Runit/Systemd/Dinit/s6)
   build <RECIPE_DIR>       Build package from recipe.toml (fetch source, check sha256, build, scan ELF)
+  status [--full]          Show declared providers, channels, and database state
   test-suite               Run internal engine self-test suite
 
 Global Options:
@@ -1068,6 +1069,56 @@ int cmd_channel(const CliOptions& opts) {
     return 0;
 }
 
+int cmd_status(const CliOptions& opts) {
+    auto cfg_res = sage::config::SystemConfig::load_from_root(opts.target_root);
+    if (!cfg_res) {
+        sage::util::log_error("Failed to load configuration: {}", cfg_res.error());
+        return 1;
+    }
+    const auto& cfg = *cfg_res;
+    const bool full = std::ranges::find(opts.args, "--full") != opts.args.end();
+
+    print_banner();
+    std::println("");
+    std::println("Target Root:   {}", opts.target_root.string());
+    std::println("Config Dir:    {}", cfg.config_dir.string());
+    std::println("Database:      {}{}", cfg.db_path.string(),
+        std::filesystem::exists(cfg.db_path) ? "" : "  (not initialized)");
+    std::println("Schema:        v{}", cfg.schema_version);
+
+    std::println("");
+    std::println("Active Providers:");
+    if (cfg.providers.empty()) {
+        std::println("  (none declared)");
+    } else {
+        for (const auto& [interface_name, provider] : cfg.providers) {
+            std::println("  • {:<16} {}", interface_name, provider);
+        }
+    }
+
+    std::println("");
+    std::println("Channels ({}):", cfg.channels.size());
+    for (const auto& ch : cfg.channels) {
+        std::println("  • {:<15} scope: {:<10} priority: {:<5} {}",
+            ch.name, ch.scope, ch.priority, ch.enabled ? "enabled" : "disabled");
+    }
+
+    std::println("");
+    auto db_res = sage::db::Database::open(cfg.db_path, true);
+    if (!db_res) {
+        std::println("Installed Packages: (database unavailable)");
+        return 0;
+    }
+    auto installed = db_res->list_installed_packages();
+    std::println("Installed Packages: {}", installed.size());
+    if (full) {
+        for (const auto& pkg : installed) {
+            std::println("  • {:<20} {:<15} [{}]", pkg.name, pkg.version.to_string(), pkg.channel);
+        }
+    }
+    return 0;
+}
+
 int cmd_rebuild(const CliOptions& opts) {
     auto cfg_res = sage::config::SystemConfig::load_from_root(opts.target_root);
     if (!cfg_res) {
@@ -1159,6 +1210,9 @@ int main(int argc, char** argv) {
     }
     if (opts.command == "rebuild") {
         return cmd_rebuild(opts);
+    }
+    if (opts.command == "status") {
+        return cmd_status(opts);
     }
     if (opts.command == "query") {
         return cmd_query(opts);
