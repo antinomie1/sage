@@ -20,11 +20,7 @@ elseif is_mode("debug") then
     set_optimize("none")
 end
 
--- Use system shared libraries dynamically
-add_requires("system::lmdb", {system = true})
-add_requires("system::zstd", {system = true})
-add_requires("system::tomlplusplus", {system = true})
-add_requires("system::curl", {system = true})
+add_rules("mode.release", "mode.debug")
 
 -- Sage CLI executable target
 target("sage")
@@ -33,5 +29,5 @@ target("sage")
     add_files("src/core/**.cppm")
     add_files("src/sage.cppm")
     add_files("src/cli/main.cpp")
-    add_packages("system::lmdb", "system::zstd", "system::tomlplusplus", "system::curl")
+    add_links("lmdb", "zstd", "curl")
     set_default(true)
