@@ -58,10 +58,13 @@ struct Version {
         while (i < a.size() || j < b.size()) {
             while (i < a.size() && !std::isalnum(static_cast<unsigned char>(a[i]))) ++i;
             while (j < b.size() && !std::isalnum(static_cast<unsigned char>(b[j]))) ++j;
-            if (i >= a.size() && j >= b.size()) break;
+            if (i >= a.size() || j >= b.size()) {
+                if (i >= a.size() && j >= b.size()) return 0;
+                return (i >= a.size()) ? -1 : 1;
+            }
 
-            bool a_digit = (i < a.size() && std::isdigit(static_cast<unsigned char>(a[i])));
-            bool b_digit = (j < b.size() && std::isdigit(static_cast<unsigned char>(b[j])));
+            bool a_digit = std::isdigit(static_cast<unsigned char>(a[i]));
+            bool b_digit = std::isdigit(static_cast<unsigned char>(b[j]));
 
             if (a_digit && b_digit) {
                 // Numeric comparison
@@ -81,7 +84,7 @@ struct Version {
                 if (sa != sb) {
                     return sa < sb ? -1 : 1;
                 }
-            } else {
+            } else if (!a_digit && !b_digit) {
                 // Alpha segment comparison
                 size_t start_i = i, start_j = j;
                 while (i < a.size() && std::isalpha(static_cast<unsigned char>(a[i]))) ++i;
@@ -92,6 +95,8 @@ struct Version {
                 if (sa != sb) {
                     return sa < sb ? -1 : 1;
                 }
+            } else {
+                return a_digit ? 1 : -1;
             }
         }
         return 0;

@@ -141,6 +141,9 @@ public:
             }
 
             visited.insert(req.name);
+            if (visited.contains(best_candidate->name)) {
+                continue;
+            }
             visited.insert(best_candidate->name);
             solution.push_back(*best_candidate);
 
