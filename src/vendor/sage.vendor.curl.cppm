@@ -148,9 +148,10 @@ inline std::expected<void, std::string> download_file(
 
     std::string url_str(url);
 
+    std::filesystem::path tmp_path = dest_path.string() + ".part";
     std::string last_error = "Unknown download error";
     for (int retry = 0; retry < 5; ++retry) {
-        int fd = ::open(dest_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd < 0) return std::unexpected("Failed to open destination file for write");
 
         struct SingleCtx {
@@ -192,12 +193,18 @@ inline std::expected<void, std::string> download_file(
         ::close(fd);
 
         if (res) {
+            std::error_code ec;
+            std::filesystem::rename(tmp_path, dest_path, ec);
+            if (ec) {
+                std::filesystem::remove(tmp_path, ec);
+                return std::unexpected("Failed to rename downloaded archive: " + ec.message());
+            }
             return {};
         }
 
         last_error = res.error();
         std::error_code ec;
-        std::filesystem::remove(dest_path, ec);
+        std::filesystem::remove(tmp_path, ec);
         if (retry < 4) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1000 * (retry + 1)));
         }

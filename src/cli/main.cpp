@@ -118,7 +118,13 @@ int cmd_build(const CliOptions& opts) {
             std::string cmd = std::format("tar -xf \"{}\" -C \"{}\" --strip-components=1 2>/dev/null || tar -xf \"{}\" -C \"{}\"", 
                 archive_path.string(), src_dir.string(), archive_path.string(), src_dir.string());
             int ret = std::system(cmd.c_str());
-            (void)ret;
+            if (ret != 0) {
+                sage::util::log_error("Failed to unpack source archive! Archive may be corrupted. Cleaning up...");
+                std::error_code ec;
+                std::filesystem::remove(archive_path, ec);
+                std::filesystem::remove_all(src_dir, ec);
+                return 1;
+            }
         }
     }
 
