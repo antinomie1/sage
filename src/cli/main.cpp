@@ -801,7 +801,16 @@ int cmd_test_suite() {
     std::filesystem::permissions(tc_dir / "clang", std::filesystem::perms::owner_all | std::filesystem::perms::group_read | std::filesystem::perms::group_exec);
 
     auto sw_res = sage::channel::ProfileManager::switch_active_toolchain(extract_root, "llvm", "22");
-    if (!sw_res || !std::filesystem::exists(extract_root / "etc/sage/profiles/default/bin/cc")) {
+    // Profile links are deliberately chroot-relative: they point at
+    // /opt/channels/..., which is where the toolchain lives once the sysroot
+    // becomes the root. On the build host that target does not exist, so
+    // std::filesystem::exists() -- which follows the link -- is the wrong
+    // probe. Check the link itself, and that it points where it should.
+    auto cc_link = extract_root / "etc/sage/profiles/default/bin/cc";
+    std::error_code cc_ec;
+    if (!sw_res
+        || !std::filesystem::is_symlink(cc_link, cc_ec)
+        || std::filesystem::read_symlink(cc_link, cc_ec) != "/opt/channels/llvm/22/bin/clang") {
         sage::util::log_error("Toolchain profile switch verification failed");
         return 1;
     }
