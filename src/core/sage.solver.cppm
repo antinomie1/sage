@@ -107,7 +107,8 @@ public:
         const std::vector<package::Dependency>& root_requests) 
     {
         std::vector<package::PackageManifest> solution;
-        std::set<std::string> visited;
+        std::set<std::string> visited_symbols;
+        std::set<std::string> visited_packages;
         std::vector<package::Dependency> queue = root_requests;
 
         // Diagnostic cause tree recorder
@@ -117,7 +118,7 @@ public:
             auto req = queue.back();
             queue.pop_back();
 
-            if (visited.contains(req.name)) continue;
+            if (visited_symbols.contains(req.name)) continue;
 
             auto candidates = find_candidates(req);
             if (candidates.empty()) {
@@ -140,11 +141,11 @@ public:
                 return std::unexpected(err);
             }
 
-            visited.insert(req.name);
-            if (visited.contains(best_candidate->name)) {
+            visited_symbols.insert(req.name);
+            if (visited_packages.contains(best_candidate->name)) {
                 continue;
             }
-            visited.insert(best_candidate->name);
+            visited_packages.insert(best_candidate->name);
             solution.push_back(*best_candidate);
 
             // Queue candidate dependencies
