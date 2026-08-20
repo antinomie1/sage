@@ -251,20 +251,18 @@ struct PackageManifest {
         const auto& tbl = *tbl_res;
 
         PackageManifest m;
-        m.schema_version = static_cast<uint32_t>(tbl.get("schema_version")->value_or(1LL));
+        m.schema_version = static_cast<uint32_t>(tbl["schema_version"].value_or(1LL));
 
         if (auto* pkg = tbl.get_as<vendor::toml::table>("package")) {
-            m.name = pkg->get("name")->value_or("");
-            std::string ver_str = pkg->get("version")->value_or("");
+            m.name = (*pkg)["name"].value_or("");
+            std::string ver_str = std::string((*pkg)["version"].value_or(""));
             m.version = Version::parse(ver_str);
-            if (auto* rel = pkg->get("release")) {
-                m.version.rel = rel->value_or("1");
-            }
-            m.description = pkg->get("description")->value_or("");
-            m.license = pkg->get("license")->value_or("");
-            m.channel = pkg->get("channel")->value_or("system");
-            m.arch = pkg->get("arch")->value_or("x86_64");
-            m.installed_size = pkg->get("installed_size")->value_or(0ULL);
+            m.version.rel = std::string((*pkg)["release"].value_or("1"));
+            m.description = (*pkg)["description"].value_or("");
+            m.license = (*pkg)["license"].value_or("");
+            m.channel = (*pkg)["channel"].value_or("system");
+            m.arch = (*pkg)["arch"].value_or("x86_64");
+            m.installed_size = (*pkg)["installed_size"].value_or(0ULL);
         } else {
             return std::unexpected("Missing [package] section in manifest");
         }
@@ -412,25 +410,24 @@ struct Recipe {
         const auto& tbl = *tbl_res;
 
         Recipe r;
-        r.schema_version = static_cast<uint32_t>(tbl.get("schema_version")->value_or(1LL));
+        r.schema_version = static_cast<uint32_t>(tbl["schema_version"].value_or(1LL));
 
         if (auto* pkg = tbl.get_as<vendor::toml::table>("package")) {
-            r.name = pkg->get("name")->value_or("");
-            r.version = Version::parse(pkg->get("version")->value_or(""));
-            if (auto* rel = pkg->get("release")) {
-                r.version.rel = rel->value_or("1");
-            }
-            r.description = pkg->get("description")->value_or("");
-            r.license = pkg->get("license")->value_or("");
-            r.channel = pkg->get("channel")->value_or("system");
-            r.arch = pkg->get("arch")->value_or("x86_64");
+            r.name = (*pkg)["name"].value_or("");
+            std::string ver_str = std::string((*pkg)["version"].value_or(""));
+            r.version = Version::parse(ver_str);
+            r.version.rel = std::string((*pkg)["release"].value_or("1"));
+            r.description = (*pkg)["description"].value_or("");
+            r.license = (*pkg)["license"].value_or("");
+            r.channel = (*pkg)["channel"].value_or("system");
+            r.arch = (*pkg)["arch"].value_or("x86_64");
         } else {
             return std::unexpected("Missing [package] section in recipe");
         }
 
         if (auto* src = tbl.get_as<vendor::toml::table>("source")) {
-            r.source_url = src->get("url")->value_or("");
-            r.source_sha256 = src->get("sha256")->value_or("");
+            r.source_url = (*src)["url"].value_or("");
+            r.source_sha256 = (*src)["sha256"].value_or("");
         }
 
         auto parse_deps = [&](const vendor::toml::table& t, const char* key, std::vector<Dependency>& target) {

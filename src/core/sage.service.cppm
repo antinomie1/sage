@@ -64,19 +64,19 @@ struct ServiceSpec {
         const auto& tbl = *tbl_res;
 
         ServiceSpec s;
-        s.schema_version = static_cast<uint32_t>(tbl.get("schema_version")->value_or(1LL));
+        s.schema_version = static_cast<uint32_t>(tbl["schema_version"].value_or(1LL));
         if (auto* svc = tbl.get_as<vendor::toml::table>("service")) {
-            s.name = svc->get("name")->value_or("");
-            s.description = svc->get("description")->value_or("");
-            s.exec_start = svc->get("exec_start")->value_or("");
-            s.exec_stop = svc->get("exec_stop")->value_or("");
-            s.exec_reload = svc->get("exec_reload")->value_or("");
-            s.user = svc->get("user")->value_or("root");
-            s.group = svc->get("group")->value_or("root");
-            s.working_dir = svc->get("working_dir")->value_or("/");
-            s.pid_file = svc->get("pid_file")->value_or("");
-            s.restart = svc->get("restart")->value_or("always");
-            s.type = svc->get("type")->value_or("simple");
+            s.name = (*svc)["name"].value_or("");
+            s.description = (*svc)["description"].value_or("");
+            s.exec_start = (*svc)["exec_start"].value_or("");
+            s.exec_stop = (*svc)["exec_stop"].value_or("");
+            s.exec_reload = (*svc)["exec_reload"].value_or("");
+            s.user = (*svc)["user"].value_or("root");
+            s.group = (*svc)["group"].value_or("root");
+            s.working_dir = (*svc)["working_dir"].value_or("/");
+            s.pid_file = (*svc)["pid_file"].value_or("");
+            s.restart = (*svc)["restart"].value_or("always");
+            s.type = (*svc)["type"].value_or("simple");
 
             if (auto* aft = svc->get_as<vendor::toml::array>("after")) {
                 for (auto&& a : *aft) {

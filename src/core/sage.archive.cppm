@@ -291,7 +291,7 @@ inline std::expected<void, std::string> create_package(
 
     vendor::zstd::ZstdCompressStream zstd_stream(9); // Level 9 compression
     if (!zstd_stream) {
-        return std::unexpected("Failed to initialize ZSTD compressor");
+        return std::unexpected(std::string("Failed to initialize ZSTD compressor"));
     }
 
     constexpr size_t out_chunk_size = 128 * 1024;

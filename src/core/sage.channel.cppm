@@ -147,28 +147,26 @@ struct ChannelIndex {
         const auto& tbl = *tbl_res;
 
         ChannelIndex idx;
-        idx.schema_version = static_cast<uint32_t>(tbl.get("schema_version")->value_or(1LL));
+        idx.schema_version = static_cast<uint32_t>(tbl["schema_version"].value_or(1LL));
 
         if (auto* meta = tbl.get_as<vendor::toml::table>("channel")) {
-            idx.channel_name = meta->get("name")->value_or("");
-            idx.updated_at = meta->get("updated_at")->value_or("");
+            idx.channel_name = (*meta)["name"].value_or("");
+            idx.updated_at = (*meta)["updated_at"].value_or("");
         }
 
         if (auto* pkgs = tbl.get_as<vendor::toml::array>("packages")) {
             for (auto&& item : *pkgs) {
                 if (auto* ptab = item.as_table()) {
                     package::PackageManifest m;
-                    m.name = ptab->get("name")->value_or("");
-                    std::string ver_str = ptab->get("version")->value_or("");
+                    m.name = (*ptab)["name"].value_or("");
+                    std::string ver_str = std::string((*ptab)["version"].value_or(""));
                     m.version = package::Version::parse(ver_str);
-                    if (auto* rel = ptab->get("release")) {
-                        m.version.rel = rel->value_or("1");
-                    }
-                    m.description = ptab->get("description")->value_or("");
-                    m.license = ptab->get("license")->value_or("");
-                    m.channel = ptab->get("channel")->value_or("system");
-                    m.arch = ptab->get("arch")->value_or("x86_64");
-                    m.installed_size = ptab->get("installed_size")->value_or(0ULL);
+                    m.version.rel = std::string((*ptab)["release"].value_or("1"));
+                    m.description = (*ptab)["description"].value_or("");
+                    m.license = (*ptab)["license"].value_or("");
+                    m.channel = (*ptab)["channel"].value_or("system");
+                    m.arch = (*ptab)["arch"].value_or("x86_64");
+                    m.installed_size = (*ptab)["installed_size"].value_or(0ULL);
 
                     if (auto* deps = ptab->get_as<vendor::toml::array>("dependencies")) {
                         for (auto&& d : *deps) {

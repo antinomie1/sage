@@ -57,10 +57,10 @@ struct SystemConfig {
         SystemConfig cfg;
 
         if (auto* sys = tbl.get_as<vendor::toml::table>("system")) {
-            if (auto r = sys->get("root_dir")) cfg.root_dir = r->value_or("/");
-            if (auto d = sys->get("db_path")) cfg.db_path = d->value_or("/var/lib/sage/data.mdb");
-            if (auto c = sys->get("cache_dir")) cfg.cache_dir = c->value_or("/var/cache/sage");
-            if (auto cfg_d = sys->get("config_dir")) {
+            cfg.root_dir = (*sys)["root_dir"].value_or("/");
+            cfg.db_path = (*sys)["db_path"].value_or("/var/lib/sage/data.mdb");
+            cfg.cache_dir = (*sys)["cache_dir"].value_or("/var/cache/sage");
+            if (auto* cfg_d = sys->get("config_dir")) {
                 cfg.config_dir = cfg_d->value_or("/etc/sage");
                 cfg.system_config_path = cfg.config_dir / "system.toml";
                 cfg.channels_config_path = cfg.config_dir / "channels.toml";
@@ -84,11 +84,11 @@ struct SystemConfig {
             for (auto&& item : *chs) {
                 if (auto* ctab = item.as_table()) {
                     ChannelConfig ch;
-                    ch.name = ctab->get("name")->value_or("");
-                    ch.url = ctab->get("url")->value_or("");
-                    ch.scope = ctab->get("scope")->value_or("system");
-                    ch.priority = static_cast<int>(ctab->get("priority")->value_or(50LL));
-                    ch.enabled = ctab->get("enabled")->value_or(true);
+                    ch.name = (*ctab)["name"].value_or("");
+                    ch.url = (*ctab)["url"].value_or("");
+                    ch.scope = (*ctab)["scope"].value_or("system");
+                    ch.priority = static_cast<int>((*ctab)["priority"].value_or(50LL));
+                    ch.enabled = (*ctab)["enabled"].value_or(true);
                     if (!ch.name.empty()) {
                         cfg.channels.push_back(std::move(ch));
                     }
@@ -109,11 +109,11 @@ struct SystemConfig {
             for (auto&& item : *chs) {
                 if (auto* ctab = item.as_table()) {
                     ChannelConfig ch;
-                    ch.name = ctab->get("name")->value_or("");
-                    ch.url = ctab->get("url")->value_or("");
-                    ch.scope = ctab->get("scope")->value_or("system");
-                    ch.priority = static_cast<int>(ctab->get("priority")->value_or(50LL));
-                    ch.enabled = ctab->get("enabled")->value_or(true);
+                    ch.name = (*ctab)["name"].value_or("");
+                    ch.url = (*ctab)["url"].value_or("");
+                    ch.scope = (*ctab)["scope"].value_or("system");
+                    ch.priority = static_cast<int>((*ctab)["priority"].value_or(50LL));
+                    ch.enabled = (*ctab)["enabled"].value_or(true);
                     if (!ch.name.empty()) {
                         list.push_back(std::move(ch));
                     }
