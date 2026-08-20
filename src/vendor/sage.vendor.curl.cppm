@@ -32,7 +32,8 @@ public:
             curl_easy_setopt(handle_, CURLOPT_FOLLOWLOCATION, 1L);
             curl_easy_setopt(handle_, CURLOPT_FAILONERROR, 1L);
             curl_easy_setopt(handle_, CURLOPT_NOSIGNAL, 1L);
-            curl_easy_setopt(handle_, CURLOPT_USERAGENT, "sage/0.1.0 (Linux; x86_64)");
+            curl_easy_setopt(handle_, CURLOPT_CONNECTTIMEOUT, 30L);
+            curl_easy_setopt(handle_, CURLOPT_USERAGENT, "curl/8.12.0");
         }
     }
 
@@ -119,65 +120,14 @@ inline std::expected<std::string, std::string> fetch_string(std::string_view url
     return response;
 }
 
-struct RemoteFileInfo {
-    size_t content_length{0};
-    bool supports_ranges{false};
-};
-
-inline std::expected<RemoteFileInfo, std::string> probe_remote_file(std::string_view url) {
-    if (auto local_p = parse_local_url(url); !local_p.empty()) {
-        if (std::filesystem::exists(local_p)) {
-            RemoteFileInfo info;
-            std::error_code ec;
-            info.content_length = std::filesystem::file_size(local_p, ec);
-            info.supports_ranges = false;
-            return info;
-        }
-        return std::unexpected("Local file does not exist: " + local_p.string());
-    }
-
-    CurlEasy curl;
-    if (!curl) return std::unexpected("Failed to initialize curl");
-
-    std::string url_str(url);
-    curl.setopt(CURLOPT_URL, url_str.c_str());
-    curl.setopt(CURLOPT_NOBODY, 1L); // HEAD request
-    curl.setopt(CURLOPT_HEADER, 1L);
-    curl.setopt(CURLOPT_TIMEOUT, 15L);
-
-    bool supports_ranges = false;
-    curl.setopt(CURLOPT_HEADERFUNCTION, +[](char* buffer, size_t size, size_t nitems, void* userdata) -> size_t {
-        size_t total = size * nitems;
-        std::string_view line(buffer, total);
-        auto* range_flag = static_cast<bool*>(userdata);
-        if (line.starts_with("Accept-Ranges:") || line.starts_with("accept-ranges:")) {
-            if (line.find("bytes") != std::string_view::npos) {
-                *range_flag = true;
-            }
-        }
-        return total;
-    });
-    curl.setopt(CURLOPT_HEADERDATA, &supports_ranges);
-
-    auto res = curl.perform();
-    if (!res) return std::unexpected(res.error());
-
-    curl_off_t cl = 0;
-    curl_easy_getinfo(curl.handle(), CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &cl);
-
-    RemoteFileInfo info;
-    info.content_length = (cl > 0) ? static_cast<size_t>(cl) : 0;
-    info.supports_ranges = supports_ranges;
-    return info;
-}
-
-// Download file with multi-threaded range chunks for high performance
+// Download file with stream writing and automatic retry on transient errors
 inline std::expected<void, std::string> download_file(
     std::string_view url,
     const std::filesystem::path& dest_path,
     ProgressCallback progress_cb = nullptr,
     size_t num_threads = 4) 
 {
+    (void)num_threads;
     if (auto parent = dest_path.parent_path(); !parent.empty()) {
         std::filesystem::create_directories(parent);
     }
@@ -196,33 +146,43 @@ inline std::expected<void, std::string> download_file(
         return std::unexpected("Local source file does not exist: " + local_p.string());
     }
 
-    auto probe = probe_remote_file(url);
-    size_t total_size = probe ? probe->content_length : 0;
-    bool parallel_eligible = probe && probe->supports_ranges && (total_size >= 4 * 1024 * 1024); // >= 4MB
-
     std::string url_str(url);
 
-    if (!parallel_eligible || num_threads <= 1) {
-        // Single thread stream download
+    std::string last_error = "Unknown download error";
+    for (int retry = 0; retry < 5; ++retry) {
         int fd = ::open(dest_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd < 0) return std::unexpected("Failed to open destination file for write");
 
         struct SingleCtx {
             int fd;
             ProgressCallback cb;
-            size_t total;
+            size_t total{0};
             size_t downloaded{0};
-        } ctx{fd, progress_cb, total_size, 0};
+        } ctx{fd, progress_cb, 0, 0};
 
         CurlEasy curl;
         curl.setopt(CURLOPT_URL, url_str.c_str());
+        curl.setopt(CURLOPT_FOLLOWLOCATION, 1L);
+        curl.setopt(CURLOPT_FAILONERROR, 1L);
+        curl.setopt(CURLOPT_CONNECTTIMEOUT, 30L);
+        curl.setopt(CURLOPT_LOW_SPEED_LIMIT, 1024L);
+        curl.setopt(CURLOPT_LOW_SPEED_TIME, 30L);
+
+        curl.setopt(CURLOPT_XFERINFOFUNCTION, +[](void* clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t, curl_off_t) -> int {
+            auto* c = static_cast<SingleCtx*>(clientp);
+            if (dltotal > 0) c->total = static_cast<size_t>(dltotal);
+            if (c->cb && c->total > 0) c->cb(static_cast<size_t>(dlnow), c->total);
+            return 0;
+        });
+        curl.setopt(CURLOPT_XFERINFODATA, &ctx);
+        curl.setopt(CURLOPT_NOPROGRESS, 0L);
+
         curl.setopt(CURLOPT_WRITEFUNCTION, +[](char* ptr, size_t size, size_t nmemb, void* userdata) -> size_t {
             auto* c = static_cast<SingleCtx*>(userdata);
             size_t bytes = size * nmemb;
             ssize_t written = ::write(c->fd, ptr, bytes);
             if (written > 0) {
                 c->downloaded += static_cast<size_t>(written);
-                if (c->cb) c->cb(c->downloaded, c->total);
             }
             return bytes;
         });
@@ -230,86 +190,19 @@ inline std::expected<void, std::string> download_file(
 
         auto res = curl.perform();
         ::close(fd);
-        if (!res) {
-            std::filesystem::remove(dest_path);
-            return std::unexpected(res.error());
-        }
-        return {};
-    }
 
-    // High performance multi-threaded parallel chunk download
-    int fd = ::open(dest_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) return std::unexpected("Failed to create destination file");
-
-    if (::posix_fallocate(fd, 0, static_cast<off_t>(total_size)) != 0) {
-        if (::ftruncate(fd, static_cast<off_t>(total_size)) != 0) {
-            // Ignore if filesystem already handles write offsets
-        }
-    }
-
-    std::atomic<size_t> total_downloaded{0};
-    size_t chunk_size = (total_size + num_threads - 1) / num_threads;
-
-    std::vector<std::future<std::expected<void, std::string>>> futures;
-    futures.reserve(num_threads);
-
-    for (size_t i = 0; i < num_threads; ++i) {
-        size_t start = i * chunk_size;
-        size_t end = std::min(start + chunk_size - 1, total_size - 1);
-        if (start > end) break;
-
-        futures.push_back(std::async(std::launch::async, [url_str, fd, start, end, total_size, &total_downloaded, progress_cb]() -> std::expected<void, std::string> {
-            CurlEasy curl;
-            if (!curl) return std::unexpected("Failed to init worker curl");
-
-            std::string range_header = std::to_string(start) + "-" + std::to_string(end);
-            curl.setopt(CURLOPT_URL, url_str.c_str());
-            curl.setopt(CURLOPT_RANGE, range_header.c_str());
-
-            struct ChunkCtx {
-                int fd;
-                off_t offset;
-                size_t total_size;
-                std::atomic<size_t>& global_downloaded;
-                ProgressCallback cb;
-            } cctx{fd, static_cast<off_t>(start), total_size, total_downloaded, progress_cb};
-
-            curl.setopt(CURLOPT_WRITEFUNCTION, +[](char* ptr, size_t size, size_t nmemb, void* userdata) -> size_t {
-                auto* c = static_cast<ChunkCtx*>(userdata);
-                size_t bytes = size * nmemb;
-                ssize_t written = ::pwrite(c->fd, ptr, bytes, c->offset);
-                if (written > 0) {
-                    c->offset += written;
-                    size_t cur = c->global_downloaded.fetch_add(static_cast<size_t>(written)) + static_cast<size_t>(written);
-                    if (c->cb) c->cb(cur, c->total_size);
-                }
-                return bytes;
-            });
-            curl.setopt(CURLOPT_WRITEDATA, &cctx);
-
-            auto res = curl.perform();
-            if (!res) return std::unexpected(res.error());
+        if (res) {
             return {};
-        }));
-    }
+        }
 
-    std::string error_msg;
-    for (auto& f : futures) {
-        auto res = f.get();
-        if (!res && error_msg.empty()) {
-            error_msg = res.error();
+        last_error = res.error();
+        std::error_code ec;
+        std::filesystem::remove(dest_path, ec);
+        if (retry < 4) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000 * (retry + 1)));
         }
     }
-
-    ::close(fd);
-
-    if (!error_msg.empty()) {
-        std::filesystem::remove(dest_path);
-        return std::unexpected(error_msg);
-    }
-
-    if (progress_cb) progress_cb(total_size, total_size);
-    return {};
+    return std::unexpected(last_error);
 }
 
 } // namespace sage::vendor::curl

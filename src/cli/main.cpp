@@ -248,6 +248,14 @@ int cmd_install(const CliOptions& opts) {
         }
     }
 
+    // Include already-installed packages in the pool so that installed providers
+    // (e.g. glibc providing so:libc.so.6) satisfy dependencies during bootstrap,
+    // when the repository may not yet contain the providing package. Candidates
+    // that are already installed are filtered out after solving.
+    for (auto& pkg : db.list_installed_packages()) {
+        pool.push_back(std::move(pkg));
+    }
+
     // Check if any arguments are direct .pkg.tar.zst archive files
     std::vector<sage::package::Dependency> root_reqs;
     for (const auto& arg : opts.args) {
@@ -280,6 +288,25 @@ int cmd_install(const CliOptions& opts) {
         }
     }
 
+    // Filter out packages already installed at a satisfying version: the pool
+    // includes installed packages purely as dependency providers, and the solver
+    // may have selected them as candidates. Only repo-newer versions are installed
+    // (upgrades); everything else is already satisfied by the current system.
+    std::unordered_map<std::string, sage::package::PackageManifest> installed_by_name;
+    for (auto& p : db.list_installed_packages()) {
+        installed_by_name.emplace(p.name, std::move(p));
+    }
+    std::vector<sage::package::PackageManifest> to_install;
+    for (auto& pkg : unique_to_install) {
+        auto it = installed_by_name.find(pkg.name);
+        if (it != installed_by_name.end() && it->second.version >= pkg.version) {
+            sage::util::log_info("  ~ {:<20} {:<15} [already installed]", pkg.name, pkg.version.to_string());
+            continue;
+        }
+        to_install.push_back(std::move(pkg));
+    }
+    unique_to_install = std::move(to_install);
+
     sage::util::log_info("Resolved {} packages to install into target root '{}':", unique_to_install.size(), opts.target_root.string());
     for (const auto& pkg : unique_to_install) {
         std::println("  + {:<20} {:<15} [{}]", pkg.name, pkg.version.to_string(), pkg.channel);
@@ -294,6 +321,18 @@ int cmd_install(const CliOptions& opts) {
     if (!wtxn) {
         sage::util::log_error("Failed to open database write transaction: {}", wtxn.error());
         return 1;
+    }
+
+    // Self-heal: prune file registrations owned by packages that are no longer
+    // installed (leftovers from previous versions with incomplete file lists),
+    // so the paths can be claimed by the packages about to be installed.
+    std::unordered_set<std::string> installed_names;
+    for (const auto& [name, _] : installed_by_name) {
+        installed_names.insert(name);
+    }
+    auto pruned = db.prune_orphaned_files(*wtxn, installed_names);
+    if (pruned > 0) {
+        sage::util::log_info("  ~ pruned {} orphaned file registration(s)", pruned);
     }
 
     std::vector<sage::package::FileEntry> all_installed_files;
@@ -318,6 +357,39 @@ int cmd_install(const CliOptions& opts) {
 
         auto installed_pkg = pkg;
         installed_pkg.files = ext_res->extracted_files;
+
+        // Upgrade cleanup: remove physical files owned by a previously installed
+        // version of this package that are not part of the new version, so file
+        // ownership can transition to other packages (e.g. split -dev/-libs
+        // children claim headers/libs the old monolithic version used to own).
+        auto old_it = installed_by_name.find(pkg.name);
+        if (old_it != installed_by_name.end() && old_it->second.version != pkg.version) {
+            std::unordered_set<std::string> new_paths;
+            for (const auto& f : installed_pkg.files) {
+                new_paths.insert(sage::util::clean_rel_path(f.path));
+            }
+            std::vector<sage::package::FileEntry> stale;
+            std::string my_owner = std::format("{}:{}", pkg.name, pkg.channel);
+            for (const auto& old_path : db.get_package_files(pkg.name)) {
+                if (new_paths.contains(old_path)) continue;
+                if (auto cur_owner = db.get_file_owner(old_path); cur_owner && *cur_owner != my_owner) {
+                    continue;
+                }
+                std::filesystem::path disk_p = opts.target_root / old_path;
+                std::error_code ec;
+                if (!std::filesystem::is_directory(disk_p, ec)) {
+                    std::filesystem::remove(disk_p, ec);
+                }
+                sage::package::FileEntry fe;
+                fe.path = old_path;
+                stale.push_back(std::move(fe));
+            }
+            if (!stale.empty()) {
+                (void)db.unregister_files(*wtxn, stale, my_owner);
+                sage::util::log_info("  ~ removed {} stale file(s) from previous {} {}", 
+                    stale.size(), pkg.name, old_it->second.version.to_string());
+            }
+        }
 
         auto p_res = db.put_package(*wtxn, installed_pkg);
         if (!p_res) {
@@ -513,17 +585,28 @@ int cmd_remove(const CliOptions& opts) {
         ch.slot = spec.slot;
         auto dest_root = ch.resolve_target_root(opts.target_root);
 
-        // Delete physical files
+        // Delete physical files. The LMDB files table is the authoritative owner
+        // registry: merge the installed manifest's file list with all files still
+        // registered to this package (a previous version's leftovers may not be
+        // present in the current manifest), so stale ownership records are purged.
         auto files_to_delete = pkg.files;
-        if (files_to_delete.empty()) {
-            for (const auto& fp : db.get_package_files(pkg_name)) {
+        std::unordered_set<std::string> seen_paths;
+        for (const auto& f : files_to_delete) {
+            seen_paths.insert(sage::util::clean_rel_path(f.path));
+        }
+        for (const auto& fp : db.get_package_files(pkg_name)) {
+            if (seen_paths.insert(fp).second) {
                 sage::package::FileEntry fe;
                 fe.path = fp;
                 files_to_delete.push_back(std::move(fe));
             }
         }
 
+        std::string my_owner = std::format("{}:{}", pkg_name, pkg.channel);
         for (const auto& file_entry : files_to_delete) {
+            if (auto cur_owner = db.get_file_owner(file_entry.path); cur_owner && *cur_owner != my_owner) {
+                continue;
+            }
             std::filesystem::path p = dest_root / file_entry.path;
             std::error_code ec;
             if (!std::filesystem::is_directory(p, ec)) {
@@ -532,7 +615,7 @@ int cmd_remove(const CliOptions& opts) {
             removed_files.push_back(file_entry);
         }
 
-        (void)db.unregister_files(*wtxn, files_to_delete);
+        (void)db.unregister_files(*wtxn, files_to_delete, my_owner);
         (void)db.unregister_provides(*wtxn, pkg.provides);
         (void)db.del_package(*wtxn, pkg_name);
     }

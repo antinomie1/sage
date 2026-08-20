@@ -162,19 +162,7 @@ public:
     {
         std::string owner_val = std::format("{}:{}", pkg_name, channel);
 
-        // First pass: check for conflicts
-        for (const auto& f : files) {
-            if (f.type == package::FileType::Directory) continue;
-            auto cleaned = util::clean_rel_path(f.path);
-            if (cleaned == "usr/share/info/dir" || cleaned.ends_with("/info/dir")) continue;
-            if (auto existing = dbi_files_.get(txn, cleaned)) {
-                if (*existing != owner_val) {
-                    return std::unexpected(std::format("File conflict: '{}' is already owned by '{}'", cleaned, *existing));
-                }
-            }
-        }
-
-        // Second pass: insert file records
+        // Insert file records (new owner claims file)
         for (const auto& f : files) {
             if (f.type == package::FileType::Directory) continue;
             auto cleaned = util::clean_rel_path(f.path);
@@ -188,16 +176,52 @@ public:
 
     std::expected<void, std::string> unregister_files(
         vendor::lmdb::MdbTxn& txn,
-        const std::vector<package::FileEntry>& files) 
+        const std::vector<package::FileEntry>& files,
+        std::string_view expected_owner = "") 
     {
         for (const auto& f : files) {
             if (f.type == package::FileType::Directory) continue;
             auto cleaned = util::clean_rel_path(f.path);
             if (cleaned == "usr/share/info/dir" || cleaned.ends_with("/info/dir")) continue;
+            if (!expected_owner.empty()) {
+                if (auto existing = dbi_files_.get(txn, cleaned); existing && *existing != expected_owner) {
+                    continue;
+                }
+            }
             auto res = dbi_files_.del(txn, cleaned);
             if (!res) return res;
         }
         return {};
+    }
+
+    // Prune file registrations whose owning package is no longer installed.
+    // The files table is the authoritative ownership registry: entries left
+    // behind by upgrades/removes (e.g. when a previous version's manifest file
+    // list was incomplete) would otherwise block other packages from claiming
+    // the same paths. Returns the number of pruned entries.
+    std::size_t prune_orphaned_files(
+        vendor::lmdb::MdbTxn& txn,
+        const std::unordered_set<std::string>& installed_names)
+    {
+        std::vector<std::string> orphaned;
+        auto cur_res = vendor::lmdb::MdbCursor::open(txn, dbi_files_);
+        if (!cur_res) return 0;
+        auto& cursor = *cur_res;
+        std::string_view k, v;
+        if (cursor.first(k, v)) {
+            do {
+                std::string_view owner = v;
+                auto colon = owner.find(':');
+                std::string_view pkg = colon == std::string_view::npos ? owner : owner.substr(0, colon);
+                if (!installed_names.contains(std::string(pkg))) {
+                    orphaned.emplace_back(k);
+                }
+            } while (cursor.next(k, v));
+        }
+        for (const auto& key : orphaned) {
+            (void)dbi_files_.del(txn, key);
+        }
+        return orphaned.size();
     }
 
     // ========================================================================

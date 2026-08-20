@@ -205,14 +205,17 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
                     } else {
                         // Regular File
                         entry.type = package::FileType::Regular;
-                        int fd = ::open(dest_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, mode ? mode : 0644);
+                        std::string tmp_file = dest_file.string() + ".sage_tmp";
+                        int fd = ::open(tmp_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, mode ? mode : 0644);
                         if (fd >= 0) {
                             if (file_size > 0) {
                                 ssize_t w = ::write(fd, payload_data, file_size);
                                 (void)w;
                             }
                             ::close(fd);
-                            ::chmod(dest_file.c_str(), mode ? mode : 0644);
+                            ::chmod(tmp_file.c_str(), mode ? mode : 0644);
+                            std::error_code ren_ec;
+                            std::filesystem::rename(tmp_file, dest_file, ren_ec);
                         }
 
                         // Compute file SHA256
