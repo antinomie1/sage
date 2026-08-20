@@ -395,6 +395,8 @@ struct Recipe {
     std::string description;
     std::string license;
     std::string channel{"system"};
+    // "any" marks an architecture-independent package (scripts, fonts, docs).
+    std::string arch{"x86_64"};
     std::string source_url;
     std::string source_sha256;
     std::vector<std::string> build_deps;
@@ -421,6 +423,7 @@ struct Recipe {
             r.description = pkg->get("description")->value_or("");
             r.license = pkg->get("license")->value_or("");
             r.channel = pkg->get("channel")->value_or("system");
+            r.arch = pkg->get("arch")->value_or("x86_64");
         } else {
             return std::unexpected("Missing [package] section in recipe");
         }

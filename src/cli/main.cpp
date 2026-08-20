@@ -162,6 +162,7 @@ int cmd_build(const CliOptions& opts) {
     manifest.channel = r.channel;
     manifest.dependencies = r.host_deps;
     manifest.provides = r.provides;
+    manifest.arch = r.arch;
 
     if (std::filesystem::exists(pkg_dir)) {
         for (const auto& entry : std::filesystem::recursive_directory_iterator(pkg_dir, std::filesystem::directory_options::skip_permission_denied)) {
@@ -181,7 +182,7 @@ int cmd_build(const CliOptions& opts) {
     }
 
     // 4. Archive Creation
-    std::string out_name = std::format("{}-{}-{}.pkg.tar.zst", r.name, r.version.ver, r.version.rel);
+    std::string out_name = std::format("{}-{}-{}-{}.pkg.tar.zst", r.name, r.version.ver, r.version.rel, manifest.arch);
     std::filesystem::path out_path = recipe_dir / out_name;
     auto pack_res = sage::archive::create_package(manifest, pkg_dir, out_path);
     if (!pack_res) {
