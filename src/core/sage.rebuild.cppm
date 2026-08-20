@@ -49,39 +49,31 @@ public:
             }
         }
 
-        if (run_ldconfig) {
-            std::filesystem::path ldc = sysroot / "sbin/ldconfig";
-            if (std::filesystem::exists(ldc)) {
-                util::log_info("Running post-transaction trigger: /sbin/ldconfig");
-                // For sysroots other than "/" run the chroot's own ldconfig
-                // INSIDE the chroot, so its loader and glibc match the target
-                // (running it host-side with -r can silently fail when the
-                // host glibc is older than the target's).
-                std::string cmd = (sysroot == "/")
-                    ? ldc.string()
-                    : "chroot " + sysroot.string() + " /sbin/ldconfig";
-                int ret = std::system(cmd.c_str());
-                if (ret != 0) {
-                    util::log_warn("ldconfig trigger failed (exit {}): {}", ret, cmd);
-                }
+        // Post-transaction tools are provided BY the target, and resolve their
+        // own paths against "/". For a sysroot other than "/" they must run
+        // inside the chroot: host-side they would rebuild the HOST's caches and
+        // leave the sysroot's untouched, and the host loader may not even match
+        // the target's glibc. `abs_path` and `args` are therefore always
+        // expressed relative to the target root.
+        auto run_target_tool = [&](std::string_view abs_path, std::string_view args = "") {
+            if (!std::filesystem::exists(sysroot / std::filesystem::path(abs_path).relative_path())) {
+                return;
             }
-        }
-        if (run_ca) {
-            std::filesystem::path ca = sysroot / "usr/sbin/update-ca-certificates";
-            if (std::filesystem::exists(ca)) {
-                util::log_info("Running post-transaction trigger: update-ca-certificates");
-                int ret = std::system(ca.c_str());
-                (void)ret;
+            std::string suffix = args.empty() ? std::string{} : std::format(" {}", args);
+            std::string cmd = (sysroot == "/")
+                ? std::format("{}{}", abs_path, suffix)
+                : std::format("chroot {} {}{}", sysroot.string(), abs_path, suffix);
+
+            util::log_info("Running post-transaction trigger: {}", abs_path);
+            int ret = std::system(cmd.c_str());
+            if (ret != 0) {
+                util::log_warn("Trigger failed (exit {}): {}", ret, cmd);
             }
-        }
-        if (run_mime) {
-            std::filesystem::path mime = sysroot / "usr/bin/update-mime-database";
-            if (std::filesystem::exists(mime)) {
-                util::log_info("Running post-transaction trigger: update-mime-database");
-                int ret = std::system((mime.string() + " " + (sysroot / "usr/share/mime").string()).c_str());
-                (void)ret;
-            }
-        }
+        };
+
+        if (run_ldconfig) run_target_tool("/sbin/ldconfig");
+        if (run_ca)       run_target_tool("/usr/sbin/update-ca-certificates");
+        if (run_mime)     run_target_tool("/usr/bin/update-mime-database", "/usr/share/mime");
     }
 };
 
