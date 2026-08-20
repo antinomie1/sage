@@ -868,11 +868,17 @@ int cmd_test_suite() {
 
     // 10. Complete Closed-Loop: `sage build` -> `sage repo index` -> `sage install` -> `sage remove` with Orphan Cleanup
     auto build_test_dir = temp_dir / "build_test";
-    std::filesystem::create_directories(build_test_dir / "libsample/pkg/usr/lib");
-    std::filesystem::create_directories(build_test_dir / "sample-app/pkg/usr/bin");
+    std::filesystem::create_directories(build_test_dir / "libsample");
+    std::filesystem::create_directories(build_test_dir / "sample-app");
     std::filesystem::create_directories(build_test_dir / "repo");
 
-    // 1. Write libsample recipe and dummy payload
+    // Both recipes produce their payload from an `install` phase writing into
+    // $DESTDIR. `cmd_build` clears <recipe>/pkg/ before running the phases, so
+    // a payload staged there beforehand would be deleted and the package would
+    // come out empty; going through the phase is also what exercises the
+    // DESTDIR contract these packages are meant to demonstrate.
+
+    // 1. Write libsample recipe
     std::ofstream lib_recipe(build_test_dir / "libsample/recipe.toml");
     lib_recipe << R"(schema_version = 1
 [package]
@@ -884,13 +890,15 @@ license = "MIT"
 channel = "system"
 
 provides = ["libsample", "so:libsample.so.1"]
+
+install = [
+    'mkdir -p "$DESTDIR/usr/lib"',
+    'printf "/* libsample binary */\n" > "$DESTDIR/usr/lib/libsample.so.1"',
+]
 )";
     lib_recipe.close();
-    std::ofstream lib_so(build_test_dir / "libsample/pkg/usr/lib/libsample.so.1");
-    lib_so << "/* libsample binary */\n";
-    lib_so.close();
 
-    // 2. Write sample-app recipe and dummy payload
+    // 2. Write sample-app recipe
     std::ofstream app_recipe(build_test_dir / "sample-app/recipe.toml");
     app_recipe << R"(schema_version = 1
 [package]
@@ -902,13 +910,14 @@ license = "GPL-3.0"
 channel = "system"
 
 dependencies = ["libsample >= 1.0.0"]
+
+install = [
+    'mkdir -p "$DESTDIR/usr/bin"',
+    'printf "#!/bin/sh\necho running sample-app\n" > "$DESTDIR/usr/bin/sample-app"',
+    'chmod 755 "$DESTDIR/usr/bin/sample-app"',
+]
 )";
     app_recipe.close();
-    std::ofstream app_bin(build_test_dir / "sample-app/pkg/usr/bin/sample-app");
-    app_bin << "#!/bin/sh\necho 'running sample-app'\n";
-    app_bin.close();
-    std::filesystem::permissions(build_test_dir / "sample-app/pkg/usr/bin/sample-app", 
-        std::filesystem::perms::owner_all | std::filesystem::perms::group_read | std::filesystem::perms::group_exec);
 
     // 3. Execute `sage build` on both packages
     CliOptions build_lib_opts;
