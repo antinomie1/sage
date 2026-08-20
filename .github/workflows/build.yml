@@ -1,0 +1,49 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Arch rather than ubuntu-latest: every core module opens with
+    # `import std;`, which needs GCC 15. Ubuntu's images are older, and the
+    # package format this project targets is Arch's anyway.
+    container: archlinux:latest
+
+    env:
+      # Container steps run as root, and xmake refuses to run as root unless
+      # told to.
+      XMAKE_ROOT: y
+
+    steps:
+      # Must come before checkout: actions/checkout shells out to git, and
+      # the base image does not ship it.
+      - name: Install toolchain and dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base-devel git xmake \
+            lmdb zstd tomlplusplus curl
+
+      - uses: actions/checkout@v4
+
+      - name: Report toolchain versions
+        run: |
+          gcc --version | head -1
+          xmake --version | head -1
+
+      - name: Configure
+        run: xmake f -m release -y
+
+      # -v so a module-build failure shows the actual compiler invocation;
+      # C++20 module errors are close to unreadable without it.
+      - name: Build
+        run: xmake -v
+
+      - name: Smoke test
+        run: xmake run sage --version
+
+      - name: Engine self-test suite
+        run: xmake run sage test-suite
