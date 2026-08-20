@@ -308,8 +308,23 @@ int cmd_install(const CliOptions& opts) {
     for (auto& pkg : unique_to_install) {
         auto it = installed_by_name.find(pkg.name);
         if (it != installed_by_name.end() && it->second.version >= pkg.version) {
-            sage::util::log_info("  ~ {:<20} {:<15} [already installed]", pkg.name, pkg.version.to_string());
-            continue;
+            bool files_present = true;
+            if (!it->second.files.empty()) {
+                for (const auto& f : it->second.files) {
+                    if (f.type != sage::package::FileType::Directory) {
+                        if (!std::filesystem::exists(opts.target_root / f.path)) {
+                            files_present = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (files_present) {
+                sage::util::log_info("  ~ {:<20} {:<15} [already installed]", pkg.name, pkg.version.to_string());
+                continue;
+            } else {
+                sage::util::log_warn("  ! {:<20} {:<15} [files missing on disk, reinstalling]", pkg.name, pkg.version.to_string());
+            }
         }
         to_install.push_back(std::move(pkg));
     }
