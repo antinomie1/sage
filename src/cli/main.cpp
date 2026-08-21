@@ -41,6 +41,8 @@ Commands:
   channel [COMMAND]        Manage multi-layer channels (list, add, remove, sync)
   repo index <DIR> [NAME]  Generate index.toml for local repository directory
   query [COMMAND]          Query packages, files, capabilities and ownership (nanosecond LMDB)
+  list [-q] [PATTERN]      List installed packages (-q: bare names for scripting)
+  count [PATTERN]          Print the number of installed packages
   service [COMMAND]        Inspect and generate native init scripts (OpenRC/Runit/Systemd/Dinit/s6)
   build <RECIPE_DIR>       Build package from recipe.toml (fetch source, check sha256, build, scan ELF)
   verify [PKG...]          Check installed files against the recorded files.idx hashes
@@ -1569,9 +1571,105 @@ install = [
     return 0;
 }
 
+// ============================================================================
+// `sage list` / `sage count` -- installed package inventory
+// ============================================================================
+
+namespace {
+
+// Substring match, or glob when the pattern carries a wildcard. A bare name is
+// far more often meant as "anything containing this" than as an exact match,
+// but `sage count 'python-*'` should still mean what it looks like.
+bool inventory_matches(std::string_view name, std::string_view pattern) {
+    if (pattern.empty()) return true;
+    if (pattern.find_first_of("*?[") == std::string_view::npos) {
+        return name.find(pattern) != std::string_view::npos;
+    }
+    return sage::util::glob_match(pattern, name);
+}
+
+std::expected<std::vector<sage::package::PackageManifest>, std::string>
+collect_installed(const CliOptions& opts, std::string_view pattern) {
+    auto cfg_res = sage::config::SystemConfig::load_from_root(opts.target_root);
+    auto db_res = sage::db::Database::open(
+        cfg_res ? cfg_res->db_path : std::filesystem::path("/var/lib/sage/data.mdb"), true);
+    if (!db_res) return std::unexpected(db_res.error());
+
+    auto list = db_res->list_installed_packages();
+    std::erase_if(list, [&](const auto& pkg) { return !inventory_matches(pkg.name, pattern); });
+    std::ranges::sort(list, {}, &sage::package::PackageManifest::name);
+    return list;
+}
+
+} // namespace
+
+int cmd_list(const CliOptions& opts) {
+    bool quiet = false;
+    std::string pattern;
+    for (const auto& a : opts.args) {
+        if (a == "--quiet" || a == "-q") quiet = true;
+        else if (a == "--help" || a == "-h") {
+            std::println("Usage: sage list [-q|--quiet] [PATTERN]");
+            return 0;
+        } else if (pattern.empty()) pattern = a;
+    }
+
+    auto list_res = collect_installed(opts, pattern);
+    if (!list_res) {
+        // Nothing is installed on a root that has no database yet. That is a
+        // legitimate answer to "what is installed", not a failure, so -q stays
+        // silent and scripts reading it see an empty list rather than an error.
+        if (!quiet) sage::util::log_warn("Database not yet initialized or inaccessible: {}", list_res.error());
+        return quiet ? 0 : 0;
+    }
+    const auto& list = *list_res;
+
+    // -q prints bare names, one per line, so the output can be piped straight
+    // into xargs without anything having to strip decoration off it.
+    if (quiet) {
+        for (const auto& pkg : list) std::println("{}", pkg.name);
+        return 0;
+    }
+
+    if (list.empty()) {
+        std::println("No installed packages in '{}'{}", opts.target_root.string(),
+            pattern.empty() ? "" : std::format(" matching '{}'", pattern));
+        return 0;
+    }
+
+    std::uintmax_t total_size = 0;
+    for (const auto& pkg : list) total_size += pkg.installed_size;
+
+    std::println("Installed packages in '{}'{}:", opts.target_root.string(),
+        pattern.empty() ? "" : std::format(" matching '{}'", pattern));
+    for (const auto& pkg : list) {
+        std::println("  {:<28} {:<16} [{}]", pkg.name, pkg.version.to_string(), pkg.channel);
+    }
+    std::println("");
+    std::println("{} package(s), {} installed", list.size(), sage::util::format_size(total_size));
+    return 0;
+}
+
+int cmd_count(const CliOptions& opts) {
+    std::string pattern;
+    for (const auto& a : opts.args) {
+        if (a == "--help" || a == "-h") {
+            std::println("Usage: sage count [PATTERN]");
+            return 0;
+        }
+        if (pattern.empty()) pattern = a;
+    }
+
+    auto list_res = collect_installed(opts, pattern);
+    // A bare number and nothing else: this exists to be captured in a shell
+    // substitution, so it must not print a word even when the root is empty.
+    std::println("{}", list_res ? list_res->size() : 0u);
+    return 0;
+}
+
 int cmd_query(const CliOptions& opts) {
     if (opts.args.empty()) {
-        std::println("Usage: sage query [installed|info <pkg>|owner <path>|files <pkg>|capabilities]");
+        std::println("Usage: sage query [installed|count|info <pkg>|owner <path>|files <pkg>|capabilities]");
         return 1;
     }
 
@@ -1635,8 +1733,16 @@ int cmd_query(const CliOptions& opts) {
         return 0;
     }
 
+    if (sub == "count") {
+        std::println("{}", db.list_installed_packages().size());
+        return 0;
+    }
+
     if (sub == "installed") {
         auto list = db.list_installed_packages();
+        // LMDB hands these back in key order already, but sorting explicitly
+        // keeps the listing stable if the key layout ever changes.
+        std::ranges::sort(list, {}, &sage::package::PackageManifest::name);
         std::println("Installed packages in '{}' ({} total):", opts.target_root.string(), list.size());
         for (const auto& pkg : list) {
             std::println("  • {:<20} {:<15} [{}]", pkg.name, pkg.version.to_string(), pkg.channel);
@@ -2157,6 +2263,12 @@ int main(int argc, char** argv) {
     }
     if (opts.command == "query") {
         return cmd_query(opts);
+    }
+    if (opts.command == "list") {
+        return cmd_list(opts);
+    }
+    if (opts.command == "count") {
+        return cmd_count(opts);
     }
     if (opts.command == "toolchain") {
         return cmd_toolchain(opts);
