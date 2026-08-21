@@ -465,6 +465,17 @@ struct PackageManifest {
     uint64_t installed_size{0};
     std::string file;  // Relative path in repository (e.g. "acl/acl-2.4.0-2-x86_64.pkg.tar.zst")
 
+    // Build provenance, stamped by cmd_build after a successful build: the
+    // compiler actually used (after any fallback) and the effective flags.
+    // Rides along through serialization -- which is also the LMDB record and
+    // the in-archive .METADATA/manifest.toml -- and is republished by the
+    // repository index. All empty for packages built before this existed.
+    std::string build_compiler;
+    std::string build_compiler_version;
+    std::string build_cflags;
+    std::string build_cxxflags;
+    std::string build_ldflags;
+
     std::vector<Dependency> dependencies;
     std::vector<std::string> provides; // e.g. "virtual/init", "so:libz.so.1"
     std::vector<Dependency> conflicts;
@@ -512,6 +523,11 @@ struct PackageManifest {
             m.channel = (*pkg)["channel"].value_or("system");
             m.arch = (*pkg)["arch"].value_or("x86_64");
             m.installed_size = (*pkg)["installed_size"].value_or(0ULL);
+            m.build_compiler = (*pkg)["build_compiler"].value_or("");
+            m.build_compiler_version = (*pkg)["build_compiler_version"].value_or("");
+            m.build_cflags = (*pkg)["build_cflags"].value_or("");
+            m.build_cxxflags = (*pkg)["build_cxxflags"].value_or("");
+            m.build_ldflags = (*pkg)["build_ldflags"].value_or("");
         } else {
             return std::unexpected("Missing [package] section in manifest");
         }
@@ -617,6 +633,13 @@ struct PackageManifest {
         ss << "license = \"" << quote(license) << "\"\n";
         ss << "channel = \"" << quote(channel) << "\"\n";
         ss << "arch = \"" << quote(arch) << "\"\n";
+        // Provenance is omitted entirely when unknown so that packages built
+        // before it existed keep their byte-identical manifests.
+        if (!build_compiler.empty()) ss << "build_compiler = \"" << quote(build_compiler) << "\"\n";
+        if (!build_compiler_version.empty()) ss << "build_compiler_version = \"" << quote(build_compiler_version) << "\"\n";
+        if (!build_cflags.empty()) ss << "build_cflags = \"" << quote(build_cflags) << "\"\n";
+        if (!build_cxxflags.empty()) ss << "build_cxxflags = \"" << quote(build_cxxflags) << "\"\n";
+        if (!build_ldflags.empty()) ss << "build_ldflags = \"" << quote(build_ldflags) << "\"\n";
         ss << "installed_size = " << installed_size << "\n\n";
 
         ss << "dependencies = [\n";
@@ -730,6 +753,12 @@ struct Recipe {
     std::vector<std::string> prepare_cmds;
     std::vector<std::string> build_cmds;
     std::vector<std::string> install_cmds;
+    // Per-recipe compiler flags from the optional [build] table. Non-empty
+    // values replace the global baseline from /etc/sage/build.toml -- the
+    // declared downgrade for packages that cannot take the official one.
+    // cxxflags empty mirrors cflags, mirroring BuildConfig's own rule.
+    std::string cflags;
+    std::string cxxflags;
     std::vector<CapabilityHook> capability_hooks;
     std::vector<Trigger> triggers;
 
@@ -821,11 +850,33 @@ struct Recipe {
                     }
                 }
             }
+            // The [build] table is the fourth scope. It exists mainly to carry
+            // the per-recipe flag overrides below, and since a root-level
+            // `build = [...]` array cannot coexist with a `[build]` table in
+            // the same document (duplicate key), phase commands must be
+            // expressible here too or the two features would exclude
+            // each other.
+            if (auto* bld = tbl.get_as<vendor::toml::table>("build")) {
+                if (auto* arr = bld->get_as<vendor::toml::array>(key)) {
+                    for (auto&& c : *arr) {
+                        if (auto str = c.value<std::string_view>()) {
+                            dest.emplace_back(*str);
+                        }
+                    }
+                }
+            }
         };
 
         extract_cmds("prepare", r.prepare_cmds);
         extract_cmds("build", r.build_cmds);
         extract_cmds("install", r.install_cmds);
+
+        // Flag overrides are presence-respecting: an explicit `cflags = ""`
+        // clears the baseline rather than falling back to it.
+        if (auto* bld = tbl.get_as<vendor::toml::table>("build")) {
+            if (auto v = (*bld)["cflags"].value<std::string_view>()) r.cflags = std::string(*v);
+            if (auto v = (*bld)["cxxflags"].value<std::string_view>()) r.cxxflags = std::string(*v);
+        }
 
         parse_capability_hooks(tbl, r.capability_hooks);
         if (auto trig_res = parse_triggers(tbl, r.triggers); !trig_res) {

@@ -8,6 +8,40 @@ import sage.cli;
 
 namespace sage::cli {
 
+// -- Build toolchain probing -------------------------------------------------
+//
+// Existence check and version capture in one shot: run `<cc> --version` with
+// output redirected into a scratch file (this codebase speaks plain
+// std::system; popen would be its own RAII project), then take the first
+// whitespace token starting with a digit -- "clang version 19.1.7" and
+// "gcc (GCC) 15.1.1" both yield their version that way. nullopt means the
+// compiler is not usable at all.
+std::optional<std::string> probe_compiler(std::string_view cc) {
+    if (cc.empty()) return std::nullopt;
+    std::filesystem::path out = std::filesystem::temp_directory_path()
+        / std::format("sage-cc-probe-{}.txt", sage::util::current_pid());
+    struct Remover {  // RAII: the scratch file cleans itself up
+        const std::filesystem::path& p;
+        ~Remover() { std::error_code ec; std::filesystem::remove(p, ec); }
+    } remover{out};
+
+    int rc = std::system(std::format("\"{}\" --version > \"{}\" 2>&1", cc, out.string()).c_str());
+    if (rc != 0) return std::nullopt;
+    std::ifstream f(out);
+    std::string line;
+    if (!std::getline(f, line)) return std::nullopt;
+    size_t i = 0;
+    while (i < line.size()) {
+        size_t j = line.find(' ', i);
+        std::string_view tok(line.data() + i, (j == std::string::npos ? line.size() : j) - i);
+        if (!tok.empty() && std::isdigit(static_cast<unsigned char>(tok.front()))) {
+            return std::string(tok);
+        }
+        i = (j == std::string::npos) ? line.size() : j + 1;
+    }
+    return std::string("unknown");
+}
+
 export int cmd_build(const CliOptions& opts) {
     if (opts.args.empty()) {
         std::println("Usage: sage build <RECIPE_DIR>");
@@ -48,16 +82,61 @@ export int cmd_build(const CliOptions& opts) {
     const auto& r = *recipe_res;
     sage::util::log_info("Building package '{}' version {} (channel: {})...", r.name, r.version.to_string(), r.channel);
 
+    // Load the build configuration up front: the phases need the compiler
+    // and flags, and the DT_NEEDED check below reuses the same handle.
+    auto cfg_res = sage::config::SystemConfig::load_from_root(opts.target_root);
+    if (!cfg_res) {
+        sage::util::log_error("Failed to load configuration: {}", cfg_res.error());
+        return 1;
+    }
+    const sage::config::BuildConfig& bcfg = cfg_res->build;
+
+    // Per-recipe [build] overrides replace the global baseline; cxxflags
+    // mirror cflags at whichever level does not spell them out.
+    const std::string eff_cflags = !r.cflags.empty() ? r.cflags : bcfg.cflags;
+    const std::string eff_cxxflags = !r.cxxflags.empty() ? r.cxxflags
+                                   : !r.cflags.empty() ? r.cflags
+                                   : !bcfg.cxxflags.empty() ? bcfg.cxxflags
+                                   : bcfg.cflags;
+
+    // Candidate toolchains in priority order: the configured pair first, the
+    // fallback pair second. Each is probed once up front -- `<cc> --version`
+    // doubles as the existence check and yields the version that gets stamped
+    // into the package afterwards.
+    struct Toolchain { std::string cc, cxx, version; };
+    std::vector<Toolchain> candidates;
+    for (const auto& [cc_name, cxx_name] : {std::pair{bcfg.cc, bcfg.cxx},
+                                            std::pair{bcfg.fallback_cc, bcfg.fallback_cxx}}) {
+        if (cc_name.empty() || std::ranges::any_of(candidates, [&](const Toolchain& t) { return t.cc == cc_name; })) {
+            continue;
+        }
+        auto ver = probe_compiler(cc_name);
+        if (!ver) {
+            sage::util::log_warn("Compiler '{}' not usable, skipping", cc_name);
+            continue;
+        }
+        candidates.push_back({cc_name, cxx_name, std::move(*ver)});
+    }
+    if (candidates.empty()) {
+        // Script-only recipes must keep building on hosts without any
+        // probeable compiler: run unlabeled, stamping nothing.
+        sage::util::log_warn("No usable C compiler found; building without CC/CXX injection");
+        candidates.push_back({bcfg.cc, bcfg.cxx, ""});
+    } else {
+        sage::util::log_info("Using compiler: {} ({})", candidates.front().cc, candidates.front().version);
+    }
+
     std::filesystem::path dist_dir = recipe_dir / "distfiles";
     std::filesystem::path src_dir = recipe_dir / "src";
     std::filesystem::path pkg_dir = recipe_dir / "pkg";
 
     // 1. Source Fetch & SHA256 Verification
+    std::filesystem::path archive_path;  // hoisted: the attempt loop re-extracts per candidate
     if (!r.source_url.empty()) {
         std::filesystem::create_directories(dist_dir);
         std::string filename = std::filesystem::path(r.source_url).filename().string();
         if (filename.empty()) filename = "source.tar.gz";
-        std::filesystem::path archive_path = dist_dir / filename;
+        archive_path = dist_dir / filename;
 
         if (!std::filesystem::exists(archive_path)) {
             sage::util::log_info("Fetching source archive from {}...", r.source_url);
@@ -81,48 +160,72 @@ export int cmd_build(const CliOptions& opts) {
             }
             sage::util::log_success("Source SHA256 checksum verified: {}", *hash_res);
         }
+    }
 
-        // Unpack source if src_dir doesn't exist
-        if (!std::filesystem::exists(src_dir)) {
+    // 2. Prepare, Build & Install Phases -- retried whole-hog per candidate
+    // toolchain. Every attempt starts from a pristine tree: a half-built src/
+    // left behind by a failed pass would poison the next candidate.
+    Toolchain used;
+    bool built = false;
+    for (size_t attempt = 0; attempt < candidates.size(); ++attempt) {
+        const Toolchain& cand = candidates[attempt];
+        if (candidates.size() > 1) {
+            sage::util::log_info("Build attempt {} of {} with {} {}...",
+                attempt + 1, candidates.size(), cand.cc, cand.version);
+        }
+
+        std::error_code ec;
+        std::filesystem::remove_all(pkg_dir, ec);
+        std::filesystem::create_directories(pkg_dir);
+        if (!r.source_url.empty()) {
+            std::filesystem::remove_all(src_dir, ec);
             std::filesystem::create_directories(src_dir);
             sage::util::log_info("Unpacking source to {}...", src_dir.string());
-            std::string cmd = std::format("tar -xf \"{}\" -C \"{}\" --strip-components=1 2>/dev/null || tar -xf \"{}\" -C \"{}\"", 
+            std::string cmd = std::format("tar -xf \"{}\" -C \"{}\" --strip-components=1 2>/dev/null || tar -xf \"{}\" -C \"{}\"",
                 archive_path.string(), src_dir.string(), archive_path.string(), src_dir.string());
-            int ret = std::system(cmd.c_str());
-            if (ret != 0) {
+            if (std::system(cmd.c_str()) != 0) {
                 sage::util::log_error("Failed to unpack source archive! Archive may be corrupted. Cleaning up...");
-                std::error_code ec;
                 std::filesystem::remove(archive_path, ec);
                 std::filesystem::remove_all(src_dir, ec);
                 return 1;
             }
         }
-    }
+        std::filesystem::path work_dir = std::filesystem::exists(src_dir) ? src_dir : recipe_dir;
 
-    // 2. Prepare, Build & Install Phases
-    std::error_code ec;
-    std::filesystem::remove_all(pkg_dir, ec);
-    std::filesystem::create_directories(pkg_dir);
-    std::filesystem::path work_dir = std::filesystem::exists(src_dir) ? src_dir : recipe_dir;
-
-    auto run_phase = [&](std::string_view phase_name, const std::vector<std::string>& cmds) -> bool {
-        if (cmds.empty()) return true;
-        sage::util::log_info("Executing {} phase...", phase_name);
-        for (const auto& cmd_line : cmds) {
-            std::string full_cmd = std::format("export DESTDIR=\"{}\" PREFIX=\"/usr\" RECIPE_DIR=\"{}\" SRCDIR=\"{}\" PKGDIR=\"{}\"; cd \"{}\" && {}", 
-                pkg_dir.string(), recipe_dir.string(), src_dir.string(), pkg_dir.string(), work_dir.string(), cmd_line);
-            int ret = std::system(full_cmd.c_str());
-            if (ret != 0) {
-                sage::util::log_error("Command failed in {} phase: {}", phase_name, cmd_line);
-                return false;
+        auto run_phase = [&](std::string_view phase_name, const std::vector<std::string>& cmds) -> bool {
+            if (cmds.empty()) return true;
+            sage::util::log_info("Executing {} phase...", phase_name);
+            for (const auto& cmd_line : cmds) {
+                std::string full_cmd = std::format(
+                    "export CC=\"{}\" CXX=\"{}\" CPPFLAGS=\"{}\" CFLAGS=\"{}\" CXXFLAGS=\"{}\" LDFLAGS=\"{}\" "
+                    "DESTDIR=\"{}\" PREFIX=\"/usr\" RECIPE_DIR=\"{}\" SRCDIR=\"{}\" PKGDIR=\"{}\"; cd \"{}\" && {}",
+                    cand.cc, cand.cxx, bcfg.cppflags, eff_cflags, eff_cxxflags, bcfg.ldflags,
+                    pkg_dir.string(), recipe_dir.string(), src_dir.string(), pkg_dir.string(),
+                    work_dir.string(), cmd_line);
+                int ret = std::system(full_cmd.c_str());
+                if (ret != 0) {
+                    sage::util::log_error("Command failed in {} phase: {}", phase_name, cmd_line);
+                    return false;
+                }
             }
-        }
-        return true;
-    };
+            return true;
+        };
 
-    if (!run_phase("prepare", r.prepare_cmds)) return 1;
-    if (!run_phase("build", r.build_cmds)) return 1;
-    if (!run_phase("install", r.install_cmds)) return 1;
+        built = run_phase("prepare", r.prepare_cmds)
+             && run_phase("build", r.build_cmds)
+             && run_phase("install", r.install_cmds);
+        if (built) {
+            used = cand;
+            break;
+        }
+        if (attempt + 1 < candidates.size()) {
+            sage::util::log_warn("{} build failed; falling back to {}", cand.cc, candidates[attempt + 1].cc);
+        }
+    }
+    if (!built) {
+        sage::util::log_error("Build failed under every configured compiler ({} tried)", candidates.size());
+        return 1;
+    }
 
     // 3. Automated ELF Scanner for DT_SONAME & DT_NEEDED
     sage::package::PackageManifest manifest;
@@ -136,6 +239,16 @@ export int cmd_build(const CliOptions& opts) {
     manifest.arch = r.arch;
     manifest.capability_hooks = r.capability_hooks;
     manifest.triggers = r.triggers;
+
+    // Stamp build provenance: the compiler that actually succeeded (after any
+    // fallback) and the flags the recipe shell really saw.
+    if (!used.cc.empty()) {
+        manifest.build_compiler = used.cc;
+        manifest.build_compiler_version = used.version;
+    }
+    if (!eff_cflags.empty()) manifest.build_cflags = eff_cflags;
+    if (!eff_cxxflags.empty()) manifest.build_cxxflags = eff_cxxflags;
+    if (!bcfg.ldflags.empty()) manifest.build_ldflags = bcfg.ldflags;
 
     // Every soname this package satisfies by itself, and every soname it still
     // needs from elsewhere -- remembering which file asked, so a failure can
@@ -213,15 +326,12 @@ export int cmd_build(const CliOptions& opts) {
     // libdevmapper -- and the failure surfaces at install time on a machine
     // that has no such file.
     if (!opts.no_elf_check && !external_sonames.empty()) {
-        auto host_cfg = sage::config::SystemConfig::load_from_root(opts.target_root);
-        auto host_db = host_cfg
-            ? sage::db::Database::open(host_cfg->db_path, true)
-            : std::expected<sage::db::Database, std::string>(std::unexpected("no config"));
+        auto host_db = sage::db::Database::open(cfg_res->db_path, true);
 
         if (!host_db) {
             sage::util::log_warn("Cannot verify DT_NEEDED: no package database at '{}'. "
                 "{} external soname(s) go unchecked -- expected while bootstrapping, a bug otherwise.",
-                host_cfg ? host_cfg->db_path.string() : std::string("<unknown>"), external_sonames.size());
+                cfg_res->db_path.string(), external_sonames.size());
         } else {
             std::vector<std::string> unsatisfied;
             for (const auto& soname : external_sonames) {

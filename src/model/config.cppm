@@ -64,6 +64,50 @@ inline std::string normalize_capability(std::string_view name) {
     return "virtual/" + std::string(name);
 }
 
+// ============================================================================
+// Build environment
+// ============================================================================
+//
+// Pure build-environment configuration, read from /etc/sage/build.toml when
+// present. A missing file means exactly these defaults (and the distro's
+// `sage` package ships a build.toml that spells them out); a malformed file
+// is warned about and ignored rather than failing every command.
+//
+// `cxxflags` left empty mirrors `cflags` at use time unless spelled out. The
+// fallback pair exists for the clang-by-default policy: when a build fails
+// under `cc`, cmd_build retries the whole recipe under `fallback_cc`.
+struct BuildConfig {
+    uint32_t schema_version{1};
+    std::string cc{"clang"};
+    std::string cxx{"clang++"};
+    std::string fallback_cc{"gcc"};
+    std::string fallback_cxx{"g++"};
+    std::string cflags{"-O3 -march=x86-64-v3"};
+    std::string cxxflags;
+    std::string cppflags;
+    std::string ldflags;
+
+    bool operator==(const BuildConfig&) const = default;
+
+    static std::expected<BuildConfig, std::string> parse_toml(std::string_view toml_str) {
+        auto tbl_res = vendor::toml::parse_string(toml_str);
+        if (!tbl_res) return std::unexpected(tbl_res.error());
+        const auto& tbl = *tbl_res;
+
+        BuildConfig cfg;
+        cfg.schema_version = static_cast<uint32_t>(tbl["schema_version"].value_or(1LL));
+        if (auto v = tbl["cc"].value<std::string_view>()) cfg.cc = std::string(*v);
+        if (auto v = tbl["cxx"].value<std::string_view>()) cfg.cxx = std::string(*v);
+        if (auto v = tbl["fallback_cc"].value<std::string_view>()) cfg.fallback_cc = std::string(*v);
+        if (auto v = tbl["fallback_cxx"].value<std::string_view>()) cfg.fallback_cxx = std::string(*v);
+        if (auto v = tbl["cflags"].value<std::string_view>()) cfg.cflags = std::string(*v);
+        if (auto v = tbl["cxxflags"].value<std::string_view>()) cfg.cxxflags = std::string(*v);
+        if (auto v = tbl["cppflags"].value<std::string_view>()) cfg.cppflags = std::string(*v);
+        if (auto v = tbl["ldflags"].value<std::string_view>()) cfg.ldflags = std::string(*v);
+        return cfg;
+    }
+};
+
 struct SystemConfig {
     uint32_t schema_version{1};
     std::filesystem::path root_dir{"/"};
@@ -72,6 +116,7 @@ struct SystemConfig {
     std::filesystem::path config_dir{"/etc/sage"};
     std::filesystem::path system_config_path{"/etc/sage/system.toml"};
     std::filesystem::path channels_config_path{"/etc/sage/channels.toml"};
+    std::filesystem::path build_config_path{"/etc/sage/build.toml"};
 
     // Capability -> concrete provider binding.
     // e.g. "virtual/init" -> "systemd", "virtual/initramfs-generator" -> "mkinitcpio"
@@ -82,6 +127,9 @@ struct SystemConfig {
     std::map<std::string, CapabilityKind> capabilities;
 
     std::vector<ChannelConfig> channels;
+
+    // Build-time tuning knobs (compiler, flags), see BuildConfig above.
+    BuildConfig build;
 
     static SystemConfig default_config() {
         SystemConfig cfg;
@@ -129,6 +177,7 @@ struct SystemConfig {
                 cfg.config_dir = cfg_d->value_or("/etc/sage");
                 cfg.system_config_path = cfg.config_dir / "system.toml";
                 cfg.channels_config_path = cfg.config_dir / "channels.toml";
+                cfg.build_config_path = cfg.config_dir / "build.toml";
             }
         }
 
@@ -206,6 +255,7 @@ struct SystemConfig {
         cfg.config_dir = config_dir;
         cfg.system_config_path = sys_path;
         cfg.channels_config_path = chan_path;
+        cfg.build_config_path = config_dir / "build.toml";
 
         if (std::filesystem::exists(sys_path)) {
             std::ifstream f(sys_path);
@@ -217,6 +267,7 @@ struct SystemConfig {
             cfg.config_dir = config_dir;
             cfg.system_config_path = sys_path;
             cfg.channels_config_path = chan_path;
+            cfg.build_config_path = config_dir / "build.toml";
         }
 
         if (std::filesystem::exists(chan_path)) {
@@ -237,6 +288,21 @@ struct SystemConfig {
             }
         }
 
+        // Build settings overlay last: they are leaf tuning knobs, never
+        // structural, so even a broken file degrades to the defaults with a
+        // warning instead of taking every command down with it.
+        if (std::filesystem::exists(cfg.build_config_path)) {
+            std::ifstream bf(cfg.build_config_path);
+            std::stringstream bs;
+            bs << bf.rdbuf();
+            auto b_res = BuildConfig::parse_toml(bs.str());
+            if (b_res) {
+                cfg.build = std::move(*b_res);
+            } else {
+                sage::util::log_warn("Ignoring invalid {}: {}", cfg.build_config_path.string(), b_res.error());
+            }
+        }
+
         return cfg;
     }
 
@@ -253,6 +319,7 @@ struct SystemConfig {
             res->config_dir = config_dir;
             res->system_config_path = config_dir / "system.toml";
             res->channels_config_path = config_dir / "channels.toml";
+            res->build_config_path = config_dir / "build.toml";
         }
         return res;
     }

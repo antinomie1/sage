@@ -2176,6 +2176,171 @@ install = [
     }
     sage::util::log_success("12. Target Root Write Lock Rejection & Release OK");
 
+    // 13. Build configuration: global flag injection, the per-recipe [build]
+    // override (which doubles as the fourth phase-command scope), and the
+    // compiler fallback -- the provenance Recipedia reads from the manifest
+    // and the repository index.
+    {
+        // Pure-model defaults: an empty document yields the built-in baseline,
+        // and the shipped /etc/sage/build.toml must keep parsing to exactly
+        // that -- the two are kept in lockstep by this assertion.
+        auto empty_cfg = sage::config::BuildConfig::parse_toml("");
+        auto shipped_cfg = sage::config::BuildConfig::parse_toml(R"(schema_version = 1
+cc = "clang"
+cxx = "clang++"
+fallback_cc = "gcc"
+fallback_cxx = "g++"
+cflags = "-O3 -march=x86-64-v3"
+)");
+        if (!empty_cfg || !shipped_cfg || *shipped_cfg != *empty_cfg
+            || empty_cfg->cc != "clang" || empty_cfg->cflags != "-O3 -march=x86-64-v3"
+            || !empty_cfg->cxxflags.empty()) {
+            sage::util::log_error("BuildConfig defaults or shipped-default parse drifted");
+            return 1;
+        }
+
+        auto write_build_toml = [&](const std::filesystem::path& root, std::string_view body) {
+            std::filesystem::create_directories(root / "etc/sage");
+            std::ofstream f(root / "etc/sage/build.toml");
+            f << body;
+            return f.good();
+        };
+        auto write_canary_recipe = [&](const std::filesystem::path& dir, std::string_view toml_body) {
+            std::filesystem::create_directories(dir);
+            std::ofstream recipe(dir / "recipe.toml");
+            recipe << toml_body;
+            return recipe.good();
+        };
+        auto build_with_root = [&](const std::filesystem::path& recipe_dir,
+                                   const std::filesystem::path& target_root,
+                                   const std::filesystem::path& extract_dir,
+                                   std::string_view pkg_filename)
+            -> std::expected<sage::package::PackageManifest, std::string> {
+            CliOptions build_opts;
+            build_opts.args = {recipe_dir.string()};
+            build_opts.target_root = target_root;
+            if (cmd_build(build_opts) != 0) {
+                return std::unexpected("cmd_build failed for " + recipe_dir.string());
+            }
+            auto extracted = sage::archive::extract_package(recipe_dir / pkg_filename, extract_dir);
+            if (!extracted) return std::unexpected(extracted.error());
+            return std::move(extracted->manifest);
+        };
+        auto read_text = [](const std::filesystem::path& p) {
+            std::ifstream f(p);
+            std::stringstream ss;
+            ss << f.rdbuf();
+            return ss.str();
+        };
+
+        // (a) Global baseline reaches the recipe shell and is stamped.
+        auto canary_root = temp_dir / "bcfg-target-a";
+        auto canary_dir = temp_dir / "bcfg-canary";
+        if (!write_build_toml(canary_root, R"(cc = "cc"
+cxx = "c++"
+fallback_cc = "cc"
+fallback_cxx = "c++"
+cflags = "-DGLOBAL_CFLAG=1"
+)")
+            || !write_canary_recipe(canary_dir, R"(schema_version = 1
+[package]
+name = "flagcanary"
+version = "1.0.0"
+release = "1"
+description = "build-config canary"
+license = "MIT"
+channel = "system"
+install = [
+    'mkdir -p "$DESTDIR/usr/share"',
+    'printf "%s" "$CFLAGS" > "$DESTDIR/usr/share/cflags.txt"',
+]
+)")) {
+            sage::util::log_error("Failed to create build-config canary fixtures");
+            return 1;
+        }
+        auto canary = build_with_root(canary_dir, canary_root, temp_dir / "bcfg-canary-x",
+                                      "flagcanary-1.0.0-1-x86_64.pkg.tar.zst");
+        if (!canary || canary->build_compiler != "cc" || canary->build_compiler_version.empty()
+            || canary->build_cflags != "-DGLOBAL_CFLAG=1"
+            || canary->build_cxxflags != "-DGLOBAL_CFLAG=1"  // cxxflags mirror cflags
+            || read_text(temp_dir / "bcfg-canary-x/usr/share/cflags.txt") != "-DGLOBAL_CFLAG=1") {
+            sage::util::log_error("Global build-config injection or provenance stamping failed");
+            return 1;
+        }
+
+        // (b) The recipe's [build] table replaces the baseline and carries the
+        // phase commands themselves.
+        auto override_root = temp_dir / "bcfg-target-b";
+        auto override_dir = temp_dir / "bcfg-override";
+        if (!write_build_toml(override_root, R"(cc = "cc"
+fallback_cc = "cc"
+cflags = "-DGLOBAL_CFLAG=1"
+)")
+            || !write_canary_recipe(override_dir, R"(schema_version = 1
+[package]
+name = "flagoverride"
+version = "1.0.0"
+release = "1"
+description = "build-config override canary"
+license = "MIT"
+channel = "system"
+
+[build]
+cflags = "-DLOCAL_CFLAG=2"
+install = [
+    'mkdir -p "$DESTDIR/usr/share"',
+    'printf "%s" "$CFLAGS" > "$DESTDIR/usr/share/cflags.txt"',
+]
+)")) {
+            sage::util::log_error("Failed to create build-config override fixtures");
+            return 1;
+        }
+        auto overridden = build_with_root(override_dir, override_root, temp_dir / "bcfg-override-x",
+                                          "flagoverride-1.0.0-1-x86_64.pkg.tar.zst");
+        if (!overridden || overridden->build_compiler != "cc"
+            || overridden->build_cflags != "-DLOCAL_CFLAG=2"
+            || overridden->build_cxxflags != "-DLOCAL_CFLAG=2"  // mirrors the recipe cflags
+            || read_text(temp_dir / "bcfg-override-x/usr/share/cflags.txt") != "-DLOCAL_CFLAG=2") {
+            sage::util::log_error("Per-recipe [build] override did not replace the global baseline");
+            return 1;
+        }
+
+        // (c) An unusable primary compiler degrades to the fallback pair.
+        auto fallback_root = temp_dir / "bcfg-target-c";
+        auto fallback_dir = temp_dir / "bcfg-fallback";
+        if (!write_build_toml(fallback_root, R"(cc = "/nonexistent/sage-no-such-cc"
+fallback_cc = "cc"
+fallback_cxx = "c++"
+cflags = "-DFALLBACK_CFLAG=3"
+)")
+            || !write_canary_recipe(fallback_dir, R"(schema_version = 1
+[package]
+name = "flagfallback"
+version = "1.0.0"
+release = "1"
+description = "build-config fallback canary"
+license = "MIT"
+channel = "system"
+install = [
+    'mkdir -p "$DESTDIR/usr/share"',
+    'printf "%s" "$CFLAGS" > "$DESTDIR/usr/share/cflags.txt"',
+]
+)")) {
+            sage::util::log_error("Failed to create build-config fallback fixtures");
+            return 1;
+        }
+        auto fallback = build_with_root(fallback_dir, fallback_root, temp_dir / "bcfg-fallback-x",
+                                        "flagfallback-1.0.0-1-x86_64.pkg.tar.zst");
+        if (!fallback || fallback->build_compiler != "cc"
+            || fallback->build_cflags != "-DFALLBACK_CFLAG=3"
+            || read_text(temp_dir / "bcfg-fallback-x/usr/share/cflags.txt") != "-DFALLBACK_CFLAG=3") {
+            sage::util::log_error("Compiler fallback did not degrade to the configured fallback pair");
+            return 1;
+        }
+
+        sage::util::log_success("13. Build Config Injection, Recipe Override & Compiler Fallback OK");
+    }
+
     std::filesystem::remove_all(temp_dir);
     sage::util::log_success("🎉 All Sage Master Architecture & Subsystem Integration Tests Passed Successfully!");
     return 0;

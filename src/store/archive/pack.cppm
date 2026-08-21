@@ -303,6 +303,12 @@ inline std::expected<void, std::string> generate_repo_index(
         ss << "arch = \"" << quote(m.arch) << "\"\n";
         ss << "installed_size = " << m.installed_size << "\n";
         ss << "file = \"" << quote(rel_path) << "\"\n";
+        // Build provenance, same omit-if-empty rule as the manifest.
+        if (!m.build_compiler.empty()) ss << "build_compiler = \"" << quote(m.build_compiler) << "\"\n";
+        if (!m.build_compiler_version.empty()) ss << "build_compiler_version = \"" << quote(m.build_compiler_version) << "\"\n";
+        if (!m.build_cflags.empty()) ss << "build_cflags = \"" << quote(m.build_cflags) << "\"\n";
+        if (!m.build_cxxflags.empty()) ss << "build_cxxflags = \"" << quote(m.build_cxxflags) << "\"\n";
+        if (!m.build_ldflags.empty()) ss << "build_ldflags = \"" << quote(m.build_ldflags) << "\"\n";
         ss << "dependencies = [\n";
         for (const auto& d : m.dependencies) ss << "    \"" << quote(d.to_string()) << "\",\n";
         ss << "]\n";
