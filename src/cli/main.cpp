@@ -73,6 +73,23 @@ int cmd_build(const CliOptions& opts) {
         return 1;
     }
 
+    // Make the recipe directory absolute before anything derives from it.
+    // The build phases run with the working directory changed to src/ (or the
+    // recipe directory), so a relative DESTDIR such as "./foo/pkg" would be
+    // resolved against *that* directory instead of sage's own -- the install
+    // phase writes into a phantom nested path, packing then finds pkg/ empty,
+    // and the package ships with no payload and no error anywhere.
+    {
+        std::error_code ec;
+        auto abs = std::filesystem::canonical(recipe_dir, ec);
+        if (ec) {
+            sage::util::log_error("Cannot resolve recipe directory '{}': {}", recipe_dir.string(), ec.message());
+            return 1;
+        }
+        recipe_dir = std::move(abs);
+        recipe_file = recipe_dir / "recipe.toml";
+    }
+
     std::ifstream rf(recipe_file);
     std::stringstream ss;
     ss << rf.rdbuf();
@@ -485,6 +502,15 @@ int cmd_install(const CliOptions& opts) {
 
         auto installed_pkg = pkg;
         installed_pkg.files = ext_res->extracted_files;
+
+        // The channel index is a solving summary: it carries names, versions,
+        // dependencies and provides, but not capability hooks or triggers.
+        // Those live in the archive's own manifest, and the post-transaction
+        // trigger pass reads them back out of the database -- so adopt them
+        // here, or an installed initramfs generator would be invisible to the
+        // very trigger that has to run it.
+        installed_pkg.capability_hooks = ext_res->manifest.capability_hooks;
+        installed_pkg.triggers = ext_res->manifest.triggers;
 
         // Upgrade cleanup: remove physical files owned by a previously installed
         // version of this package that are not part of the new version, so file

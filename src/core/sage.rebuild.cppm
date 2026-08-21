@@ -192,8 +192,17 @@ private:
         }
 
         if (!hook) {
-            util::log_warn("Trigger '{}' wants capability '{}', but no installed package provides it with a hook -- skipping",
-                trig.name, trig.run_capability);
+            // A capability nobody provides is the ordinary case -- most roots
+            // never install a bootloader -- and warning about it on every
+            // transaction trains people to ignore trigger warnings. Only a
+            // provider that is installed but ships no hook is worth reporting:
+            // that one is a packaging mistake.
+            bool provided = std::ranges::any_of(ctx.installed_packages,
+                [&](const auto& pkg) { return pkg.provides_capability(trig.run_capability); });
+            if (provided) {
+                util::log_warn("Trigger '{}' wants capability '{}': it is provided, but no provider declares a capability hook -- skipping",
+                    trig.name, trig.run_capability);
+            }
             return std::nullopt;
         }
 
