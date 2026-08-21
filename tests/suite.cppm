@@ -131,6 +131,20 @@ export int run_all() {
         return 1;
     }
 
+    // Package directory cleanup must preserve unowned user content.  In
+    // particular, an upgrade dropping a formerly-owned directory must not
+    // fail after other payload files have already been replaced.
+    auto nonempty_remove_root = temp_dir / "nonempty-remove-root";
+    std::filesystem::create_directories(nonempty_remove_root / "var/lib/demo");
+    std::ofstream(nonempty_remove_root / "var/lib/demo/user-data") << "keep\n";
+    auto nonempty_remove = sage::archive::remove_path_anchored(
+        nonempty_remove_root, "var/lib/demo");
+    if (!nonempty_remove
+        || !std::filesystem::exists(nonempty_remove_root / "var/lib/demo/user-data")) {
+        sage::util::log_error("Package cleanup removed or rejected a non-empty directory");
+        return 1;
+    }
+
     auto raw_tar_path = temp_dir / "dummy-tool.tar";
     auto decompress_cmd = std::format("zstd -dc \"{}\" > \"{}\"", pkg_path.string(), raw_tar_path.string());
     if (std::system(decompress_cmd.c_str()) != 0) {

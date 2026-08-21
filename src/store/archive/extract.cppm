@@ -27,7 +27,7 @@ using std::uint64_t;
 inline std::expected<void, std::string> remove_path_anchored(
     const std::filesystem::path& target_root,
     std::string_view raw_path,
-    bool ignore_nonempty_directory = false)
+    bool ignore_nonempty_directory = true)
 {
     auto normalized = normalize_data_path(raw_path);
     if (!normalized) return std::unexpected(normalized.error());
@@ -74,6 +74,7 @@ inline std::expected<void, std::string> remove_path_anchored(
         }
         return std::unexpected(std::strerror(errno));
     }
+    if (::fsync(current.get()) != 0) return std::unexpected(std::strerror(errno));
     return {};
 }
 // ============================================================================
@@ -185,6 +186,11 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
                 return std::unexpected(std::format(
                     "Cannot create symlink '{}' -> '{}': {}",
                     rel_path, archive_entry.linkname, std::strerror(errno)));
+            }
+            if (::fsync(destination->directory.get()) != 0) {
+                return std::unexpected(std::format(
+                    "Cannot sync symlink directory '{}': {}",
+                    rel_path, std::strerror(errno)));
             }
         } else {
             entry.type = package::FileType::Regular;
