@@ -340,8 +340,8 @@ inline std::expected<void, std::string> create_package(
             std::memcpy(hdr.linkname, linkname.data(), std::min(linkname.size(), sizeof(hdr.linkname)));
         }
 
-        std::memcpy(hdr.magic, "ustar ", 6);
-        std::memcpy(hdr.version, " \0", 2);
+        std::memcpy(hdr.magic, "ustar", 5);
+        std::memcpy(hdr.version, "00", 2);
         std::memcpy(hdr.uname, "root", 4);
         std::memcpy(hdr.gname, "root", 4);
 
@@ -392,7 +392,15 @@ inline std::expected<void, std::string> create_package(
 
     // 3. Append data/... filesystem payload
     if (std::filesystem::exists(data_dir)) {
+        std::vector<std::filesystem::directory_entry> entries;
         for (const auto& entry : std::filesystem::recursive_directory_iterator(data_dir, std::filesystem::directory_options::none)) {
+            entries.push_back(entry);
+        }
+        std::ranges::sort(entries, {}, [&](const auto& entry) {
+            return entry.path().lexically_relative(data_dir).generic_string();
+        });
+
+        for (const auto& entry : entries) {
             auto rel = entry.path().lexically_relative(data_dir).generic_string();
             std::string tar_name = "data/" + rel;
 

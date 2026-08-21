@@ -168,7 +168,15 @@ int cmd_build(const CliOptions& opts) {
     manifest.arch = r.arch;
 
     if (std::filesystem::exists(pkg_dir)) {
+        std::vector<std::filesystem::directory_entry> entries;
         for (const auto& entry : std::filesystem::recursive_directory_iterator(pkg_dir, std::filesystem::directory_options::skip_permission_denied)) {
+            entries.push_back(entry);
+        }
+        std::ranges::sort(entries, {}, [&](const auto& entry) {
+            return entry.path().lexically_relative(pkg_dir).generic_string();
+        });
+
+        for (const auto& entry : entries) {
             if (entry.is_symlink()) continue;
             if (entry.is_regular_file()) {
                 auto elf_res = sage::util::scan_elf(entry.path());
@@ -799,12 +807,28 @@ int cmd_test_suite() {
     // 2. Tar+Zstd Archive Packaging & Streaming Extractor Test
     auto temp_dir = std::filesystem::temp_directory_path() / "sage_archive_test";
     std::filesystem::remove_all(temp_dir);
-    std::filesystem::create_directories(temp_dir / "data/usr/bin");
+    const auto long_rel = std::filesystem::path("usr/share") / std::string(80, 'a') / std::string(30, 'b') / "payload.txt";
+    auto populate_payload = [&](const std::filesystem::path& root, bool long_path_first) {
+        auto write_long_path = [&] {
+            std::filesystem::create_directories((root / long_rel).parent_path());
+            std::ofstream(root / long_rel) << "long path payload\n";
+        };
+        auto write_dummy = [&] {
+            std::filesystem::create_directories(root / "usr/bin");
+            std::ofstream(root / "usr/bin/dummy") << "#!/bin/sh\necho 'hello sage'\n";
+            std::filesystem::permissions(root / "usr/bin/dummy", std::filesystem::perms::owner_all | std::filesystem::perms::group_read | std::filesystem::perms::group_exec);
+        };
 
-    std::ofstream dummy_bin(temp_dir / "data/usr/bin/dummy");
-    dummy_bin << "#!/bin/sh\necho 'hello sage'\n";
-    dummy_bin.close();
-    std::filesystem::permissions(temp_dir / "data/usr/bin/dummy", std::filesystem::perms::owner_all | std::filesystem::perms::group_read | std::filesystem::perms::group_exec);
+        if (long_path_first) {
+            write_long_path();
+            write_dummy();
+        } else {
+            write_dummy();
+            write_long_path();
+        }
+    };
+    populate_payload(temp_dir / "data", true);
+    populate_payload(temp_dir / "data_reordered", false);
 
     sage::package::PackageManifest manifest;
     manifest.name = "dummy-tool";
@@ -820,13 +844,30 @@ int cmd_test_suite() {
         return 1;
     }
 
+    auto reordered_pkg_path = temp_dir / "dummy-tool-reordered.pkg.tar.zst";
+    auto reordered_pack_res = sage::archive::create_package(manifest, temp_dir / "data_reordered", reordered_pkg_path);
+    auto pkg_hash = sage::util::compute_file_sha256(pkg_path);
+    auto reordered_pkg_hash = sage::util::compute_file_sha256(reordered_pkg_path);
+    if (!reordered_pack_res || !pkg_hash || !reordered_pkg_hash || *pkg_hash != *reordered_pkg_hash) {
+        sage::util::log_error("Archive reproducibility verification failed");
+        return 1;
+    }
+
     auto extract_root = temp_dir / "sysroot";
     auto ext_res = sage::archive::extract_package(pkg_path, extract_root);
-    if (!ext_res || !std::filesystem::exists(extract_root / "usr/bin/dummy")) {
+    if (!ext_res || !std::filesystem::exists(extract_root / "usr/bin/dummy") || !std::filesystem::exists(extract_root / long_rel)) {
         sage::util::log_error("Archive extraction verification failed");
         return 1;
     }
-    sage::util::log_success("2. Native Streaming Tar + Zstandard Engine OK");
+
+    auto tar_extract_root = temp_dir / "tar-sysroot";
+    std::filesystem::create_directories(tar_extract_root);
+    auto tar_cmd = std::format("tar -xf \"{}\" -C \"{}\"", pkg_path.string(), tar_extract_root.string());
+    if (std::system(tar_cmd.c_str()) != 0 || !std::filesystem::exists(tar_extract_root / "data" / long_rel)) {
+        sage::util::log_error("POSIX USTAR compatibility verification failed");
+        return 1;
+    }
+    sage::util::log_success("2. Deterministic POSIX USTAR + Zstandard Engine OK");
 
     // 3. PubGrub Dependency Solver & Toolchain MSRV Resolution Test
     std::vector<sage::package::PackageManifest> repo_pool;
