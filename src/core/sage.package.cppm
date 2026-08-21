@@ -226,6 +226,29 @@ struct FileEntry {
     std::string link_target;
 };
 
+inline std::string escape_toml_basic_string(std::string_view value) {
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (unsigned char ch : value) {
+        switch (ch) {
+            case '"': escaped += "\\\""; break;
+            case '\\': escaped += "\\\\"; break;
+            case '\b': escaped += "\\b"; break;
+            case '\t': escaped += "\\t"; break;
+            case '\n': escaped += "\\n"; break;
+            case '\f': escaped += "\\f"; break;
+            case '\r': escaped += "\\r"; break;
+            default:
+                if (ch < 0x20 || ch == 0x7f) {
+                    escaped += std::format("\\u{:04X}", ch);
+                } else {
+                    escaped.push_back(static_cast<char>(ch));
+                }
+        }
+    }
+    return escaped;
+}
+
 // ============================================================================
 // Package Manifest Model
 // ============================================================================
@@ -339,41 +362,44 @@ struct PackageManifest {
     }
 
     [[nodiscard]] std::string serialize_toml() const {
+        const auto quote = [](std::string_view value) {
+            return escape_toml_basic_string(value);
+        };
         std::ostringstream ss;
         ss << "schema_version = " << schema_version << "\n\n";
         ss << "[package]\n";
-        ss << "name = \"" << name << "\"\n";
-        ss << "version = \"" << version.ver << "\"\n";
-        ss << "release = \"" << version.rel << "\"\n";
+        ss << "name = \"" << quote(name) << "\"\n";
+        ss << "version = \"" << quote(version.ver) << "\"\n";
+        ss << "release = \"" << quote(version.rel) << "\"\n";
         if (version.epoch > 0) ss << "epoch = " << version.epoch << "\n";
-        ss << "description = \"" << description << "\"\n";
-        ss << "license = \"" << license << "\"\n";
-        ss << "channel = \"" << channel << "\"\n";
-        ss << "arch = \"" << arch << "\"\n";
+        ss << "description = \"" << quote(description) << "\"\n";
+        ss << "license = \"" << quote(license) << "\"\n";
+        ss << "channel = \"" << quote(channel) << "\"\n";
+        ss << "arch = \"" << quote(arch) << "\"\n";
         ss << "installed_size = " << installed_size << "\n\n";
 
         ss << "dependencies = [\n";
         for (const auto& d : dependencies) {
-            ss << "    \"" << d.to_string() << "\",\n";
+            ss << "    \"" << quote(d.to_string()) << "\",\n";
         }
         ss << "]\n\n";
 
         ss << "provides = [\n";
         for (const auto& p : provides) {
-            ss << "    \"" << p << "\",\n";
+            ss << "    \"" << quote(p) << "\",\n";
         }
         ss << "]\n\n";
 
         ss << "conflicts = [\n";
         for (const auto& c : conflicts) {
-            ss << "    \"" << c.to_string() << "\",\n";
+            ss << "    \"" << quote(c.to_string()) << "\",\n";
         }
         ss << "]\n\n";
 
         if (!files.empty()) {
             ss << "files = [\n";
             for (const auto& f : files) {
-                ss << "    \"" << f.path << "\",\n";
+                ss << "    \"" << quote(f.path) << "\",\n";
             }
             ss << "]\n";
         }

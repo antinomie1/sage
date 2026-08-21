@@ -4,6 +4,7 @@ module;
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <cerrno>
 #include <cstring>
 #include <zstd.h>
 
@@ -134,13 +135,19 @@ struct ExtractedPackage {
     std::vector<package::FileEntry> extracted_files;
 };
 
-// ============================================================================
-// Streaming Tar + Zstd Extractor (Extracts directly to target root)
-// ============================================================================
+struct ArchiveEntryView {
+    std::string name;
+    uint64_t size{0};
+    uint32_t mode{0};
+    char typeflag{'0'};
+    std::string linkname;
+    std::span<const uint8_t> payload;
+};
 
-inline std::expected<ExtractedPackage, std::string> extract_package(
+template <typename Handler>
+inline std::expected<void, std::string> walk_archive_entries(
     const std::filesystem::path& archive_path,
-    const std::filesystem::path& target_root) 
+    Handler&& handler)
 {
     std::ifstream file(archive_path, std::ios::binary);
     if (!file.is_open()) {
@@ -160,10 +167,6 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
 
     std::vector<uint8_t> ring;
     ring.reserve(256 * 1024);
-
-    ExtractedPackage result;
-    std::string manifest_content;
-    std::string service_content;
 
     auto process_decompressed_bytes = [&](std::span<const uint8_t> chunk) -> std::expected<void, std::string> {
         ring.insert(ring.end(), chunk.begin(), chunk.end());
@@ -205,61 +208,16 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
                 return {};
             }
 
-            const uint8_t* payload_data = ring.data() + 512;
-
-            if (full_name == ".METADATA/manifest.toml") {
-                manifest_content.assign(reinterpret_cast<const char*>(payload_data), file_size);
-            } else if (full_name == ".METADATA/service.toml") {
-                service_content.assign(reinterpret_cast<const char*>(payload_data), file_size);
-            } else if (full_name.starts_with("data/")) {
-                std::string rel_path = full_name.substr(5); // strip "data/"
-                if (!rel_path.empty()) {
-                    std::filesystem::path dest_file = target_root / rel_path;
-                    std::filesystem::create_directories(dest_file.parent_path());
-
-                    package::FileEntry entry;
-                    entry.path = rel_path;
-                    entry.mode = mode;
-                    entry.size = file_size;
-
-                    if (typeflag == '5') {
-                        // Directory
-                        entry.type = package::FileType::Directory;
-                        std::filesystem::create_directories(dest_file);
-                    } else if (typeflag == '2') {
-                        // Symlink
-                        entry.type = package::FileType::Symlink;
-                        entry.link_target = linkname;
-                        std::error_code ec;
-                        std::filesystem::remove(dest_file, ec);
-                        std::filesystem::create_symlink(linkname, dest_file, ec);
-                    } else {
-                        // Regular File
-                        entry.type = package::FileType::Regular;
-                        std::string tmp_file = dest_file.string() + ".sage_tmp";
-                        int fd = ::open(tmp_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, mode ? mode : 0644);
-                        if (fd >= 0) {
-                            if (file_size > 0) {
-                                ssize_t w = ::write(fd, payload_data, file_size);
-                                (void)w;
-                            }
-                            ::close(fd);
-                            ::chmod(tmp_file.c_str(), mode ? mode : 0644);
-                            std::error_code ren_ec;
-                            std::filesystem::rename(tmp_file, dest_file, ren_ec);
-                        }
-
-                        // Compute file SHA256
-                        util::Sha256 hasher;
-                        if (file_size > 0) {
-                            hasher.update(payload_data, file_size);
-                        }
-                        entry.sha256 = hasher.finalize();
-                    }
-
-                    result.extracted_files.push_back(std::move(entry));
-                }
-            }
+            ArchiveEntryView entry{
+                .name = std::move(full_name),
+                .size = file_size,
+                .mode = mode,
+                .typeflag = typeflag,
+                .linkname = std::move(linkname),
+                .payload = std::span<const uint8_t>(ring.data() + 512, file_size),
+            };
+            auto handle_res = handler(entry);
+            if (!handle_res) return handle_res;
 
             ring.erase(ring.begin(), ring.begin() + total_entry_size);
         }
@@ -281,6 +239,183 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
             }
         }
     }
+
+    return {};
+}
+
+inline std::expected<void, std::string> preflight_extract_paths(
+    const std::filesystem::path& archive_path,
+    const std::filesystem::path& target_root)
+{
+    return walk_archive_entries(archive_path, [&](const ArchiveEntryView& entry)
+        -> std::expected<void, std::string> {
+        if (!entry.name.starts_with("data/")) return {};
+        std::string rel_path = entry.name.substr(5);
+        if (rel_path.empty()) return {};
+
+        const auto destination = target_root / rel_path;
+        for (auto parent = destination.parent_path(); parent != target_root; parent = parent.parent_path()) {
+            std::error_code parent_ec;
+            auto status = std::filesystem::status(parent, parent_ec);
+            if (parent_ec && parent_ec != std::errc::no_such_file_or_directory) {
+                return std::unexpected(std::format(
+                    "Cannot inspect parent directory for '{}': {}", rel_path, parent_ec.message()));
+            }
+            if (!parent_ec && std::filesystem::exists(status) && !std::filesystem::is_directory(status)) {
+                return std::unexpected(std::format(
+                    "Parent path for '{}' is not a directory", rel_path));
+            }
+            if (parent.empty() || parent == parent.root_path()) break;
+        }
+
+        std::error_code status_ec;
+        auto status = std::filesystem::symlink_status(destination, status_ec);
+        if (status_ec && status_ec != std::errc::no_such_file_or_directory) {
+            return std::unexpected(std::format(
+                "Cannot inspect '{}': {}", rel_path, status_ec.message()));
+        }
+        if (status_ec || !std::filesystem::exists(status)) return {};
+
+        if (entry.typeflag == '5') {
+            std::error_code directory_ec;
+            if (!std::filesystem::is_directory(destination, directory_ec) || directory_ec) {
+                return std::unexpected(std::format(
+                    "Cannot replace '{}' with directory", rel_path));
+            }
+        } else if (entry.typeflag == '2' && std::filesystem::is_directory(status)) {
+            std::error_code empty_ec;
+            if (!std::filesystem::is_empty(destination, empty_ec) || empty_ec) {
+                return std::unexpected(std::format(
+                    "Cannot replace non-empty directory '{}' with symlink", rel_path));
+            }
+        } else if (entry.typeflag != '2' && std::filesystem::is_directory(status)) {
+            return std::unexpected(std::format(
+                "Cannot replace directory '{}' with regular file", rel_path));
+        }
+        return {};
+    });
+}
+
+// ============================================================================
+// Streaming Tar + Zstd Extractor (Extracts directly to target root)
+// ============================================================================
+
+inline std::expected<ExtractedPackage, std::string> extract_package(
+    const std::filesystem::path& archive_path,
+    const std::filesystem::path& target_root)
+{
+    auto preflight_res = preflight_extract_paths(archive_path, target_root);
+    if (!preflight_res) return std::unexpected(preflight_res.error());
+
+    ExtractedPackage result;
+    std::string manifest_content;
+    std::string service_content;
+
+    auto extract_res = walk_archive_entries(archive_path, [&](const ArchiveEntryView& archive_entry)
+        -> std::expected<void, std::string> {
+        if (archive_entry.name == ".METADATA/manifest.toml") {
+            manifest_content.assign(
+                reinterpret_cast<const char*>(archive_entry.payload.data()), archive_entry.size);
+            return {};
+        }
+        if (archive_entry.name == ".METADATA/service.toml") {
+            service_content.assign(
+                reinterpret_cast<const char*>(archive_entry.payload.data()), archive_entry.size);
+            return {};
+        }
+        if (!archive_entry.name.starts_with("data/")) return {};
+
+        std::string rel_path = archive_entry.name.substr(5);
+        if (rel_path.empty()) return {};
+        std::filesystem::path dest_file = target_root / rel_path;
+        std::error_code parent_ec;
+        std::filesystem::create_directories(dest_file.parent_path(), parent_ec);
+        if (parent_ec) {
+            return std::unexpected(std::format(
+                "Cannot create parent directory for '{}': {}", rel_path, parent_ec.message()));
+        }
+
+        package::FileEntry entry;
+        entry.path = rel_path;
+        entry.mode = archive_entry.mode;
+        entry.size = archive_entry.size;
+
+        if (archive_entry.typeflag == '5') {
+            entry.type = package::FileType::Directory;
+            std::error_code dir_ec;
+            std::filesystem::create_directories(dest_file, dir_ec);
+            if (dir_ec) {
+                return std::unexpected(std::format(
+                    "Cannot create directory '{}': {}", rel_path, dir_ec.message()));
+            }
+        } else if (archive_entry.typeflag == '2') {
+            entry.type = package::FileType::Symlink;
+            entry.link_target = archive_entry.linkname;
+            std::error_code ec;
+            std::filesystem::remove(dest_file, ec);
+            if (ec) {
+                return std::unexpected(std::format(
+                    "Cannot replace '{}' with symlink: {}", rel_path, ec.message()));
+            }
+            std::filesystem::create_symlink(archive_entry.linkname, dest_file, ec);
+            if (ec) {
+                return std::unexpected(std::format(
+                    "Cannot create symlink '{}' -> '{}': {}", rel_path, archive_entry.linkname, ec.message()));
+            }
+        } else {
+            entry.type = package::FileType::Regular;
+            std::string tmp_file = dest_file.string() + ".sage_tmp";
+            int fd = ::open(tmp_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC,
+                            archive_entry.mode ? archive_entry.mode : 0644);
+            if (fd < 0) {
+                return std::unexpected(std::format(
+                    "Cannot create temporary file for '{}': {}", rel_path, std::strerror(errno)));
+            }
+            size_t written = 0;
+            while (written < archive_entry.size) {
+                ssize_t count = ::write(fd, archive_entry.payload.data() + written,
+                                        archive_entry.size - written);
+                if (count < 0 && errno == EINTR) continue;
+                if (count <= 0) {
+                    auto message = std::string(std::strerror(errno));
+                    ::close(fd);
+                    std::filesystem::remove(tmp_file);
+                    return std::unexpected(std::format(
+                        "Cannot write '{}': {}", rel_path, message));
+                }
+                written += static_cast<size_t>(count);
+            }
+            if (::close(fd) != 0) {
+                auto message = std::string(std::strerror(errno));
+                std::filesystem::remove(tmp_file);
+                return std::unexpected(std::format(
+                    "Cannot close '{}': {}", rel_path, message));
+            }
+            if (::chmod(tmp_file.c_str(), archive_entry.mode ? archive_entry.mode : 0644) != 0) {
+                auto message = std::string(std::strerror(errno));
+                std::filesystem::remove(tmp_file);
+                return std::unexpected(std::format(
+                    "Cannot set mode on '{}': {}", rel_path, message));
+            }
+            std::error_code ren_ec;
+            std::filesystem::rename(tmp_file, dest_file, ren_ec);
+            if (ren_ec) {
+                std::filesystem::remove(tmp_file);
+                return std::unexpected(std::format(
+                    "Cannot install '{}': {}", rel_path, ren_ec.message()));
+            }
+
+            util::Sha256 hasher;
+            if (!archive_entry.payload.empty()) {
+                hasher.update(archive_entry.payload.data(), archive_entry.payload.size());
+            }
+            entry.sha256 = hasher.finalize();
+        }
+
+        result.extracted_files.push_back(std::move(entry));
+        return {};
+    });
+    if (!extract_res) return std::unexpected(extract_res.error());
 
     if (manifest_content.empty()) {
         return std::unexpected("Package archive is missing .METADATA/manifest.toml");
@@ -480,9 +615,12 @@ inline std::expected<void, std::string> generate_repo_index(
     }
 
     std::ostringstream ss;
+    const auto quote = [](std::string_view value) {
+        return package::escape_toml_basic_string(value);
+    };
     ss << "schema_version = 1\n\n";
     ss << "[channel]\n";
-    ss << "name = \"" << channel_name << "\"\n";
+    ss << "name = \"" << quote(channel_name) << "\"\n";
     ss << "updated_at = \"" << "2026-08-20T00:00:00Z" << "\"\n\n";
 
     size_t count = 0;
@@ -495,19 +633,19 @@ inline std::expected<void, std::string> generate_repo_index(
             if (ext_res) {
                 const auto& m = ext_res->manifest;
                 ss << "[[packages]]\n";
-                ss << "name = \"" << m.name << "\"\n";
-                ss << "version = \"" << m.version.ver << "\"\n";
-                ss << "release = \"" << m.version.rel << "\"\n";
-                ss << "description = \"" << m.description << "\"\n";
-                ss << "license = \"" << m.license << "\"\n";
-                ss << "channel = \"" << m.channel << "\"\n";
-                ss << "arch = \"" << m.arch << "\"\n";
+                ss << "name = \"" << quote(m.name) << "\"\n";
+                ss << "version = \"" << quote(m.version.ver) << "\"\n";
+                ss << "release = \"" << quote(m.version.rel) << "\"\n";
+                ss << "description = \"" << quote(m.description) << "\"\n";
+                ss << "license = \"" << quote(m.license) << "\"\n";
+                ss << "channel = \"" << quote(m.channel) << "\"\n";
+                ss << "arch = \"" << quote(m.arch) << "\"\n";
                 ss << "installed_size = " << m.installed_size << "\n";
                 ss << "dependencies = [\n";
-                for (const auto& d : m.dependencies) ss << "    \"" << d.to_string() << "\",\n";
+                for (const auto& d : m.dependencies) ss << "    \"" << quote(d.to_string()) << "\",\n";
                 ss << "]\n";
                 ss << "provides = [\n";
-                for (const auto& p : m.provides) ss << "    \"" << p << "\",\n";
+                for (const auto& p : m.provides) ss << "    \"" << quote(p) << "\",\n";
                 ss << "]\n\n";
                 count++;
             }

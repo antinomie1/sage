@@ -102,13 +102,13 @@ public:
         return dbi_packages_.del(txn, name);
     }
 
-    std::vector<package::PackageManifest> list_installed_packages() {
+    std::expected<std::vector<package::PackageManifest>, std::string> list_installed_packages() {
         std::vector<package::PackageManifest> list;
         auto txn = begin_read_txn();
-        if (!txn) return list;
+        if (!txn) return std::unexpected("Failed to open installed package read transaction: " + txn.error());
 
         auto cur_res = vendor::lmdb::MdbCursor::open(*txn, dbi_packages_);
-        if (!cur_res) return list;
+        if (!cur_res) return std::unexpected("Failed to open installed package cursor: " + cur_res.error());
         auto& cursor = *cur_res;
 
         std::string_view k, v;
@@ -116,6 +116,9 @@ public:
             do {
                 if (auto pkg = package::PackageManifest::parse_toml(v)) {
                     list.push_back(std::move(*pkg));
+                } else {
+                    return std::unexpected(std::format(
+                        "Failed to parse installed package '{}' metadata: {}", k, pkg.error()));
                 }
             } while (cursor.next(k, v));
         }

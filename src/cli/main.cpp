@@ -226,6 +226,12 @@ int cmd_install(const CliOptions& opts) {
         return 1;
     }
     auto& db = *db_res;
+    auto installed_res = db.list_installed_packages();
+    if (!installed_res) {
+        sage::util::log_error("Installed package database is inconsistent: {}", installed_res.error());
+        return 1;
+    }
+    auto installed_packages = std::move(*installed_res);
 
     // 1. Gather Available Package Pool from Channels and Local Repos
     std::vector<sage::package::PackageManifest> pool;
@@ -269,8 +275,8 @@ int cmd_install(const CliOptions& opts) {
     // (e.g. glibc providing so:libc.so.6) satisfy dependencies during bootstrap,
     // when the repository may not yet contain the providing package. Candidates
     // that are already installed are filtered out after solving.
-    for (auto& pkg : db.list_installed_packages()) {
-        pool.push_back(std::move(pkg));
+    for (const auto& pkg : installed_packages) {
+        pool.push_back(pkg);
     }
 
     // Check if any arguments are direct .pkg.tar.zst archive files
@@ -310,7 +316,7 @@ int cmd_install(const CliOptions& opts) {
     // may have selected them as candidates. Only repo-newer versions are installed
     // (upgrades); everything else is already satisfied by the current system.
     std::unordered_map<std::string, sage::package::PackageManifest> installed_by_name;
-    for (auto& p : db.list_installed_packages()) {
+    for (auto& p : installed_packages) {
         installed_by_name.emplace(p.name, std::move(p));
     }
     std::vector<sage::package::PackageManifest> to_install;
@@ -518,8 +524,12 @@ int cmd_remove(const CliOptions& opts) {
     auto& db = *db_res;
 
     auto all_installed = db.list_installed_packages();
+    if (!all_installed) {
+        sage::util::log_error("Installed package database is inconsistent: {}", all_installed.error());
+        return 1;
+    }
     std::map<std::string, sage::package::PackageManifest> installed_map;
-    for (const auto& pkg : all_installed) {
+    for (const auto& pkg : *all_installed) {
         installed_map[pkg.name] = pkg;
     }
 
@@ -838,7 +848,7 @@ int cmd_test_suite() {
     sage::package::PackageManifest manifest;
     manifest.name = "dummy-tool";
     manifest.version = sage::package::Version::parse("1.0.0-1");
-    manifest.description = "Test mock tool";
+    manifest.description = "Test \"mock\" tool with \\ path";
     manifest.license = "BSD-2-Clause";
     manifest.channel = "system";
 
@@ -917,6 +927,18 @@ int cmd_test_suite() {
         !std::filesystem::is_symlink(extract_root / "usr/bin/link") ||
         std::filesystem::read_symlink(extract_root / "usr/bin/link").generic_string() != boundary_link_target) {
         sage::util::log_error("Archive extraction verification failed");
+        return 1;
+    }
+
+    auto conflict_root = temp_dir / "conflict-sysroot";
+    std::filesystem::create_directories(conflict_root / "usr/bin/link");
+    std::ofstream(conflict_root / "usr/bin/link/keep") << "must survive\n";
+    auto conflict_res = sage::archive::extract_package(pkg_path, conflict_root);
+    if (conflict_res
+        || !std::filesystem::exists(conflict_root / "usr/bin/link/keep")
+        || std::filesystem::exists(conflict_root / "usr/bin/dummy")
+        || std::filesystem::exists(conflict_root / long_rel)) {
+        sage::util::log_error("Archive path-type conflict was not reported safely");
         return 1;
     }
 
@@ -1121,6 +1143,17 @@ install = [
         sage::util::log_error("Dependency & Toolchain MSRV solver test failed (resolved size: {})", solve_res ? solve_res->size() : 0);
         return 1;
     }
+    auto dependency_before = [&](std::string_view dependency, std::string_view dependent) {
+        auto dependency_it = std::ranges::find(*solve_res, dependency, &sage::package::PackageManifest::name);
+        auto dependent_it = std::ranges::find(*solve_res, dependent, &sage::package::PackageManifest::name);
+        return dependency_it != solve_res->end()
+            && dependent_it != solve_res->end()
+            && dependency_it < dependent_it;
+    };
+    if (!dependency_before("libfoo", "demo-app") || !dependency_before("gcc", "demo-app")) {
+        sage::util::log_error("Dependency solver did not return dependency-first install order");
+        return 1;
+    }
     sage::util::log_success("3. Native PubGrub / CDCL SAT Dependency & MSRV Solver OK");
 
     // 4. Multi-Init Universal Service Generation Test
@@ -1141,6 +1174,67 @@ install = [
     auto db_res = sage::db::Database::open(db_dir);
     if (!db_res) {
         sage::util::log_error("DB open failed: {}", db_res.error());
+        return 1;
+    }
+
+    sage::package::PackageManifest escaped_manifest;
+    escaped_manifest.name = "escaped-metadata";
+    escaped_manifest.version = sage::package::Version::parse("1.0.0-1");
+    escaped_manifest.description = "quoted \"value\" with \\ slash\nnext line";
+    sage::package::FileEntry escaped_file;
+    escaped_file.path = R"(usr/lib/systemd/system/system-systemd\x2dmute.slice)";
+    escaped_manifest.files.push_back(std::move(escaped_file));
+    auto escaped_round_trip = sage::package::PackageManifest::parse_toml(escaped_manifest.serialize_toml());
+    if (!escaped_round_trip
+        || escaped_round_trip->description != escaped_manifest.description
+        || escaped_round_trip->files.size() != 1
+        || escaped_round_trip->files.front().path != escaped_manifest.files.front().path) {
+        sage::util::log_error("Package metadata TOML escaping round-trip failed");
+        return 1;
+    }
+
+    auto corrupt_target = temp_dir / "corrupt-target";
+    auto corrupt_db_dir = corrupt_target / "var/lib/sage";
+    {
+        auto raw_env = sage::vendor::lmdb::MdbEnv::create(corrupt_db_dir);
+        if (!raw_env) {
+            sage::util::log_error("Failed to create corrupt database fixture");
+            return 1;
+        }
+        auto raw_txn = sage::vendor::lmdb::MdbTxn::begin(*raw_env);
+        if (!raw_txn) {
+            sage::util::log_error("Failed to begin corrupt database fixture transaction");
+            return 1;
+        }
+        auto raw_packages = sage::vendor::lmdb::MdbDbi::open(
+            *raw_txn, "packages", sage::vendor::lmdb::flag_create);
+        auto raw_files = sage::vendor::lmdb::MdbDbi::open(
+            *raw_txn, "files", sage::vendor::lmdb::flag_create);
+        if (!raw_packages || !raw_files
+            || !raw_packages->put(*raw_txn, "broken", "[package]\nname = \"broken\n")
+            || !raw_files->put(*raw_txn, "usr/bin/broken", "broken:system")) {
+            sage::util::log_error("Failed to populate corrupt database fixture");
+            return 1;
+        }
+        auto raw_commit = raw_txn->commit();
+        if (!raw_commit) {
+            sage::util::log_error("Failed to commit corrupt database fixture");
+            return 1;
+        }
+    }
+    std::filesystem::create_directories(corrupt_target / "etc/sage");
+    CliOptions corrupt_install_opts;
+    corrupt_install_opts.target_root = corrupt_target;
+    corrupt_install_opts.args = {"dummy-tool"};
+    if (cmd_install(corrupt_install_opts) == 0) {
+        sage::util::log_error("Install accepted a corrupt installed package manifest");
+        return 1;
+    }
+    auto corrupt_db = sage::db::Database::open(corrupt_db_dir, true);
+    if (!corrupt_db
+        || corrupt_db->list_installed_packages()
+        || corrupt_db->get_file_owner("usr/bin/broken") != "broken:system") {
+        sage::util::log_error("Corrupt manifest failure changed existing file ownership");
         return 1;
     }
 
@@ -1193,14 +1287,24 @@ install = [
     sage::util::log_success("7. Ephemeral Sandboxed Shell Environment Generator (sage shell) OK");
 
     // 8. Local Repository Indexing & Zero-Copy file:// Protocol Test
-    auto idx_res = sage::archive::generate_repo_index(temp_dir, "core");
+    const std::string escaped_channel_name = "core \"quoted\" \\ channel";
+    auto idx_res = sage::archive::generate_repo_index(temp_dir, escaped_channel_name);
     if (!idx_res || !std::filesystem::exists(temp_dir / "index.toml")) {
         sage::util::log_error("Local repository index generation failed");
         return 1;
     }
 
     auto fetch_res = sage::vendor::curl::fetch_string("file://" + (temp_dir / "index.toml").string());
-    if (!fetch_res || fetch_res->find("schema_version = 1") == std::string::npos) {
+    if (!fetch_res) {
+        sage::util::log_error("Local file:// protocol fetch failed");
+        return 1;
+    }
+    auto parsed_index = sage::channel::ChannelIndex::parse_toml(*fetch_res);
+    if (fetch_res->find("schema_version = 1") == std::string::npos
+        || !parsed_index
+        || parsed_index->channel_name != escaped_channel_name
+        || parsed_index->available_packages.empty()
+        || parsed_index->available_packages.front().description != manifest.description) {
         sage::util::log_error("Local file:// protocol fetch failed");
         return 1;
     }
@@ -1378,7 +1482,12 @@ install = [
 
     // Verify LMDB is clean
     auto loop_db = sage::db::Database::open(loop_target / "var/lib/sage/data.mdb");
-    if (loop_db && !loop_db->list_installed_packages().empty()) {
+    if (!loop_db) {
+        sage::util::log_error("LMDB unavailable after cascaded removal");
+        return 1;
+    }
+    auto loop_packages = loop_db->list_installed_packages();
+    if (!loop_packages || !loop_packages->empty()) {
         sage::util::log_error("LMDB still contains packages after cascaded removal");
         return 1;
     }
@@ -1408,8 +1517,12 @@ int cmd_query(const CliOptions& opts) {
 
     if (sub == "installed") {
         auto list = db.list_installed_packages();
-        std::println("Installed packages in '{}' ({} total):", opts.target_root.string(), list.size());
-        for (const auto& pkg : list) {
+        if (!list) {
+            sage::util::log_error("Installed package database is inconsistent: {}", list.error());
+            return 1;
+        }
+        std::println("Installed packages in '{}' ({} total):", opts.target_root.string(), list->size());
+        for (const auto& pkg : *list) {
             std::println("  • {:<20} {:<15} [{}]", pkg.name, pkg.version.to_string(), pkg.channel);
         }
     } else if (sub == "info" && opts.args.size() >= 2) {
@@ -1636,9 +1749,13 @@ int cmd_status(const CliOptions& opts) {
         return 0;
     }
     auto installed = db_res->list_installed_packages();
-    std::println("Installed Packages: {}", installed.size());
+    if (!installed) {
+        sage::util::log_error("Installed package database is inconsistent: {}", installed.error());
+        return 1;
+    }
+    std::println("Installed Packages: {}", installed->size());
     if (full) {
-        for (const auto& pkg : installed) {
+        for (const auto& pkg : *installed) {
             std::println("  • {:<20} {:<15} [{}]", pkg.name, pkg.version.to_string(), pkg.channel);
         }
     }

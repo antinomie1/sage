@@ -143,6 +143,11 @@ public:
         const std::filesystem::path& sysroot = "/",
         bool dry_run = false) 
     {
+        auto installed_before = db.list_installed_packages();
+        if (!installed_before) {
+            return std::unexpected("Installed package database is inconsistent: " + installed_before.error());
+        }
+
         if (!plan.has_changes) {
             util::log_info("System state matches desired configuration. No reconcile needed.");
             return {};
@@ -201,8 +206,11 @@ public:
 
         // 4. Automatically re-generate native service configurations for ALL installed daemons
         auto installed = db.list_installed_packages();
+        if (!installed) {
+            return std::unexpected("Installed package database is inconsistent after reconcile: " + installed.error());
+        }
         size_t gen_count = 0;
-        for (const auto& pkg : installed) {
+        for (const auto& pkg : *installed) {
             // Check if package has service definition in database or package files
             service::ServiceSpec spec;
             spec.name = pkg.name;
