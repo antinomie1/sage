@@ -32,58 +32,215 @@ struct ReconcilePlan {
     bool has_changes{false};
 };
 
+// ============================================================================
+// Post-transaction Triggers
+// ============================================================================
+//
+// A transaction reports what it touched; triggers decide what has to be
+// regenerated. Two things can fire one:
+//
+//   on_paths      a file under the prefix was written or removed
+//   on_capability a package taking part in the transaction provides it
+//
+// The capability form is what makes the kernel case work. Installing a kernel
+// must rebuild the initramfs -- but *which* tool does that is the admin's
+// choice, so the trigger names the capability virtual/initramfs-generator and
+// sage resolves it at fire time through the active provider's
+// [[capability_hooks]] entry. A recipe never writes "mkinitcpio -P".
+
+struct TriggerContext {
+    std::filesystem::path sysroot{"/"};
+    // Files added, replaced or deleted by this transaction.
+    std::vector<package::FileEntry> touched_files;
+    // Packages installed or upgraded by this transaction.
+    std::vector<package::PackageManifest> transaction_packages;
+    // Every package present after the transaction. Both the source of declared
+    // triggers and the pool capability hooks are resolved against.
+    std::vector<package::PackageManifest> installed_packages;
+    // Capability -> provider bindings from system.toml.
+    std::map<std::string, std::string> providers;
+    bool dry_run{false};
+};
+
 class TriggerEngine {
 public:
-    static void run_post_transaction_triggers(
-        const std::filesystem::path& sysroot, 
-        const std::vector<package::FileEntry>& touched_files) 
-    {
-        bool run_ldconfig = false;
-        bool run_ca = false;
-        bool run_mime = false;
-        bool run_initramfs = false;
+    // Built-in triggers. These are the ones that cannot be package-declared
+    // without a bootstrap problem -- ldconfig has to run before the package
+    // that would have declared it is usable -- plus the two capability-driven
+    // ones, which are kept here so a kernel package that forgot to declare
+    // them still gets a working boot.
+    static std::vector<package::Trigger> builtin_triggers() {
+        std::vector<package::Trigger> t;
 
-        for (const auto& f : touched_files) {
-            if (f.path.starts_with("usr/lib/") || f.path.starts_with("lib/")) {
-                if (f.path.find(".so") != std::string::npos) run_ldconfig = true;
-            }
-            if (f.path.starts_with("usr/lib/modules/") || f.path.starts_with("boot/vmlinuz")) {
-                run_initramfs = true;
-            }
-            if (f.path.starts_with("etc/ssl/certs/") || f.path.starts_with("usr/share/ca-certificates/")) {
-                run_ca = true;
-            }
-            if (f.path.starts_with("usr/share/mime/")) {
-                run_mime = true;
+        t.push_back(package::Trigger{
+            .name = "ldconfig",
+            .on_paths = {"usr/lib/", "lib/"},
+            .exec = "/sbin/ldconfig",
+            .priority = 10,
+        });
+        t.push_back(package::Trigger{
+            .name = "ca-certificates",
+            .on_paths = {"etc/ssl/certs/", "usr/share/ca-certificates/"},
+            .exec = "/usr/sbin/update-ca-certificates",
+            .priority = 20,
+        });
+        t.push_back(package::Trigger{
+            .name = "mime-database",
+            .on_paths = {"usr/share/mime/"},
+            .exec = "/usr/bin/update-mime-database",
+            .args = {"/usr/share/mime"},
+            .priority = 20,
+        });
+        // Kernel installed -> rebuild the initramfs, then point the bootloader
+        // at it. Both resolve through whichever package currently provides the
+        // capability; if nothing does, they silently do not fire.
+        t.push_back(package::Trigger{
+            .name = "initramfs",
+            .on_paths = {"usr/lib/modules/", "boot/vmlinuz"},
+            .on_capability = {"virtual/kernel"},
+            .run_capability = "virtual/initramfs-generator",
+            .priority = 60,
+        });
+        t.push_back(package::Trigger{
+            .name = "bootloader",
+            .on_paths = {"boot/vmlinuz"},
+            .on_capability = {"virtual/kernel"},
+            .run_capability = "virtual/bootloader",
+            .priority = 70,
+        });
+
+        return t;
+    }
+
+    static void run(const TriggerContext& ctx) {
+        // Capabilities brought in by this transaction, for on_capability.
+        std::set<std::string> txn_capabilities;
+        for (const auto& pkg : ctx.transaction_packages) {
+            for (const auto& prov : pkg.provides) {
+                txn_capabilities.insert(prov);
             }
         }
 
-        // Post-transaction tools are provided BY the target, and resolve their
-        // own paths against "/". For a sysroot other than "/" they must run
-        // inside the chroot: host-side they would rebuild the HOST's caches and
-        // leave the sysroot's untouched, and the host loader may not even match
-        // the target's glibc. `abs_path` and `args` are therefore always
-        // expressed relative to the target root.
-        auto run_target_tool = [&](std::string_view abs_path, std::string_view args = "") {
-            if (!std::filesystem::exists(sysroot / std::filesystem::path(abs_path).relative_path())) {
-                return;
-            }
-            std::string suffix = args.empty() ? std::string{} : std::format(" {}", args);
-            std::string cmd = (sysroot == "/")
-                ? std::format("{}{}", abs_path, suffix)
-                : std::format("chroot {} {}{}", sysroot.string(), abs_path, suffix);
+        std::vector<package::Trigger> candidates = builtin_triggers();
+        for (const auto& pkg : ctx.installed_packages) {
+            candidates.insert(candidates.end(), pkg.triggers.begin(), pkg.triggers.end());
+        }
 
-            util::log_info("Running post-transaction trigger: {}", abs_path);
-            int ret = std::system(cmd.c_str());
-            if (ret != 0) {
-                util::log_warn("Trigger failed (exit {}): {}", ret, cmd);
-            }
-        };
+        std::ranges::stable_sort(candidates, {}, &package::Trigger::priority);
 
-        if (run_ldconfig)  run_target_tool("/sbin/ldconfig");
-        if (run_initramfs) run_target_tool("/usr/bin/sage-initramfs-generate");
-        if (run_ca)        run_target_tool("/usr/sbin/update-ca-certificates");
-        if (run_mime)      run_target_tool("/usr/bin/update-mime-database", "/usr/share/mime");
+        // One resolved command runs at most once per transaction, however many
+        // triggers and however many touched files ask for it.
+        std::set<std::string> already_run;
+
+        for (const auto& trig : candidates) {
+            if (!fires(trig, ctx, txn_capabilities)) continue;
+
+            auto cmd = resolve_command(trig, ctx);
+            if (!cmd) continue;
+
+            if (!already_run.insert(*cmd).second) continue;
+            execute(*cmd, trig.name, ctx);
+        }
+    }
+
+private:
+    static bool fires(const package::Trigger& trig,
+                      const TriggerContext& ctx,
+                      const std::set<std::string>& txn_capabilities)
+    {
+        for (const auto& cap : trig.on_capability) {
+            if (txn_capabilities.contains(cap)) return true;
+        }
+        for (const auto& f : ctx.touched_files) {
+            if (!trig.matches_path(f.path)) continue;
+            // The historical ldconfig rule only cared about shared objects,
+            // not about every file that happens to live under usr/lib.
+            if (trig.name == "ldconfig" && f.path.find(".so") == std::string::npos) continue;
+            return true;
+        }
+        return false;
+    }
+
+    // Resolve a trigger to a concrete command line inside the target root, or
+    // nothing when the capability has no provider / no hook.
+    static std::optional<std::string> resolve_command(const package::Trigger& trig,
+                                                      const TriggerContext& ctx)
+    {
+        if (trig.run_capability.empty()) {
+            if (trig.exec.empty()) return std::nullopt;
+            std::string cmd = trig.exec;
+            for (const auto& a : trig.args) cmd += " " + a;
+            return cmd;
+        }
+
+        const package::CapabilityHook* hook = nullptr;
+
+        // The admin's binding wins, whether the capability is exclusive or
+        // just has a declared default.
+        if (auto it = ctx.providers.find(trig.run_capability); it != ctx.providers.end()) {
+            for (const auto& pkg : ctx.installed_packages) {
+                if (pkg.name != it->second) continue;
+                hook = pkg.hook_for(trig.run_capability);
+                break;
+            }
+        }
+
+        // Otherwise: any installed provider that publishes a hook.
+        if (!hook) {
+            for (const auto& pkg : ctx.installed_packages) {
+                if (!pkg.provides_capability(trig.run_capability)) continue;
+                if (auto* h = pkg.hook_for(trig.run_capability)) {
+                    hook = h;
+                    break;
+                }
+            }
+        }
+
+        if (!hook) {
+            // A capability nobody provides is the ordinary case -- most roots
+            // never install a bootloader -- and warning about it on every
+            // transaction trains people to ignore trigger warnings. Only a
+            // provider that is installed but ships no hook is worth reporting:
+            // that one is a packaging mistake.
+            bool provided = std::ranges::any_of(ctx.installed_packages,
+                [&](const auto& pkg) { return pkg.provides_capability(trig.run_capability); });
+            if (provided) {
+                util::log_warn("Trigger '{}' wants capability '{}': it is provided, but no provider declares a capability hook -- skipping",
+                    trig.name, trig.run_capability);
+            }
+            return std::nullopt;
+        }
+
+        std::string cmd = hook->command_line();
+        for (const auto& a : trig.args) cmd += " " + a;
+        return cmd;
+    }
+
+    // Post-transaction tools are provided BY the target and resolve their own
+    // paths against "/". For a sysroot other than "/" they must run inside the
+    // chroot: host-side they would rebuild the HOST's caches and leave the
+    // sysroot's untouched, and the host loader may not even match the target's
+    // glibc. Every path here is therefore relative to the target root.
+    static void execute(const std::string& cmd, std::string_view trigger_name, const TriggerContext& ctx) {
+        std::string exec_path = cmd.substr(0, cmd.find(' '));
+        if (!std::filesystem::exists(ctx.sysroot / std::filesystem::path(exec_path).relative_path())) {
+            return;
+        }
+
+        std::string full = (ctx.sysroot == "/")
+            ? cmd
+            : std::format("chroot {} {}", ctx.sysroot.string(), cmd);
+
+        if (ctx.dry_run) {
+            util::log_info("Would run trigger '{}': {}", trigger_name, full);
+            return;
+        }
+
+        util::log_info("Running trigger '{}': {}", trigger_name, full);
+        int ret = std::system(full.c_str());
+        if (ret != 0) {
+            util::log_warn("Trigger '{}' failed (exit {}): {}", trigger_name, ret, full);
+        }
     }
 };
 
@@ -101,8 +258,15 @@ public:
                 "Failed to read current system providers: " + current_providers.error());
         }
 
-        // 1. Calculate provider diffs (virtual/init, virtual/udev, virtual/libc)
-        for (const auto& [iface, target_prov] : desired_config.providers) {
+        // 1. Calculate provider diffs.
+        //
+        // Only *exclusive* capabilities take part: they are the ones where at
+        // most one provider may exist, so a changed binding means packages
+        // must actually be swapped. Retargeting a shared default such as
+        // virtual/initramfs-generator changes which tool later transactions
+        // call, not what is installed -- reconciling on it would uninstall a
+        // perfectly valid coexisting provider.
+        for (const auto& [iface, target_prov] : desired_config.exclusive_providers()) {
             std::string cur = current_providers->contains(iface) ? current_providers->at(iface) : "";
             if (cur != target_prov) {
                 plan.swaps.push_back(ProviderSwap{
@@ -161,7 +325,8 @@ public:
         db::Database& db,
         const ReconcilePlan& plan,
         const std::filesystem::path& sysroot = "/",
-        bool dry_run = false) 
+        bool dry_run = false,
+        const std::map<std::string, std::string>& providers = {})
     {
         if (!plan.has_changes) {
             util::log_info("System state matches desired configuration. No reconcile needed.");
@@ -184,6 +349,23 @@ public:
 
         auto wtxn = db.begin_write_txn();
         if (!wtxn) return std::unexpected("Failed to open database write transaction");
+
+        // The plan was computed before taking the writer lock. Validate every
+        // provider binding before changing any of them so a stale reconcile
+        // cannot overwrite a concurrently committed provider choice.
+        for (const auto& swap : plan.swaps) {
+            auto current = db.get_system_provider(*wtxn, swap.iface);
+            if (!current) {
+                return std::unexpected(std::format(
+                    "Failed to revalidate provider '{}': {}", swap.iface, current.error()));
+            }
+            const std::string current_name = *current ? **current : std::string{};
+            if (current_name != swap.current_provider) {
+                return std::unexpected(std::format(
+                    "System provider '{}' changed after the reconcile plan was created",
+                    swap.iface));
+            }
+        }
 
         // 1. Update system provider locks in LMDB
         for (const auto& swap : plan.swaps) {
@@ -254,12 +436,16 @@ public:
             }
         }
 
-        // 5. Execute post-transaction file triggers (ldconfig, ca-certificates, mime)
-        std::vector<package::FileEntry> touched_files;
+        // 5. Execute post-transaction triggers
+        TriggerContext trig_ctx;
+        trig_ctx.sysroot = sysroot;
+        trig_ctx.transaction_packages = plan.packages_to_install;
+        trig_ctx.installed_packages = std::move(*installed);
+        trig_ctx.providers = providers;
         for (const auto& pkg : plan.packages_to_install) {
-            touched_files.insert(touched_files.end(), pkg.files.begin(), pkg.files.end());
+            trig_ctx.touched_files.insert(trig_ctx.touched_files.end(), pkg.files.begin(), pkg.files.end());
         }
-        TriggerEngine::run_post_transaction_triggers(sysroot, touched_files);
+        TriggerEngine::run(trig_ctx);
 
         util::log_success("Reconcile completed! Regenerated {} native service scripts for {}", 
             gen_count, service::to_string(plan.target_init));

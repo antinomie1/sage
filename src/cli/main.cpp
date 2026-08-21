@@ -17,6 +17,8 @@ struct CliOptions {
     bool force{false};        // --force, -f, --nodeps, -d
     bool cascade{false};      // --cascade, -c
     bool no_recursive{false};  // --no-recursive
+    bool no_elf_check{false};  // --no-elf-check
+    std::string channel_filter;  // --channel <NAME>
 };
 
 void print_banner() {
@@ -36,11 +38,14 @@ Commands:
   java [list|use <slot>]   Manage OpenJDK/GraalVM/Temurin versions and JAVA_HOME
   rust [list|use <slot>]   Manage Rust stable/nightly versions and targets
   shell [--with <spec...>] Launch ephemeral sandboxed shell with custom toolchains
-  channel [COMMAND]        Manage multi-layer channels (list, add, sync)
+  channel [COMMAND]        Manage multi-layer channels (list, add, remove, sync)
   repo index <DIR> [NAME]  Generate index.toml for local repository directory
-  query [COMMAND]          Query packages, file ownership, and manifests (nanosecond LMDB)
+  query [COMMAND]          Query packages, files, capabilities and ownership (nanosecond LMDB)
+  list [-q] [PATTERN]      List installed packages (-q: bare names for scripting)
+  count [PATTERN]          Print the number of installed packages
   service [COMMAND]        Inspect and generate native init scripts (OpenRC/Runit/Systemd/Dinit/s6)
   build <RECIPE_DIR>       Build package from recipe.toml (fetch source, check sha256, build, scan ELF)
+  verify [PKG...]          Check installed files against the recorded files.idx hashes
   status [--full]          Show declared providers, channels, and database state
   test-suite               Run internal engine self-test suite
 
@@ -48,6 +53,8 @@ Global Options:
   --root, --sysroot <DIR>  Operate on target root directory (default: /)
   --dry-run                Simulate actions without modifying filesystem
   --verbose, -v            Enable verbose diagnostics
+  --no-elf-check           Skip build-time DT_NEEDED validation (bootstrap escape hatch)
+  --channel <NAME>         Restrict `install` to a single channel
   --help, -h               Show this help message
   --version, -V            Show version information
 )");
@@ -67,6 +74,23 @@ int cmd_build(const CliOptions& opts) {
     if (!std::filesystem::exists(recipe_file)) {
         sage::util::log_error("recipe.toml not found in directory: {}", recipe_dir.string());
         return 1;
+    }
+
+    // Make the recipe directory absolute before anything derives from it.
+    // The build phases run with the working directory changed to src/ (or the
+    // recipe directory), so a relative DESTDIR such as "./foo/pkg" would be
+    // resolved against *that* directory instead of sage's own -- the install
+    // phase writes into a phantom nested path, packing then finds pkg/ empty,
+    // and the package ships with no payload and no error anywhere.
+    {
+        std::error_code ec;
+        auto abs = std::filesystem::canonical(recipe_dir, ec);
+        if (ec) {
+            sage::util::log_error("Cannot resolve recipe directory '{}': {}", recipe_dir.string(), ec.message());
+            return 1;
+        }
+        recipe_dir = std::move(abs);
+        recipe_file = recipe_dir / "recipe.toml";
     }
 
     std::ifstream rf(recipe_file);
@@ -166,26 +190,108 @@ int cmd_build(const CliOptions& opts) {
     manifest.dependencies = r.host_deps;
     manifest.provides = r.provides;
     manifest.arch = r.arch;
+    manifest.capability_hooks = r.capability_hooks;
+    manifest.triggers = r.triggers;
+
+    // Every soname this package satisfies by itself, and every soname it still
+    // needs from elsewhere -- remembering which file asked, so a failure can
+    // name the offender rather than just the missing library.
+    std::set<std::string> self_sonames;
+    std::set<std::string> needed_sonames;
+    std::map<std::string, std::vector<std::string>> needed_by;
 
     if (std::filesystem::exists(pkg_dir)) {
-        std::map<std::string, std::filesystem::directory_entry> entries;
         for (const auto& entry : std::filesystem::recursive_directory_iterator(pkg_dir, std::filesystem::directory_options::skip_permission_denied)) {
-            entries.emplace(entry.path().lexically_relative(pkg_dir).generic_string(), entry);
-        }
+            auto rel = entry.path().lexically_relative(pkg_dir).generic_string();
 
-        for (const auto& item : entries) {
-            const auto& entry = item.second;
-            if (entry.is_symlink()) continue;
-            if (entry.is_regular_file()) {
-                auto elf_res = sage::util::scan_elf(entry.path());
-                if (elf_res) {
-                    if (!elf_res->soname.empty()) {
-                        manifest.provides.push_back("so:" + elf_res->soname);
-                    }
-                    for (const auto& needed : elf_res->needed) {
-                        manifest.dependencies.push_back(sage::package::Dependency::parse("so:" + needed));
-                    }
+            // A soname is normally reached through the versioned symlink the
+            // package installs next to the real file (libz.so.1 ->
+            // libz.so.1.3.1). Skipping symlinks meant those names never made
+            // it into `provides`, which is why repository indexes ended up
+            // full of so: constraints nothing satisfied.
+            if (entry.is_symlink()) {
+                auto base = entry.path().filename().string();
+                if (base.starts_with("lib") && base.find(".so") != std::string::npos) {
+                    self_sonames.insert(base);
                 }
+                continue;
+            }
+            if (!entry.is_regular_file()) continue;
+
+            auto base = entry.path().filename().string();
+            if (base.starts_with("lib") && base.find(".so") != std::string::npos) {
+                self_sonames.insert(base);
+            }
+
+            auto elf_res = sage::util::scan_elf(entry.path());
+            if (!elf_res) continue;
+            if (!elf_res->soname.empty()) {
+                self_sonames.insert(elf_res->soname);
+            }
+            for (const auto& needed : elf_res->needed) {
+                needed_sonames.insert(needed);
+                needed_by[needed].push_back(rel);
+            }
+        }
+    }
+
+    for (const auto& soname : self_sonames) {
+        manifest.provides.push_back("so:" + soname);
+    }
+
+    // A package does not depend on itself: a soname it installs is not an
+    // external constraint, and emitting it as one makes the solver chase a
+    // cycle through the package being built.
+    std::vector<std::string> external_sonames;
+    for (const auto& soname : needed_sonames) {
+        if (!self_sonames.contains(soname)) external_sonames.push_back(soname);
+    }
+    for (const auto& soname : external_sonames) {
+        manifest.dependencies.push_back(sage::package::Dependency::parse("so:" + soname));
+    }
+
+    // Deduplicate. The same soname is routinely reached from a dozen binaries
+    // in one package, and a repeated provides entry makes the index unreadable.
+    {
+        std::unordered_set<std::string> seen;
+        std::erase_if(manifest.provides, [&](const std::string& p) { return !seen.insert(p).second; });
+    }
+    {
+        std::unordered_set<std::string> seen;
+        std::erase_if(manifest.dependencies, [&](const sage::package::Dependency& d) {
+            return !seen.insert(d.to_string()).second;
+        });
+    }
+
+    // 3b. Validate every remaining DT_NEEDED against what is actually
+    // installed. Without this the build happily links against a library that
+    // only exists on the build host -- xfsprogs picking up the host's
+    // libdevmapper -- and the failure surfaces at install time on a machine
+    // that has no such file.
+    if (!opts.no_elf_check && !external_sonames.empty()) {
+        auto host_cfg = sage::config::SystemConfig::load_from_root(opts.target_root);
+        auto host_db = host_cfg
+            ? sage::db::Database::open(host_cfg->db_path, true)
+            : std::expected<sage::db::Database, std::string>(std::unexpected("no config"));
+
+        if (!host_db) {
+            sage::util::log_warn("Cannot verify DT_NEEDED: no package database at '{}'. "
+                "{} external soname(s) go unchecked -- expected while bootstrapping, a bug otherwise.",
+                host_cfg ? host_cfg->db_path.string() : std::string("<unknown>"), external_sonames.size());
+        } else {
+            std::vector<std::string> unsatisfied;
+            for (const auto& soname : external_sonames) {
+                if (host_db->get_provider("so:" + soname)) continue;
+                unsatisfied.push_back(soname);
+            }
+            if (!unsatisfied.empty()) {
+                sage::util::log_error("Build linked against {} library/libraries no installed package provides:", unsatisfied.size());
+                for (const auto& soname : unsatisfied) {
+                    sage::util::log_error("  so:{}  needed by: {}", soname, sage::util::join(needed_by[soname], ", "));
+                }
+                sage::util::log_error("These came from the build host, not from the repository. Either package them, "
+                    "or configure the build to not use them. Pass --no-elf-check to override.");
+                return 1;
             }
         }
     }
@@ -260,8 +366,14 @@ int cmd_install(const CliOptions& opts) {
     auto channel_configs = cfg.channels;
     std::ranges::stable_sort(channel_configs, std::greater{},
         &sage::config::ChannelConfig::priority);
+    bool channel_filter_matched = opts.channel_filter.empty();
     for (const auto& ch_cfg : channel_configs) {
         if (!ch_cfg.enabled) continue;
+        // --channel narrows the pool to one channel. Installed packages are
+        // still added below, so a restricted install can still satisfy
+        // constraints that are already met on the system.
+        if (!opts.channel_filter.empty() && ch_cfg.name != opts.channel_filter) continue;
+        channel_filter_matched = true;
         sage::channel::Channel ch;
         ch.name = ch_cfg.name;
         ch.url = ch_cfg.url;
@@ -283,12 +395,19 @@ int cmd_install(const CliOptions& opts) {
                     dir_base = cfg.cache_dir / "pkg";
                 }
 
-                std::filesystem::path local_p = dir_base / std::format("{}-{}-{}-{}.pkg.tar.zst", pkg.name, pkg.version.ver, pkg.version.rel, pkg.arch);
-                if (!std::filesystem::exists(local_p)) {
-                    local_p = dir_base / std::format("{}-{}-{}.pkg.tar.zst", pkg.name, pkg.version.ver, pkg.version.rel);
-                }
-                if (!std::filesystem::exists(local_p)) {
-                    local_p = dir_base / std::format("{}-{}.pkg.tar.zst", pkg.name, pkg.version.ver);
+                std::filesystem::path local_p;
+                if (!pkg.file.empty()) {
+                    // Use the file field from index if present
+                    local_p = dir_base / pkg.file;
+                } else {
+                    // Fallback to old naming scheme for backward compatibility
+                    local_p = dir_base / std::format("{}-{}-{}-{}.pkg.tar.zst", pkg.name, pkg.version.ver, pkg.version.rel, pkg.arch);
+                    if (!std::filesystem::exists(local_p)) {
+                        local_p = dir_base / std::format("{}-{}-{}.pkg.tar.zst", pkg.name, pkg.version.ver, pkg.version.rel);
+                    }
+                    if (!std::filesystem::exists(local_p)) {
+                        local_p = dir_base / std::format("{}-{}.pkg.tar.zst", pkg.name, pkg.version.ver);
+                    }
                 }
                 // Equal-version solver ties keep the first candidate. Preserve
                 // the same priority-ordered source here so metadata and payload
@@ -297,6 +416,12 @@ int cmd_install(const CliOptions& opts) {
                     sage::package::package_identity(pkg), std::move(local_p));
             }
         }
+    }
+
+    if (!channel_filter_matched) {
+        sage::util::log_error("No enabled channel named '{}' is configured for '{}'",
+            opts.channel_filter, opts.target_root.string());
+        return 1;
     }
 
     // Include already-installed packages in the pool so that installed providers
@@ -410,6 +535,36 @@ int cmd_install(const CliOptions& opts) {
     }
     unique_to_install = std::move(to_install);
 
+    // Enforce exclusive capabilities.
+    //
+    // An exclusive capability -- virtual/init, virtual/udev, virtual/libc --
+    // is one where two providers on the same root cannot both work. Shared
+    // capabilities are exempt by construction: two initramfs builders or two
+    // kernels coexisting is the normal case, and rejecting them here is
+    // exactly the mistake this distinction exists to prevent.
+    {
+        std::map<std::string, std::string> claimed;
+        for (const auto& [name, pkg] : installed_by_name) {
+            for (const auto& prov : pkg.provides) {
+                if (cfg.is_exclusive_capability(prov)) claimed.emplace(prov, name);
+            }
+        }
+        for (const auto& pkg : unique_to_install) {
+            for (const auto& prov : pkg.provides) {
+                if (!cfg.is_exclusive_capability(prov)) continue;
+                auto [it, fresh] = claimed.emplace(prov, pkg.name);
+                if (!fresh && it->second != pkg.name) {
+                    sage::util::log_error("Exclusive capability '{}' would have two providers: '{}' and '{}'",
+                        prov, it->second, pkg.name);
+                    sage::util::log_error("Swap the provider through '{}' [providers] and 'sage rebuild', "
+                        "or drop the capability to \"shared\" under [capabilities] if they really do coexist.",
+                        cfg.system_config_path.string());
+                    return 1;
+                }
+            }
+        }
+    }
+
     sage::util::log_info("Resolved {} packages to install into target root '{}':", unique_to_install.size(), opts.target_root.string());
     for (const auto& pkg : unique_to_install) {
         std::println("  + {:<20} {:<15} [{}]", pkg.name, pkg.version.to_string(), pkg.channel);
@@ -447,16 +602,12 @@ int cmd_install(const CliOptions& opts) {
     // Self-heal: prune file registrations owned by packages that are no longer
     // installed (leftovers from previous versions with incomplete file lists),
     // so the paths can be claimed by the packages about to be installed.
-    std::unordered_set<std::string> installed_names;
-    for (const auto& [name, _] : installed_by_name) {
-        installed_names.insert(name);
-    }
     auto prune_txn = db.begin_write_txn();
     if (!prune_txn) {
         sage::util::log_error("Failed to open orphan-pruning transaction: {}", prune_txn.error());
         return 1;
     }
-    auto pruned = db.prune_orphaned_files(*prune_txn, installed_names);
+    auto pruned = db.prune_orphaned_files(*prune_txn);
     if (!pruned) {
         sage::util::log_error("Failed to prune orphaned file registrations: {}", pruned.error());
         return 1;
@@ -495,8 +646,20 @@ int cmd_install(const CliOptions& opts) {
 
         (void)sage::channel::ProfileManager::regenerate_fhs_profile(
             opts.target_root, active_channels);
-        sage::rebuild::TriggerEngine::run_post_transaction_triggers(
-            opts.target_root, installed_pkg.files);
+        auto current_packages = db.list_installed_packages();
+        if (!current_packages) {
+            sage::util::log_warn(
+                "Skipping post-install triggers for '{}': {}",
+                installed_pkg.name, current_packages.error());
+            return;
+        }
+        sage::rebuild::TriggerContext trigger_context;
+        trigger_context.sysroot = opts.target_root;
+        trigger_context.touched_files = installed_pkg.files;
+        trigger_context.transaction_packages = {installed_pkg};
+        trigger_context.installed_packages = std::move(*current_packages);
+        trigger_context.providers = cfg.providers;
+        sage::rebuild::TriggerEngine::run(trigger_context);
     };
 
     // 3. Streaming Unpack & LMDB State Registration
@@ -574,6 +737,15 @@ int cmd_install(const CliOptions& opts) {
 
         auto installed_pkg = pkg;
         installed_pkg.files = ext_res->extracted_files;
+
+        // The channel index is a solving summary: it carries names, versions,
+        // dependencies and provides, but not capability hooks or triggers.
+        // Those live in the archive's own manifest, and the post-transaction
+        // trigger pass reads them back out of the database -- so adopt them
+        // here, or an installed initramfs generator would be invisible to the
+        // very trigger that has to run it.
+        installed_pkg.capability_hooks = ext_res->manifest.capability_hooks;
+        installed_pkg.triggers = ext_res->manifest.triggers;
 
         // Upgrade cleanup: remove physical files owned by a previously installed
         // version of this package that are not part of the new version, so file
@@ -676,11 +848,27 @@ int cmd_install(const CliOptions& opts) {
             all_installed_files.end(), installed_pkg.files.begin(), installed_pkg.files.end());
     }
 
-    // Re-run the aggregate triggers after a fully successful transaction set:
-    // a trigger tool may itself have been installed after an earlier package
-    // first requested it.
-    sage::rebuild::TriggerEngine::run_post_transaction_triggers(
-        opts.target_root, all_installed_files);
+    // Re-run aggregate triggers after the complete install set. A trigger tool
+    // may itself have arrived after an earlier package first requested it.
+    // Runs AFTER toolchain activation so freshly written
+    // /etc/ld.so.conf.d/sage-*.conf entries are picked up by ldconfig, and
+    // after the DB commit so a capability installed in this very transaction
+    // (mkinitcpio arriving alongside the kernel that needs it) is already
+    // visible when the initramfs trigger looks for its provider.
+    sage::rebuild::TriggerContext trig_ctx;
+    trig_ctx.sysroot = opts.target_root;
+    trig_ctx.touched_files = all_installed_files;
+    trig_ctx.transaction_packages = unique_to_install;
+    if (auto current_packages = db.list_installed_packages()) {
+        trig_ctx.installed_packages = std::move(*current_packages);
+    } else {
+        sage::util::log_error(
+            "Cannot run aggregate triggers: {}", current_packages.error());
+        return 1;
+    }
+    trig_ctx.providers = cfg.providers;
+    trig_ctx.dry_run = opts.dry_run;
+    sage::rebuild::TriggerEngine::run(trig_ctx);
 
     sage::util::log_success("Successfully installed {} packages into {}", unique_to_install.size(), opts.target_root.string());
     return 0;
@@ -912,6 +1100,34 @@ int cmd_remove(const CliOptions& opts) {
     auto wtxn = db.begin_write_txn();
     if (!wtxn) return 1;
 
+    // The dependency/removal plan was built before taking the writer lock.
+    // Abort if any package was installed, removed, or replaced in that window;
+    // otherwise stale plans can delete a newer same-name package or break a
+    // dependency introduced concurrently.
+    auto current_installed = db.list_installed_packages(*wtxn);
+    if (!current_installed) {
+        sage::util::log_error(
+            "Failed to revalidate installed packages before removal: {}",
+            current_installed.error());
+        return 1;
+    }
+    if (current_installed->size() != installed_map.size()) {
+        sage::util::log_error(
+            "Installed package state changed while planning removal; retry the command");
+        return 1;
+    }
+    for (const auto& current : *current_installed) {
+        auto planned = installed_map.find(current.name);
+        if (planned == installed_map.end()
+            || sage::package::package_identity(planned->second)
+                != sage::package::package_identity(current)) {
+            sage::util::log_error(
+                "Installed package '{}' changed while planning removal; retry the command",
+                current.name);
+            return 1;
+        }
+    }
+
     std::vector<sage::package::FileEntry> removed_files;
 
     for (const auto& pkg_name : to_remove_set) {
@@ -1037,7 +1253,26 @@ int cmd_remove(const CliOptions& opts) {
     auto commit_res = wtxn->commit();
     if (!commit_res) return 1;
 
-    sage::rebuild::TriggerEngine::run_post_transaction_triggers(opts.target_root, removed_files);
+    // Removing a kernel is as much a reason to regenerate the initramfs and
+    // the bootloader entries as installing one, so removal runs the same
+    // triggers -- with the removed packages as the transaction set, since it
+    // is their capabilities that make the kernel triggers fire.
+    sage::rebuild::TriggerContext trig_ctx;
+    trig_ctx.sysroot = opts.target_root;
+    trig_ctx.touched_files = removed_files;
+    auto remaining_packages = db.list_installed_packages();
+    if (!remaining_packages) {
+        sage::util::log_error(
+            "Cannot run post-remove triggers: {}", remaining_packages.error());
+        return 1;
+    }
+    trig_ctx.installed_packages = std::move(*remaining_packages);
+    trig_ctx.providers = cfg.providers;
+    trig_ctx.dry_run = opts.dry_run;
+    for (const auto& [name, pkg] : installed_map) {
+        if (to_remove_set.contains(name)) trig_ctx.transaction_packages.push_back(pkg);
+    }
+    sage::rebuild::TriggerEngine::run(trig_ctx);
     std::vector<sage::channel::Channel> active_channels;
     for (const auto& ch_cfg : cfg.channels) {
         sage::channel::Channel ch;
@@ -1396,10 +1631,12 @@ int cmd_test_suite() {
         return 1;
     }
     std::atomic<bool> parent_replaced{false};
-    std::jthread parent_attacker([&] {
-        while (!std::filesystem::exists(parent_race_target / "a-marker")) {
+    std::jthread parent_attacker([&](std::stop_token stop) {
+        while (!stop.stop_requested()
+            && !std::filesystem::exists(parent_race_target / "a-marker")) {
             std::this_thread::yield();
         }
+        if (stop.stop_requested()) return;
         std::error_code race_ec;
         std::filesystem::remove_all(parent_race_target / "z-parent", race_ec);
         if (!race_ec) {
@@ -1410,6 +1647,7 @@ int cmd_test_suite() {
     });
     auto parent_race_result = sage::archive::extract_package(
         parent_race_pkg, parent_race_target);
+    parent_attacker.request_stop();
     parent_attacker.join();
     if (!parent_replaced.load(std::memory_order_acquire)
         || parent_race_result
@@ -1781,8 +2019,8 @@ install = [
         database_conflict_rejected = !conflict_registration;
     }
     if (!database_conflict_rejected
-        || db_res->get_file_owner(owned_file.path) != "database-owner:system"
-        || db_res->get_file_owner(unowned_file.path)) {
+        || db_res->get_file_owner(owned_file.path).value_or(std::nullopt) != "database-owner:system"
+        || db_res->get_file_owner(unowned_file.path).value_or(std::nullopt)) {
         sage::util::log_error("Database file conflict registration was not atomic");
         return 1;
     }
@@ -1856,7 +2094,7 @@ install = [
     if (!preserved_migration || !*preserved_migration
         || sage::package::package_identity(**preserved_migration)
             != sage::package::package_identity(migration_new)
-        || migration_db->get_file_owner(migration_file.path)
+        || migration_db->get_file_owner(migration_file.path).value_or(std::nullopt)
             != "migration-race:runtime/python:3.12") {
         sage::util::log_error("Rejected stale migration changed the concurrent package state");
         return 1;
@@ -1914,13 +2152,14 @@ install = [
         || corrupt_db->list_installed_packages()
         || corrupt_package
         || mismatched_package
-        || corrupt_db->get_file_owner("usr/bin/broken") != "broken:system") {
+        || corrupt_db->get_file_owner("usr/bin/broken").value_or(std::nullopt) != "broken:system") {
         sage::util::log_error("Corrupt manifest failure changed existing file ownership");
         return 1;
     }
 
     sage::config::SystemConfig sys_cfg;
     sys_cfg.providers["virtual/init"] = "openrc";
+    sys_cfg.capabilities["virtual/init"] = sage::config::CapabilityKind::Exclusive;
     auto plan_res = sage::rebuild::ReconcileEngine::calculate_diff(*db_res, sys_cfg, repo_pool);
     if (!plan_res) {
         sage::util::log_error("Reconcile plan failed: {}", plan_res.error());
@@ -1970,11 +2209,50 @@ install = [
     auto stale_execute = sage::rebuild::ReconcileEngine::execute(
         *reconcile_race_db, *stale_plan, extract_root, false);
     auto preserved_init = reconcile_race_db->get_package(old_init.name);
+    auto preserved_provider = reconcile_race_db->get_system_provider("virtual/init");
     if (stale_execute
         || !preserved_init || !*preserved_init
         || (**preserved_init).version != replacement_init.version
-        || reconcile_race_db->get_system_provider("virtual/init") != old_init.name) {
+        || !preserved_provider || !*preserved_provider
+        || **preserved_provider != old_init.name) {
         sage::util::log_error("Reconcile executed against a stale package snapshot");
+        return 1;
+    }
+
+    // A provider lock can also change without changing the package record.
+    // Reject the stale plan before it overwrites that newer binding.
+    {
+        auto reset_txn = reconcile_race_db->begin_write_txn();
+        if (!reset_txn
+            || !reconcile_race_db->put_package(*reset_txn, old_init)
+            || !reconcile_race_db->set_system_provider(*reset_txn, "virtual/init", old_init.name)
+            || !reset_txn->commit()) {
+            sage::util::log_error("Failed to reset reconcile provider fixture");
+            return 1;
+        }
+    }
+    auto stale_provider_plan = sage::rebuild::ReconcileEngine::calculate_diff(
+        *reconcile_race_db, sys_cfg, repo_pool);
+    {
+        auto update_txn = reconcile_race_db->begin_write_txn();
+        if (!stale_provider_plan || !update_txn
+            || !reconcile_race_db->set_system_provider(
+                *update_txn, "virtual/init", "concurrent-init")
+            || !update_txn->commit()) {
+            sage::util::log_error("Failed to update reconcile provider fixture");
+            return 1;
+        }
+    }
+    auto stale_provider_execute = sage::rebuild::ReconcileEngine::execute(
+        *reconcile_race_db, *stale_provider_plan, extract_root, false);
+    auto concurrent_provider = reconcile_race_db->get_system_provider("virtual/init");
+    auto provider_package = reconcile_race_db->get_package(old_init.name);
+    if (stale_provider_execute
+        || !concurrent_provider || !*concurrent_provider
+        || **concurrent_provider != "concurrent-init"
+        || !provider_package || !*provider_package
+        || (**provider_package).version != old_init.version) {
+        sage::util::log_error("Reconcile overwrote a concurrently changed provider lock");
         return 1;
     }
     sage::util::log_success("5. Declarative System Reconcile & Triggers Engine (sage rebuild) OK");
@@ -2015,13 +2293,22 @@ install = [
 
     // 8. Local Repository Indexing & Zero-Copy file:// Protocol Test
     const std::string escaped_channel_name = "core \"quoted\" \\ channel";
-    auto idx_res = sage::archive::generate_repo_index(temp_dir, escaped_channel_name);
-    if (!idx_res || !std::filesystem::exists(temp_dir / "index.toml")) {
+    auto local_repo = temp_dir / "local-repo";
+    std::filesystem::create_directories(local_repo);
+    std::error_code repo_copy_ec;
+    std::filesystem::copy_file(
+        pkg_path, local_repo / pkg_path.filename(),
+        std::filesystem::copy_options::overwrite_existing, repo_copy_ec);
+    auto idx_res = repo_copy_ec
+        ? std::expected<void, std::string>(std::unexpected(repo_copy_ec.message()))
+        : sage::archive::generate_repo_index(local_repo, escaped_channel_name);
+    if (!idx_res || !std::filesystem::exists(local_repo / "index.toml")) {
         sage::util::log_error("Local repository index generation failed");
         return 1;
     }
 
-    auto fetch_res = sage::vendor::curl::fetch_string("file://" + (temp_dir / "index.toml").string());
+    auto fetch_res = sage::vendor::curl::fetch_string(
+        "file://" + (local_repo / "index.toml").string());
     if (!fetch_res) {
         sage::util::log_error("Local file:// protocol fetch failed");
         return 1;
@@ -2041,7 +2328,7 @@ install = [
     auto isolated_target = temp_dir / "target_root";
     std::filesystem::create_directories(isolated_target / "etc/sage");
     std::ofstream chan_f(isolated_target / "etc/sage/channels.toml");
-    chan_f << "schema_version = 1\n\n[[channels]]\nname = \"core\"\nurl = \"file://" << temp_dir.string() << "\"\nscope = \"system\"\npriority = 100\nenabled = true\n";
+    chan_f << "schema_version = 1\n\n[[channels]]\nname = \"core\"\nurl = \"file://" << local_repo.string() << "\"\nscope = \"system\"\npriority = 100\nenabled = true\n";
     chan_f.close();
 
     CliOptions inst_opts;
@@ -2275,9 +2562,9 @@ install = [
     if (!alternate_record || !*alternate_record
         || sage::package::package_identity(**alternate_record)
             != sage::package::package_identity(alternate_identity)
-        || alternate_db->get_file_owner("opt/channels/llvm/42/bin/versioned")
+        || alternate_db->get_file_owner("opt/channels/llvm/42/bin/versioned").value_or(std::nullopt)
             != "versioned-package:toolchain/llvm:42"
-        || alternate_db->get_file_owner("usr/bin/versioned")) {
+        || alternate_db->get_file_owner("usr/bin/versioned").value_or(std::nullopt)) {
         sage::util::log_error("Alternate direct archive identity was not recorded");
         return 1;
     }
@@ -2356,7 +2643,7 @@ install = [
             std::unexpected("database open failed"));
     if (!owner_db || !owner_a_record || !*owner_a_record
         || !owner_b_record || *owner_b_record
-        || owner_db->get_file_owner("usr/bin/shared-file") != "owner-a:system"
+        || owner_db->get_file_owner("usr/bin/shared-file").value_or(std::nullopt) != "owner-a:system"
         || read_test_file(owner_target / "usr/bin/shared-file") != "owned by A\n") {
         sage::util::log_error("File conflict changed the first package or its ownership record");
         return 1;
@@ -2509,7 +2796,7 @@ install = [
     auto split_owner_db = sage::db::Database::open(
         split_target / "var/lib/sage/data.mdb", true);
     if (!split_owner_db
-        || split_owner_db->get_file_owner("opt/channels/llvm/77/bin/clang")
+        || split_owner_db->get_file_owner("opt/channels/llvm/77/bin/clang").value_or(std::nullopt)
             != "split-toolchain-compiler:toolchain/llvm:77") {
         sage::util::log_error("Split toolchain removal fixture has no registered file owner");
         return 1;
@@ -2737,9 +3024,106 @@ install = [
     return 0;
 }
 
+// ============================================================================
+// `sage list` / `sage count` -- installed package inventory
+// ============================================================================
+
+namespace {
+
+// Substring match, or glob when the pattern carries a wildcard. A bare name is
+// far more often meant as "anything containing this" than as an exact match,
+// but `sage count 'python-*'` should still mean what it looks like.
+bool inventory_matches(std::string_view name, std::string_view pattern) {
+    if (pattern.empty()) return true;
+    if (pattern.find_first_of("*?[") == std::string_view::npos) {
+        return name.find(pattern) != std::string_view::npos;
+    }
+    return sage::util::glob_match(pattern, name);
+}
+
+std::expected<std::vector<sage::package::PackageManifest>, std::string>
+collect_installed(const CliOptions& opts, std::string_view pattern) {
+    auto cfg_res = sage::config::SystemConfig::load_from_root(opts.target_root);
+    auto db_res = sage::db::Database::open(
+        cfg_res ? cfg_res->db_path : std::filesystem::path("/var/lib/sage/data.mdb"), true);
+    if (!db_res) return std::unexpected(db_res.error());
+
+    auto list = db_res->list_installed_packages();
+    if (!list) return std::unexpected(list.error());
+    std::erase_if(*list, [&](const auto& pkg) { return !inventory_matches(pkg.name, pattern); });
+    std::ranges::sort(*list, {}, &sage::package::PackageManifest::name);
+    return std::move(*list);
+}
+
+} // namespace
+
+int cmd_list(const CliOptions& opts) {
+    bool quiet = false;
+    std::string pattern;
+    for (const auto& a : opts.args) {
+        if (a == "--quiet" || a == "-q") quiet = true;
+        else if (a == "--help" || a == "-h") {
+            std::println("Usage: sage list [-q|--quiet] [PATTERN]");
+            return 0;
+        } else if (pattern.empty()) pattern = a;
+    }
+
+    auto list_res = collect_installed(opts, pattern);
+    if (!list_res) {
+        // Nothing is installed on a root that has no database yet. That is a
+        // legitimate answer to "what is installed", not a failure, so -q stays
+        // silent and scripts reading it see an empty list rather than an error.
+        if (!quiet) sage::util::log_warn("Database not yet initialized or inaccessible: {}", list_res.error());
+        return quiet ? 0 : 0;
+    }
+    const auto& list = *list_res;
+
+    // -q prints bare names, one per line, so the output can be piped straight
+    // into xargs without anything having to strip decoration off it.
+    if (quiet) {
+        for (const auto& pkg : list) std::println("{}", pkg.name);
+        return 0;
+    }
+
+    if (list.empty()) {
+        std::println("No installed packages in '{}'{}", opts.target_root.string(),
+            pattern.empty() ? "" : std::format(" matching '{}'", pattern));
+        return 0;
+    }
+
+    std::uintmax_t total_size = 0;
+    for (const auto& pkg : list) total_size += pkg.installed_size;
+
+    std::println("Installed packages in '{}'{}:", opts.target_root.string(),
+        pattern.empty() ? "" : std::format(" matching '{}'", pattern));
+    for (const auto& pkg : list) {
+        std::println("  {:<28} {:<16} [{}]", pkg.name, pkg.version.to_string(), pkg.channel);
+    }
+    std::println("");
+    std::println("{} package(s), {} installed", list.size(), sage::util::format_size(total_size));
+    return 0;
+}
+
+int cmd_count(const CliOptions& opts) {
+    std::string pattern;
+    for (const auto& a : opts.args) {
+        if (a == "--help" || a == "-h") {
+            std::println("Usage: sage count [PATTERN]");
+            return 0;
+        }
+        if (pattern.empty()) pattern = a;
+    }
+
+    auto list_res = collect_installed(opts, pattern);
+    // A bare number and nothing else: this exists to be captured in a shell
+    // substitution, so it must not print a word even when the root is empty.
+    std::println("{}", list_res ? list_res->size() : 0u);
+    return 0;
+}
+
 int cmd_query(const CliOptions& opts) {
     if (opts.args.empty()) {
-        std::println("Usage: sage query [installed|info <pkg>|owner <path>]");
+        std::println("Usage: sage query [installed|count|info <pkg>|owner <path>|files <pkg>|capabilities]");
         return 1;
     }
 
@@ -2752,12 +3136,91 @@ int cmd_query(const CliOptions& opts) {
     }
     auto& db = *db_res;
 
+    if (sub == "files" && opts.args.size() >= 2) {
+        std::string pkg_name = opts.args[1];
+        auto pkg_res = db.get_package(pkg_name);
+        if (!pkg_res) {
+            sage::util::log_error(
+                "Failed to read package '{}': {}", pkg_name, pkg_res.error());
+            return 1;
+        }
+        if (!*pkg_res) {
+            sage::util::log_error("Package '{}' is not installed", pkg_name);
+            return 1;
+        }
+        const auto& pkg = **pkg_res;
+        if (pkg.files.empty()) {
+            // Packages registered before files.idx existed have paths in the
+            // files table but no per-file metadata; fall back to those rather
+            // than claiming the package owns nothing.
+            auto paths = db.get_package_files(pkg_name);
+            if (!paths) {
+                sage::util::log_error(
+                    "Failed to read files for '{}': {}", pkg_name, paths.error());
+                return 1;
+            }
+            if (paths->empty()) {
+                std::println("{} owns no files", pkg_name);
+                return 0;
+            }
+            sage::util::log_warn("'{}' predates files.idx: listing paths without hashes", pkg_name);
+            for (const auto& path : *paths) std::println("/{}", path);
+            return 0;
+        }
+        for (const auto& f : pkg.files) {
+            std::println("{:<4} {:>6o} {:>10}  {:<64}  /{}",
+                sage::package::to_string(f.type), f.mode, f.size,
+                f.sha256.empty() ? "-" : f.sha256, f.path);
+        }
+        return 0;
+    }
+
+    if (sub == "capabilities") {
+        auto list = db.list_installed_packages();
+        if (!list) {
+            sage::util::log_error("Failed to list installed packages: {}", list.error());
+            return 1;
+        }
+        std::map<std::string, std::vector<std::string>> by_cap;
+        for (const auto& pkg : *list) {
+            for (const auto& prov : pkg.provides) {
+                if (!prov.starts_with("virtual/")) continue;
+                by_cap[prov].push_back(pkg.name);
+            }
+        }
+        auto cfg = cfg_res ? *cfg_res : sage::config::SystemConfig::default_config();
+        std::println("Virtual capabilities in '{}':", opts.target_root.string());
+        for (const auto& [cap, providers] : by_cap) {
+            auto bound = cfg.provider_for(cap);
+            std::println("  • {:<34} {:<10} providers: {}{}",
+                cap,
+                sage::config::to_string(cfg.capability_kind(cap)),
+                sage::util::join(providers, ", "),
+                bound ? std::format("  (bound: {})", *bound) : std::string{});
+        }
+        if (by_cap.empty()) std::println("  (none)");
+        return 0;
+    }
+
+    if (sub == "count") {
+        auto list = db.list_installed_packages();
+        if (!list) {
+            sage::util::log_error("Failed to count installed packages: {}", list.error());
+            return 1;
+        }
+        std::println("{}", list->size());
+        return 0;
+    }
+
     if (sub == "installed") {
         auto list = db.list_installed_packages();
         if (!list) {
             sage::util::log_error("Installed package database is inconsistent: {}", list.error());
             return 1;
         }
+        // LMDB hands these back in key order already, but sorting explicitly
+        // keeps the listing stable if the key layout ever changes.
+        std::ranges::sort(*list, {}, &sage::package::PackageManifest::name);
         std::println("Installed packages in '{}' ({} total):", opts.target_root.string(), list->size());
         for (const auto& pkg : *list) {
             std::println("  • {:<20} {:<15} [{}]", pkg.name, pkg.version.to_string(), pkg.channel);
@@ -2783,13 +3246,93 @@ int cmd_query(const CliOptions& opts) {
         }
     } else if (sub == "owner" && opts.args.size() >= 2) {
         std::string path = opts.args[1];
-        if (auto owner = db.get_file_owner(path)) {
-            std::println("{} is owned by {}", path, *owner);
+        auto owner = db.get_file_owner(path);
+        if (!owner) {
+            sage::util::log_error("Failed to read file ownership: {}", owner.error());
+            return 1;
+        }
+        if (*owner) {
+            std::println("{} is owned by {}", path, **owner);
         } else {
             std::println("No installed package owns {}", path);
         }
     }
     return 0;
+}
+
+// Check installed files against the hashes recorded at install time.
+int cmd_verify(const CliOptions& opts) {
+    auto cfg_res = sage::config::SystemConfig::load_from_root(opts.target_root);
+    if (!cfg_res) {
+        sage::util::log_error("Failed to load configuration: {}", cfg_res.error());
+        return 1;
+    }
+    auto db_res = sage::db::Database::open(cfg_res->db_path, true);
+    if (!db_res) {
+        sage::util::log_error("Failed to open database at {}: {}", cfg_res->db_path.string(), db_res.error());
+        return 1;
+    }
+
+    std::vector<sage::package::PackageManifest> targets;
+    if (opts.args.empty()) {
+        auto installed = db_res->list_installed_packages();
+        if (!installed) {
+            sage::util::log_error("Failed to list installed packages: {}", installed.error());
+            return 1;
+        }
+        targets = std::move(*installed);
+    } else {
+        for (const auto& name : opts.args) {
+            auto pkg_res = db_res->get_package(name);
+            if (!pkg_res) {
+                sage::util::log_error("Failed to read package '{}': {}", name, pkg_res.error());
+                return 1;
+            }
+            if (!*pkg_res) {
+                sage::util::log_error("Package '{}' is not installed", name);
+                return 1;
+            }
+            targets.push_back(std::move(**pkg_res));
+        }
+    }
+
+    size_t checked = 0;
+    size_t modified = 0;
+    size_t missing = 0;
+    size_t unhashed = 0;
+
+    for (const auto& pkg : targets) {
+        for (const auto& f : pkg.files) {
+            if (f.type != sage::package::FileType::Regular) continue;
+            if (f.sha256.empty()) { unhashed++; continue; }
+
+            std::filesystem::path on_disk = opts.target_root / f.path;
+            if (!std::filesystem::exists(on_disk)) {
+                std::println("missing   {:<20} /{}", pkg.name, f.path);
+                missing++;
+                continue;
+            }
+            auto hash = sage::util::compute_file_sha256(on_disk);
+            checked++;
+            if (!hash) {
+                std::println("unreadable {:<20} /{}", pkg.name, f.path);
+                missing++;
+            } else if (*hash != f.sha256) {
+                std::println("modified  {:<20} /{}", pkg.name, f.path);
+                modified++;
+            }
+        }
+    }
+
+    if (unhashed > 0) {
+        sage::util::log_warn("{} file(s) carry no recorded hash (installed before files.idx existed)", unhashed);
+    }
+    if (modified == 0 && missing == 0) {
+        sage::util::log_success("Verified {} file(s) across {} package(s): all match", checked, targets.size());
+        return 0;
+    }
+    sage::util::log_error("{} modified, {} missing out of {} file(s) checked", modified, missing, checked);
+    return 1;
 }
 
 int cmd_toolchain(const CliOptions& opts) {
@@ -2937,18 +3480,128 @@ int cmd_service(const CliOptions& opts) {
     return 0;
 }
 
-int cmd_channel(const CliOptions& opts) {
-    auto cfg = sage::config::SystemConfig::load_from_root(opts.target_root);
-    if (!cfg) {
-        sage::util::log_error("Failed to load configuration: {}", cfg.error());
+// Persist the channel list to the *target root's* channels.toml.
+//
+// This must always write the target's own file. SystemConfig falls back to the
+// host's /etc/sage/channels.toml when the target root has none, so a target
+// that is merely borrowing the host's channels would otherwise have an edit
+// silently applied to the host instead.
+int write_channels(const sage::config::SystemConfig& cfg) {
+    std::error_code ec;
+    std::filesystem::create_directories(cfg.channels_config_path.parent_path(), ec);
+    std::ofstream out(cfg.channels_config_path);
+    if (!out.is_open()) {
+        sage::util::log_error("Cannot write {}", cfg.channels_config_path.string());
         return 1;
     }
-    std::println("Configured Channels for '{}':", opts.target_root.string());
-    for (const auto& ch : cfg->channels) {
-        std::println("  • {:<15} {:<35} scope: {:<10} priority: {}", 
-            ch.name, ch.url, ch.scope, ch.priority);
-    }
+    out << cfg.serialize_channels_toml();
     return 0;
+}
+
+int cmd_channel(const CliOptions& opts) {
+    auto cfg_res = sage::config::SystemConfig::load_from_root(opts.target_root);
+    if (!cfg_res) {
+        sage::util::log_error("Failed to load configuration: {}", cfg_res.error());
+        return 1;
+    }
+    auto& cfg = *cfg_res;
+
+    std::string sub = opts.args.empty() ? "list" : opts.args[0];
+
+    if (sub == "list") {
+        std::println("Configured Channels for '{}':", opts.target_root.string());
+        if (cfg.channels.empty()) {
+            std::println("  (none configured)");
+        }
+        for (const auto& ch : cfg.channels) {
+            std::println("  • {:<15} {:<45} scope: {:<10} priority: {:<5} {}",
+                ch.name, ch.url, ch.scope, ch.priority, ch.enabled ? "enabled" : "disabled");
+        }
+        return 0;
+    }
+
+    if (sub == "add") {
+        if (opts.args.size() < 3) {
+            std::println("Usage: sage channel add <NAME> <URL> [SCOPE] [PRIORITY]");
+            std::println("  SCOPE: system (default) | runtime | toolchain | user");
+            return 1;
+        }
+        sage::config::ChannelConfig ch;
+        ch.name = opts.args[1];
+        ch.url = opts.args[2];
+        ch.scope = opts.args.size() >= 4 ? opts.args[3] : "system";
+        ch.priority = opts.args.size() >= 5 ? std::atoi(opts.args[4].c_str()) : 50;
+        ch.enabled = true;
+
+        auto existing = std::ranges::find(cfg.channels, ch.name, &sage::config::ChannelConfig::name);
+        if (existing != cfg.channels.end()) {
+            sage::util::log_info("Updating existing channel '{}'", ch.name);
+            *existing = std::move(ch);
+        } else {
+            cfg.channels.push_back(std::move(ch));
+        }
+
+        if (int rc = write_channels(cfg); rc != 0) return rc;
+        sage::util::log_success("Channel '{}' written to {}", opts.args[1], cfg.channels_config_path.string());
+        return 0;
+    }
+
+    if (sub == "remove" || sub == "rm") {
+        if (opts.args.size() < 2) {
+            std::println("Usage: sage channel remove <NAME>");
+            return 1;
+        }
+        const std::string& name = opts.args[1];
+        auto removed = std::erase_if(cfg.channels, [&](const sage::config::ChannelConfig& c) { return c.name == name; });
+        if (removed == 0) {
+            sage::util::log_error("No channel named '{}' is configured", name);
+            return 1;
+        }
+        if (int rc = write_channels(cfg); rc != 0) return rc;
+        sage::util::log_success("Channel '{}' removed from {}", name, cfg.channels_config_path.string());
+        return 0;
+    }
+
+    if (sub == "sync") {
+        // Optional second argument narrows the sync to a single channel;
+        // --channel does the same, so accept whichever the user reached for.
+        std::string only = opts.args.size() >= 2 ? opts.args[1] : opts.channel_filter;
+
+        size_t synced = 0;
+        size_t failed = 0;
+        for (const auto& ch_cfg : cfg.channels) {
+            if (!only.empty() && ch_cfg.name != only) continue;
+            if (!ch_cfg.enabled) {
+                sage::util::log_info("Skipping disabled channel '{}'", ch_cfg.name);
+                continue;
+            }
+            sage::channel::Channel ch;
+            ch.name = ch_cfg.name;
+            ch.url = ch_cfg.url;
+            ch.scope = sage::channel::parse_scope(ch_cfg.scope);
+
+            auto idx = sage::channel::ProfileManager::sync_channel(ch, cfg.cache_dir);
+            if (!idx) {
+                sage::util::log_error("Channel '{}': {}", ch_cfg.name, idx.error());
+                failed++;
+                continue;
+            }
+            sage::util::log_success("Channel '{}': {} packages", ch_cfg.name, idx->available_packages.size());
+            synced++;
+        }
+
+        if (synced == 0 && failed == 0) {
+            sage::util::log_warn("Nothing to sync{}", only.empty() ? "" : std::format(": no enabled channel named '{}'", only));
+            return only.empty() ? 0 : 1;
+        }
+        // A partial sync is still a failure: the pool is now inconsistent with
+        // what the caller asked for, and installing from it would pick stale
+        // versions without saying so.
+        return failed == 0 ? 0 : 1;
+    }
+
+    std::println("Usage: sage channel [list|add <NAME> <URL> [SCOPE] [PRIORITY]|remove <NAME>|sync [NAME]]");
+    return 1;
 }
 
 int cmd_status(const CliOptions& opts) {
@@ -3025,7 +3678,7 @@ int cmd_rebuild(const CliOptions& opts) {
         return 1;
     }
 
-    auto exec_res = sage::rebuild::ReconcileEngine::execute(*db_res, *plan_res, opts.target_root, opts.dry_run);
+    auto exec_res = sage::rebuild::ReconcileEngine::execute(*db_res, *plan_res, opts.target_root, opts.dry_run, cfg_res->providers);
     if (!exec_res) {
         sage::util::log_error("Reconcile execution failed: {}", exec_res.error());
         return 1;
@@ -3079,6 +3732,10 @@ int main(int argc, char** argv) {
             opts.cascade = true;
         } else if (arg == "--no-recursive") {
             opts.no_recursive = true;
+        } else if (arg == "--no-elf-check") {
+            opts.no_elf_check = true;
+        } else if (arg == "--channel" && i + 1 < argc) {
+            opts.channel_filter = argv[++i];
         } else if ((arg == "--root" || arg == "--sysroot") && i + 1 < argc) {
             opts.target_root = argv[++i];
         } else if (opts.command.empty()) {
@@ -3109,6 +3766,12 @@ int main(int argc, char** argv) {
     if (opts.command == "query") {
         return cmd_query(opts);
     }
+    if (opts.command == "list") {
+        return cmd_list(opts);
+    }
+    if (opts.command == "count") {
+        return cmd_count(opts);
+    }
     if (opts.command == "toolchain") {
         return cmd_toolchain(opts);
     }
@@ -3129,6 +3792,9 @@ int main(int argc, char** argv) {
     }
     if (opts.command == "repo") {
         return cmd_repo(opts);
+    }
+    if (opts.command == "verify") {
+        return cmd_verify(opts);
     }
 
     std::println(std::cerr, "Unknown command: '{}'", opts.command);

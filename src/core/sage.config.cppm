@@ -17,6 +17,53 @@ struct ChannelConfig {
     bool enabled{true};
 };
 
+// ============================================================================
+// Virtual capabilities
+// ============================================================================
+//
+// A *capability* is a name in a package's `provides` that is not a package
+// name: "virtual/init", "virtual/initramfs-generator", "so:libz.so.1". It is
+// the contract other packages depend on.
+//
+// A *provider* is the binding of one capability to one concrete package. The
+// binding lives in system.toml `[providers]`, never in a package.
+//
+// The axis that matters is whether the capability is exclusive:
+//
+//   Exclusive -- at most one provider may be installed. Swapping providers is
+//                a system reconfiguration and goes through `sage rebuild`.
+//                virtual/init, virtual/udev, virtual/libc.
+//   Shared    -- any number of providers may coexist. A `[providers]` entry is
+//                merely the preferred default the solver reaches for first.
+//                virtual/initramfs-generator, virtual/kernel, every so:*.
+//
+// Anything not named in `[capabilities]` defaults to Shared: exclusivity is
+// opt-in, because getting it wrong turns a coexisting pair into a hard
+// resolution failure.
+enum class CapabilityKind {
+    Shared,
+    Exclusive
+};
+
+inline std::string_view to_string(CapabilityKind k) noexcept {
+    return k == CapabilityKind::Exclusive ? "exclusive" : "shared";
+}
+
+inline std::optional<CapabilityKind> parse_capability_kind(std::string_view s) noexcept {
+    if (s == "exclusive") return CapabilityKind::Exclusive;
+    if (s == "shared") return CapabilityKind::Shared;
+    return std::nullopt;
+}
+
+// Capability names are stored fully qualified. system.toml may spell them
+// either way ("init" or "virtual/init"); so: symbols are passed through.
+inline std::string normalize_capability(std::string_view name) {
+    if (name.starts_with("virtual/") || name.starts_with("so:")) {
+        return std::string(name);
+    }
+    return "virtual/" + std::string(name);
+}
+
 struct SystemConfig {
     uint32_t schema_version{1};
     std::filesystem::path root_dir{"/"};
@@ -26,9 +73,13 @@ struct SystemConfig {
     std::filesystem::path system_config_path{"/etc/sage/system.toml"};
     std::filesystem::path channels_config_path{"/etc/sage/channels.toml"};
 
-    // Core minimal virtual providers
-    // e.g. "virtual/init" -> "openrc", "virtual/udev" -> "eudev", "virtual/libc" -> "glibc"
+    // Capability -> concrete provider binding.
+    // e.g. "virtual/init" -> "systemd", "virtual/initramfs-generator" -> "mkinitcpio"
+    // For exclusive capabilities this is a lock; for shared ones, a default.
     std::map<std::string, std::string> providers;
+
+    // Capability -> exclusivity. Absent means CapabilityKind::Shared.
+    std::map<std::string, CapabilityKind> capabilities;
 
     std::vector<ChannelConfig> channels;
 
@@ -37,6 +88,14 @@ struct SystemConfig {
         cfg.providers["virtual/init"] = "openrc";
         cfg.providers["virtual/udev"] = "eudev";
         cfg.providers["virtual/libc"] = "glibc";
+        // The initramfs builder is a *default*, not a lock: dracut and
+        // mkinitcpio can sit on disk together, and an admin who wants the
+        // other one only has to retarget this one line.
+        cfg.providers["virtual/initramfs-generator"] = "mkinitcpio";
+
+        cfg.capabilities["virtual/init"] = CapabilityKind::Exclusive;
+        cfg.capabilities["virtual/udev"] = CapabilityKind::Exclusive;
+        cfg.capabilities["virtual/libc"] = CapabilityKind::Exclusive;
 
         ChannelConfig core;
         core.name = "core";
@@ -70,12 +129,22 @@ struct SystemConfig {
         if (auto* prov = tbl.get_as<vendor::toml::table>("providers")) {
             for (auto&& [k, v] : *prov) {
                 if (auto val_str = v.value<std::string_view>()) {
-                    std::string key_str(k.str());
-                    if (!key_str.starts_with("virtual/")) {
-                        key_str = "virtual/" + key_str;
-                    }
-                    cfg.providers[key_str] = std::string(*val_str);
+                    cfg.providers[normalize_capability(k.str())] = std::string(*val_str);
                 }
+            }
+        }
+
+        if (auto* caps = tbl.get_as<vendor::toml::table>("capabilities")) {
+            for (auto&& [k, v] : *caps) {
+                auto val_str = v.value<std::string_view>();
+                if (!val_str) continue;
+                auto kind = parse_capability_kind(*val_str);
+                if (!kind) {
+                    return std::unexpected(std::format(
+                        "Unknown capability kind '{}' for '{}' (expected \"exclusive\" or \"shared\")",
+                        *val_str, k.str()));
+                }
+                cfg.capabilities[normalize_capability(k.str())] = *kind;
             }
         }
 
@@ -182,6 +251,34 @@ struct SystemConfig {
         return res;
     }
 
+    // Exclusivity is opt-in: an undeclared capability is shared.
+    [[nodiscard]] CapabilityKind capability_kind(std::string_view cap) const {
+        auto it = capabilities.find(normalize_capability(cap));
+        return it == capabilities.end() ? CapabilityKind::Shared : it->second;
+    }
+
+    [[nodiscard]] bool is_exclusive_capability(std::string_view cap) const {
+        return capability_kind(cap) == CapabilityKind::Exclusive;
+    }
+
+    // The bound provider, if the admin declared one. Shared capabilities with
+    // no binding resolve through the solver instead.
+    [[nodiscard]] std::optional<std::string> provider_for(std::string_view cap) const {
+        auto it = providers.find(normalize_capability(cap));
+        if (it == providers.end() || it->second.empty()) return std::nullopt;
+        return it->second;
+    }
+
+    // Only exclusive capabilities take part in `sage rebuild` reconcile; a
+    // shared default changing is not a system state change.
+    [[nodiscard]] std::map<std::string, std::string> exclusive_providers() const {
+        std::map<std::string, std::string> out;
+        for (const auto& [cap, prov] : providers) {
+            if (is_exclusive_capability(cap)) out.emplace(cap, prov);
+        }
+        return out;
+    }
+
     [[nodiscard]] std::string serialize_system_toml() const {
         std::ostringstream ss;
         ss << "schema_version = " << schema_version << "\n\n";
@@ -195,6 +292,14 @@ struct SystemConfig {
         for (const auto& [k, v] : providers) {
             std::string short_key = k.starts_with("virtual/") ? k.substr(8) : k;
             ss << short_key << " = \"" << v << "\"\n";
+        }
+
+        if (!capabilities.empty()) {
+            ss << "\n[capabilities]\n";
+            for (const auto& [k, v] : capabilities) {
+                std::string short_key = k.starts_with("virtual/") ? k.substr(8) : k;
+                ss << short_key << " = \"" << to_string(v) << "\"\n";
+            }
         }
         return ss.str();
     }

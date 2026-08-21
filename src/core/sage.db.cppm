@@ -124,11 +124,16 @@ public:
     }
 
     std::expected<std::vector<package::PackageManifest>, std::string> list_installed_packages() {
-        std::vector<package::PackageManifest> list;
         auto txn = begin_read_txn();
         if (!txn) return std::unexpected("Failed to open installed package read transaction: " + txn.error());
+        return list_installed_packages(*txn);
+    }
 
-        auto cur_res = vendor::lmdb::MdbCursor::open(*txn, dbi_packages_);
+    std::expected<std::vector<package::PackageManifest>, std::string> list_installed_packages(
+        vendor::lmdb::MdbTxn& txn)
+    {
+        std::vector<package::PackageManifest> list;
+        auto cur_res = vendor::lmdb::MdbCursor::open(txn, dbi_packages_);
         if (!cur_res) return std::unexpected("Failed to open installed package cursor: " + cur_res.error());
         auto& cursor = *cur_res;
 
@@ -161,12 +166,14 @@ public:
     // Files Table & Conflict Detection
     // ========================================================================
 
-    std::optional<std::string> get_file_owner(std::string_view rel_path) {
+    std::expected<std::optional<std::string>, std::string> get_file_owner(
+        std::string_view rel_path)
+    {
         auto txn = begin_read_txn();
-        if (!txn) return std::nullopt;
-        auto result = get_file_owner(*txn, rel_path);
-        if (result) return std::move(*result);
-        return std::nullopt;
+        if (!txn) {
+            return std::unexpected("Failed to open file ownership read transaction: " + txn.error());
+        }
+        return get_file_owner(*txn, rel_path);
     }
 
     std::expected<std::optional<std::string>, std::string> get_file_owner(
@@ -291,10 +298,10 @@ public:
     // list was incomplete) would otherwise block other packages from claiming
     // the same paths. Returns the number of pruned entries.
     std::expected<std::size_t, std::string> prune_orphaned_files(
-        vendor::lmdb::MdbTxn& txn,
-        const std::unordered_set<std::string>& installed_names)
+        vendor::lmdb::MdbTxn& txn)
     {
         std::vector<std::string> orphaned;
+        std::unordered_map<std::string, bool> package_exists;
         auto cur_res = vendor::lmdb::MdbCursor::open(txn, dbi_files_);
         if (!cur_res) return std::unexpected("Failed to open orphaned-file cursor: " + cur_res.error());
         auto& cursor = *cur_res;
@@ -304,8 +311,18 @@ public:
         while (*entry) {
             std::string_view owner = v;
             auto colon = owner.find(':');
-            std::string_view pkg = colon == std::string_view::npos ? owner : owner.substr(0, colon);
-            if (!installed_names.contains(std::string(pkg))) {
+            std::string package_name(
+                colon == std::string_view::npos ? owner : owner.substr(0, colon));
+            auto known = package_exists.find(package_name);
+            if (known == package_exists.end()) {
+                auto package = dbi_packages_.get_checked(txn, package_name);
+                if (!package) {
+                    return std::unexpected(
+                        "Failed to check package while pruning ownership: " + package.error());
+                }
+                known = package_exists.emplace(package_name, package->has_value()).first;
+            }
+            if (!known->second) {
                 orphaned.emplace_back(k);
             }
             entry = cursor.next(k, v);
@@ -357,12 +374,26 @@ public:
     // System Providers Table (virtual/init, virtual/udev, virtual/libc)
     // ========================================================================
 
-    std::optional<std::string> get_system_provider(std::string_view iface) {
+    std::expected<std::optional<std::string>, std::string> get_system_provider(
+        std::string_view iface)
+    {
         auto txn = begin_read_txn();
-        if (!txn) return std::nullopt;
-        auto val = dbi_system_.get(*txn, iface);
-        if (val) return std::string(*val);
-        return std::nullopt;
+        if (!txn) {
+            return std::unexpected("Failed to open system provider read transaction: " + txn.error());
+        }
+        return get_system_provider(*txn, iface);
+    }
+
+    std::expected<std::optional<std::string>, std::string> get_system_provider(
+        vendor::lmdb::MdbTxn& txn,
+        std::string_view iface)
+    {
+        auto val = dbi_system_.get_checked(txn, iface);
+        if (!val) {
+            return std::unexpected("Failed to read system provider: " + val.error());
+        }
+        if (!*val) return std::optional<std::string>{};
+        return std::optional<std::string>{std::string(**val)};
     }
 
     std::expected<void, std::string> set_system_provider(

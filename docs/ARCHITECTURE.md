@@ -79,13 +79,16 @@ Extraction is fail-closed: package paths are normalized and preflighted before
 the payload is written, and every parent directory is then opened relative to a
 trusted target-root file descriptor with symlink following disabled. Temporary
 regular files and their final rename stay relative to that verified directory,
-so replacing a checked parent path cannot redirect extraction outside the
-target root.
+which prevents archive-controlled symlink traversal and pathname replacement.
+This is not a filesystem transaction against a privileged process concurrently
+moving an already-open target directory.
 
-Package replacement also revalidates the complete installed identity inside
-the LMDB write transaction. Existing files may migrate only from the exact
-`pkg_name:channel_name` owner recorded by that transaction; a concurrent
-same-name update aborts the install instead of being treated as an upgrade.
+Install replacement, remove plans, and provider rebuilds revalidate the state
+they planned from inside the LMDB write transaction. Existing files may migrate
+only from the exact `pkg_name:channel_name` owner recorded by that transaction;
+a concurrent package or provider change aborts the stale operation. LMDB state
+updates are transactional, but filesystem extraction/removal is not journaled
+for rollback if a later step fails.
 
 ---
 

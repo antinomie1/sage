@@ -36,12 +36,13 @@ sage install --dry-run waybar
 
 ### `sage remove <PKG...>`
 Removes installed package files, unregisters LMDB records, and removes generated service scripts.
+The complete installed-package snapshot is checked again under the LMDB writer lock before any files are removed; a concurrent package change aborts the stale removal plan.
 ```bash
 sage remove nginx
 ```
 
 ### `sage rebuild`
-**Declarative System Reconcile**: Compares `/etc/sage/system.toml` against active LMDB state. Performs atomic swaps of core virtual providers (`virtual/init`, `virtual/udev`) and automatically re-generates all native daemon service scripts.
+**Declarative System Reconcile**: Compares `/etc/sage/system.toml` against active LMDB state. Performs guarded swaps of exclusive virtual providers (`virtual/init`, `virtual/udev`) and automatically re-generates all native daemon service scripts. Provider locks and packages scheduled for removal are revalidated inside the LMDB write transaction before the plan is applied.
 ```bash
 # Preview what rebuild would change
 sage rebuild --dry-run

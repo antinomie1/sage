@@ -249,6 +249,207 @@ inline std::string escape_toml_basic_string(std::string_view value) {
     return escaped;
 }
 
+inline std::string_view to_string(FileType t) noexcept {
+    switch (t) {
+        case FileType::Directory: return "dir";
+        case FileType::Symlink:   return "link";
+        default:                  return "file";
+    }
+}
+
+inline FileType parse_file_type(std::string_view s) noexcept {
+    if (s == "dir")  return FileType::Directory;
+    if (s == "link") return FileType::Symlink;
+    return FileType::Regular;
+}
+
+// ============================================================================
+// Capability Hooks
+// ============================================================================
+//
+// A package that provides a capability may also declare *how* that capability
+// is invoked. Without this, a trigger wanting "regenerate the initramfs" would
+// have to hardcode a tool path and silently do nothing the moment the admin
+// switched from mkinitcpio to dracut.
+
+struct CapabilityHook {
+    std::string capability;          // e.g. "virtual/initramfs-generator"
+    std::string exec;                // absolute path inside the target root
+    std::vector<std::string> args;
+
+    [[nodiscard]] std::string command_line() const {
+        std::string cmd = exec;
+        for (const auto& a : args) {
+            cmd += " ";
+            cmd += a;
+        }
+        return cmd;
+    }
+};
+
+// ============================================================================
+// Package Triggers
+// ============================================================================
+//
+// Declared by the package, evaluated once per transaction. A trigger fires
+// when either condition matches:
+//
+//   on_paths      -- some file touched by the transaction sits under one of
+//                    these relative prefixes ("usr/lib/modules/").
+//   on_capability -- some package taking part in the transaction provides one
+//                    of these capabilities ("virtual/kernel").
+//
+// and runs either a fixed `exec`, or -- preferably -- `run_capability`, which
+// is resolved at fire time through the active provider's CapabilityHook.
+
+struct Trigger {
+    std::string name;
+    std::vector<std::string> on_paths;
+    std::vector<std::string> on_capability;
+    std::string exec;                 // absolute path inside the target root
+    std::vector<std::string> args;
+    std::string run_capability;       // resolved via the provider's hook
+    // Lower runs first. Ordering is not cosmetic: the initramfs must exist
+    // before the bootloader is asked to reference it, and ldconfig must have
+    // run before anything that dlopen()s.
+    int priority{50};
+
+    [[nodiscard]] bool matches_path(std::string_view rel_path) const {
+        for (const auto& prefix : on_paths) {
+            if (rel_path.starts_with(prefix)) return true;
+        }
+        return false;
+    }
+
+    [[nodiscard]] bool matches_capability(std::string_view cap) const {
+        return std::ranges::find(on_capability, cap) != on_capability.end();
+    }
+
+    [[nodiscard]] bool is_valid() const {
+        if (name.empty()) return false;
+        if (on_paths.empty() && on_capability.empty()) return false;
+        return !exec.empty() || !run_capability.empty();
+    }
+};
+
+// Shared TOML readers for the two array-of-tables sections. Both are accepted
+// at the document root and inside [package], matching how sage merges the
+// other recipe arrays across scopes.
+
+inline void parse_capability_hooks(const vendor::toml::table& tbl, std::vector<CapabilityHook>& out) {
+    auto read = [&](const vendor::toml::table& scope) {
+        auto* arr = scope.get_as<vendor::toml::array>("capability_hooks");
+        if (!arr) return;
+        for (auto&& item : *arr) {
+            auto* t = item.as_table();
+            if (!t) continue;
+            CapabilityHook h;
+            h.capability = (*t)["capability"].value_or("");
+            h.exec = (*t)["exec"].value_or("");
+            if (h.capability.empty() || h.exec.empty()) continue;
+            if (auto* args = t->get_as<vendor::toml::array>("args")) {
+                for (auto&& a : *args) {
+                    if (auto str = a.value<std::string_view>()) h.args.emplace_back(*str);
+                }
+            }
+            out.push_back(std::move(h));
+        }
+    };
+    read(tbl);
+    if (auto* pkg = tbl.get_as<vendor::toml::table>("package")) read(*pkg);
+}
+
+inline std::expected<void, std::string> parse_triggers(const vendor::toml::table& tbl, std::vector<Trigger>& out) {
+    auto read_strings = [](const vendor::toml::table& t, const char* key, std::vector<std::string>& dest) {
+        if (auto* arr = t.get_as<vendor::toml::array>(key)) {
+            for (auto&& v : *arr) {
+                if (auto str = v.value<std::string_view>()) dest.emplace_back(*str);
+            }
+        }
+    };
+
+    auto read = [&](const vendor::toml::table& scope) -> std::expected<void, std::string> {
+        auto* arr = scope.get_as<vendor::toml::array>("triggers");
+        if (!arr) return {};
+        for (auto&& item : *arr) {
+            auto* t = item.as_table();
+            if (!t) continue;
+            Trigger tr;
+            tr.name = (*t)["name"].value_or("");
+            tr.exec = (*t)["exec"].value_or("");
+            tr.run_capability = (*t)["run_capability"].value_or("");
+            tr.priority = static_cast<int>((*t)["priority"].value_or(50LL));
+            read_strings(*t, "on_paths", tr.on_paths);
+            read_strings(*t, "on_capability", tr.on_capability);
+            read_strings(*t, "args", tr.args);
+            if (!tr.is_valid()) {
+                return std::unexpected(std::format(
+                    "Invalid trigger '{}': needs a name, at least one of on_paths/on_capability, "
+                    "and one of exec/run_capability",
+                    tr.name.empty() ? "<unnamed>" : tr.name));
+            }
+            out.push_back(std::move(tr));
+        }
+        return {};
+    };
+
+    if (auto r = read(tbl); !r) return r;
+    if (auto* pkg = tbl.get_as<vendor::toml::table>("package")) {
+        if (auto r = read(*pkg); !r) return r;
+    }
+    return {};
+}
+
+// Parse a standalone `.METADATA/triggers.toml` document.
+inline std::expected<std::vector<Trigger>, std::string> parse_triggers_toml(std::string_view toml_content) {
+    auto tbl_res = vendor::toml::parse_string(toml_content);
+    if (!tbl_res) return std::unexpected(tbl_res.error());
+    std::vector<Trigger> out;
+    if (auto r = parse_triggers(*tbl_res, out); !r) return std::unexpected(r.error());
+    return out;
+}
+
+inline std::string serialize_triggers_toml(const std::vector<Trigger>& triggers) {
+    const auto quote = [](std::string_view value) {
+        return escape_toml_basic_string(value);
+    };
+    std::ostringstream ss;
+    ss << "schema_version = 1\n";
+    for (const auto& t : triggers) {
+        ss << "\n[[triggers]]\n";
+        ss << "name = \"" << quote(t.name) << "\"\n";
+        if (!t.on_paths.empty()) {
+            ss << "on_paths = [";
+            for (size_t i = 0; i < t.on_paths.size(); ++i) {
+                ss << (i ? ", " : "") << "\"" << quote(t.on_paths[i]) << "\"";
+            }
+            ss << "]\n";
+        }
+        if (!t.on_capability.empty()) {
+            ss << "on_capability = [";
+            for (size_t i = 0; i < t.on_capability.size(); ++i) {
+                ss << (i ? ", " : "") << "\"" << quote(t.on_capability[i]) << "\"";
+            }
+            ss << "]\n";
+        }
+        if (!t.run_capability.empty()) {
+            ss << "run_capability = \"" << quote(t.run_capability) << "\"\n";
+        }
+        if (!t.exec.empty()) {
+            ss << "exec = \"" << quote(t.exec) << "\"\n";
+        }
+        ss << "priority = " << t.priority << "\n";
+        if (!t.args.empty()) {
+            ss << "args = [";
+            for (size_t i = 0; i < t.args.size(); ++i) {
+                ss << (i ? ", " : "") << "\"" << quote(t.args[i]) << "\"";
+            }
+            ss << "]\n";
+        }
+    }
+    return ss.str();
+}
+
 // ============================================================================
 // Package Manifest Model
 // ============================================================================
@@ -262,11 +463,26 @@ struct PackageManifest {
     std::string channel{"system"};
     std::string arch{"x86_64"};
     uint64_t installed_size{0};
+    std::string file;  // Relative path in repository (e.g. "acl/acl-2.4.0-2-x86_64.pkg.tar.zst")
 
     std::vector<Dependency> dependencies;
     std::vector<std::string> provides; // e.g. "virtual/init", "so:libz.so.1"
     std::vector<Dependency> conflicts;
     std::vector<FileEntry> files;
+    std::vector<CapabilityHook> capability_hooks;
+    std::vector<Trigger> triggers;
+
+    // The hook this package publishes for `cap`, if any.
+    [[nodiscard]] const CapabilityHook* hook_for(std::string_view cap) const {
+        for (const auto& h : capability_hooks) {
+            if (h.capability == cap) return &h;
+        }
+        return nullptr;
+    }
+
+    [[nodiscard]] bool provides_capability(std::string_view cap) const {
+        return std::ranges::find(provides, cap) != provides.end();
+    }
 
     static std::expected<PackageManifest, std::string> parse_toml(std::string_view toml_content) {
         auto tbl_res = vendor::toml::parse_string(toml_content);
@@ -343,27 +559,42 @@ struct PackageManifest {
             parse_deps(*src, "conflicts", m.conflicts);
         }
 
-        // Parse files
-        if (auto* fls = tbl.get_as<vendor::toml::array>("files")) {
-            for (auto&& f : *fls) {
+        // Parse files. Two spellings are accepted: a bare array of path
+        // strings (what older manifests carry), and an array of tables with
+        // the full FileEntry metadata, which is what round-trips through LMDB
+        // and backs `sage query files` / `sage verify`.
+        auto parse_files = [&](const vendor::toml::array& arr) {
+            for (auto&& f : arr) {
                 if (auto str = f.value<std::string_view>()) {
                     FileEntry fe;
                     fe.path = std::string(*str);
                     m.files.push_back(std::move(fe));
+                } else if (auto* ftab = f.as_table()) {
+                    FileEntry fe;
+                    fe.path = (*ftab)["path"].value_or("");
+                    if (fe.path.empty()) continue;
+                    fe.size = (*ftab)["size"].value_or(0ULL);
+                    fe.mode = static_cast<uint32_t>((*ftab)["mode"].value_or(0644LL));
+                    fe.sha256 = (*ftab)["sha256"].value_or("");
+                    fe.type = parse_file_type((*ftab)["type"].value_or("file"));
+                    fe.link_target = (*ftab)["link_target"].value_or("");
+                    m.files.push_back(std::move(fe));
                 }
             }
+        };
+
+        if (auto* fls = tbl.get_as<vendor::toml::array>("files")) {
+            parse_files(*fls);
         }
         if (auto* pkg = tbl.get_as<vendor::toml::table>("package")) {
             if (auto* fls = pkg->get_as<vendor::toml::array>("files")) {
-                for (auto&& f : *fls) {
-                    if (auto str = f.value<std::string_view>()) {
-                        FileEntry fe;
-                        fe.path = std::string(*str);
-                        m.files.push_back(std::move(fe));
-                    }
-                }
+                parse_files(*fls);
             }
         }
+
+        parse_capability_hooks(tbl, m.capability_hooks);
+        auto trig_res = parse_triggers(tbl, m.triggers);
+        if (!trig_res) return std::unexpected(trig_res.error());
 
         return m;
     }
@@ -403,12 +634,52 @@ struct PackageManifest {
         }
         ss << "]\n\n";
 
-        if (!files.empty()) {
-            ss << "files = [\n";
-            for (const auto& f : files) {
-                ss << "    \"" << quote(f.path) << "\",\n";
+        for (const auto& h : capability_hooks) {
+            ss << "[[capability_hooks]]\n";
+            ss << "capability = \"" << quote(h.capability) << "\"\n";
+            ss << "exec = \"" << quote(h.exec) << "\"\n";
+            ss << "args = [";
+            for (size_t i = 0; i < h.args.size(); ++i) {
+                ss << (i ? ", " : "") << "\"" << quote(h.args[i]) << "\"";
+            }
+            ss << "]\n\n";
+        }
+
+        for (const auto& t : triggers) {
+            ss << "[[triggers]]\n";
+            ss << "name = \"" << quote(t.name) << "\"\n";
+            ss << "on_paths = [";
+            for (size_t i = 0; i < t.on_paths.size(); ++i) {
+                ss << (i ? ", " : "") << "\"" << quote(t.on_paths[i]) << "\"";
             }
             ss << "]\n";
+            ss << "on_capability = [";
+            for (size_t i = 0; i < t.on_capability.size(); ++i) {
+                ss << (i ? ", " : "") << "\"" << quote(t.on_capability[i]) << "\"";
+            }
+            ss << "]\n";
+            ss << "run_capability = \"" << quote(t.run_capability) << "\"\n";
+            ss << "exec = \"" << quote(t.exec) << "\"\n";
+            ss << "priority = " << t.priority << "\n";
+            ss << "args = [";
+            for (size_t i = 0; i < t.args.size(); ++i) {
+                ss << (i ? ", " : "") << "\"" << quote(t.args[i]) << "\"";
+            }
+            ss << "]\n\n";
+        }
+
+        // Array-of-tables, not bare paths: the per-file hash and mode are what
+        // make `sage query files` and integrity verification possible at all,
+        // and this serialization is also the LMDB record.
+        for (const auto& f : files) {
+            ss << "[[files]]\n";
+            ss << "path = \"" << quote(f.path) << "\"\n";
+            ss << "type = \"" << to_string(f.type) << "\"\n";
+            ss << "mode = " << f.mode << "\n";
+            ss << "size = " << f.size << "\n";
+            if (!f.sha256.empty()) ss << "sha256 = \"" << quote(f.sha256) << "\"\n";
+            if (!f.link_target.empty()) ss << "link_target = \"" << quote(f.link_target) << "\"\n";
+            ss << "\n";
         }
 
         return ss.str();
@@ -454,6 +725,8 @@ struct Recipe {
     std::vector<std::string> prepare_cmds;
     std::vector<std::string> build_cmds;
     std::vector<std::string> install_cmds;
+    std::vector<CapabilityHook> capability_hooks;
+    std::vector<Trigger> triggers;
 
     static std::expected<Recipe, std::string> parse_toml(std::string_view toml_content) {
         auto tbl_res = vendor::toml::parse_string(toml_content);
@@ -548,6 +821,11 @@ struct Recipe {
         extract_cmds("prepare", r.prepare_cmds);
         extract_cmds("build", r.build_cmds);
         extract_cmds("install", r.install_cmds);
+
+        parse_capability_hooks(tbl, r.capability_hooks);
+        if (auto trig_res = parse_triggers(tbl, r.triggers); !trig_res) {
+            return std::unexpected(trig_res.error());
+        }
 
         return r;
     }
