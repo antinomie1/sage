@@ -145,6 +145,29 @@ export int run_all() {
         return 1;
     }
 
+    // Simulate a crash after publication but before the LMDB pending marker
+    // is cleared: publication must leave its journal in place so startup can
+    // replay it.  A zero-operation transaction also exercises the valid
+    // metadata-only journal path.
+    auto replay_root = temp_dir / "filesystem-replay-root";
+    auto empty_txn_result = sage::archive::FilesystemTransaction::create(replay_root);
+    if (!empty_txn_result) {
+        sage::util::log_error("Failed to create empty filesystem transaction");
+        return 1;
+    }
+    auto empty_txn = std::move(*empty_txn_result);
+    const auto replay_id = empty_txn.id();
+    const auto replay_journal = replay_root / "var/lib/sage/transactions" / replay_id / "operations";
+    if (!empty_txn.prepare() || !empty_txn.publish()
+        || !std::filesystem::is_regular_file(replay_journal)
+        || !sage::archive::FilesystemTransaction::recover(replay_root, replay_id)
+        || !std::filesystem::is_regular_file(replay_journal)
+        || !sage::archive::FilesystemTransaction::retire(replay_root, replay_id)
+        || std::filesystem::exists(replay_journal)) {
+        sage::util::log_error("Filesystem transaction replay evidence lifecycle failed");
+        return 1;
+    }
+
     auto raw_tar_path = temp_dir / "dummy-tool.tar";
     auto decompress_cmd = std::format("zstd -dc \"{}\" > \"{}\"", pkg_path.string(), raw_tar_path.string());
     if (std::system(decompress_cmd.c_str()) != 0) {

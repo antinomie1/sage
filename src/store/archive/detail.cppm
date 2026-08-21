@@ -240,9 +240,18 @@ inline std::expected<AnchoredPath, std::string> open_anchored_parent(
 #endif
         int next = ::openat(current.get(), name.c_str(), flags);
         if (next < 0 && errno == ENOENT) {
-            if (::mkdirat(current.get(), name.c_str(), 0755) != 0 && errno != EEXIST) {
+            const bool created = ::mkdirat(current.get(), name.c_str(), 0755) == 0;
+            if (!created && errno != EEXIST) {
                 return std::unexpected(std::format(
                     "Cannot create parent directory '{}': {}", name, std::strerror(errno)));
+            }
+            // Persist the directory entry while its containing directory is
+            // still anchored.  Fsyncing the child alone does not make the
+            // parent's mkdir entry durable across power loss.
+            if (created && ::fsync(current.get()) != 0) {
+                return std::unexpected(std::format(
+                    "Cannot sync parent after creating directory '{}': {}",
+                    name, std::strerror(errno)));
             }
             next = ::openat(current.get(), name.c_str(), flags);
         }
@@ -264,7 +273,10 @@ inline std::expected<void, std::string> ensure_anchored_directory(
     std::string_view leaf)
 {
     const auto name = std::string(leaf);
-    if (::mkdirat(parent_fd, name.c_str(), 0755) == 0) return {};
+    if (::mkdirat(parent_fd, name.c_str(), 0755) == 0) {
+        if (::fsync(parent_fd) != 0) return std::unexpected(std::strerror(errno));
+        return {};
+    }
     if (errno != EEXIST) {
         return std::unexpected(std::strerror(errno));
     }

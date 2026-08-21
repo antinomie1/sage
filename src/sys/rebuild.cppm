@@ -448,6 +448,8 @@ public:
             if (!recovered) return std::unexpected(recovered.error());
             auto finished = db.finish_filesystem_transaction(id);
             if (!finished) return std::unexpected(finished.error());
+            auto retired = archive::FilesystemTransaction::retire(sysroot, id);
+            if (!retired) return std::unexpected(retired.error());
         }
 
         auto wtxn = db.begin_write_txn();
@@ -639,6 +641,8 @@ public:
             "Database committed; filesystem publication will be recovered: " + published.error());
         auto finished = db.finish_filesystem_transaction(filesystem_txn.id());
         if (!finished) return std::unexpected(finished.error());
+        auto retired = archive::FilesystemTransaction::retire(sysroot, filesystem_txn.id());
+        if (!retired) return std::unexpected(retired.error());
 
         // 5. Execute post-transaction triggers
         TriggerContext trig_ctx;

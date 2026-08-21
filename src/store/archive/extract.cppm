@@ -45,6 +45,12 @@ public:
         std::error_code ec;
         std::filesystem::create_directories(tx.payload_, ec);
         if (ec) return std::unexpected("Cannot create filesystem transaction: " + ec.message());
+        // An empty journal is meaningful: metadata-only transactions still
+        // need durable replay evidence after their LMDB marker is committed.
+        std::ofstream journal(tx.journal_, std::ios::binary | std::ios::trunc);
+        if (!journal) return std::unexpected("Cannot create filesystem transaction journal");
+        journal.close();
+        if (!journal) return std::unexpected("Cannot close filesystem transaction journal");
         return tx;
     }
 
@@ -111,6 +117,14 @@ public:
     static std::expected<void, std::string> recover(
         const std::filesystem::path& root, std::string_view id) {
         return publish_impl(root, id);
+    }
+    static std::expected<void, std::string> retire(
+        const std::filesystem::path& root, std::string_view id) {
+        auto dir = root / "var/lib/sage/transactions" / std::string(id);
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+        if (ec) return std::unexpected("Cannot retire filesystem transaction: " + ec.message());
+        return {};
     }
 
 private:
@@ -202,9 +216,9 @@ private:
             }
             if (auto fault = inject_fault(); !fault) return fault;
         }
-        std::error_code ec;
-        std::filesystem::remove_all(dir, ec);
-        if (ec) return std::unexpected("Cannot retire filesystem transaction: " + ec.message());
+        // The journal and payload are completion evidence.  The caller must
+        // first durably clear the LMDB pending marker and only then retire
+        // them, otherwise a crash between these steps makes replay impossible.
         return {};
     }
 

@@ -18,6 +18,8 @@ inline std::expected<void, std::string> recover_filesystem_transactions(
         if (!replayed) return std::unexpected("Cannot recover filesystem transaction '" + id + "': " + replayed.error());
         auto finished = db.finish_filesystem_transaction(id);
         if (!finished) return std::unexpected(finished.error());
+        auto retired = sage::archive::FilesystemTransaction::retire(root, id);
+        if (!retired) return std::unexpected(retired.error());
     }
     return {};
 }
@@ -558,6 +560,11 @@ export int cmd_install(
             sage::util::log_error("Cannot retire filesystem transaction: {}", finished.error());
             return 1;
         }
+        if (auto retired = sage::archive::FilesystemTransaction::retire(
+                opts.target_root, filesystem_txn.id()); !retired) {
+            sage::util::log_error("{}", retired.error());
+            return 1;
+        }
 
         committed_packages.push_back(installed_pkg);
         all_touched_files.insert(
@@ -979,6 +986,8 @@ export int cmd_remove(const CliOptions& opts) {
         return 1;
     }
     if (auto finished = db.finish_filesystem_transaction(filesystem_txn.id()); !finished) return 1;
+    if (auto retired = sage::archive::FilesystemTransaction::retire(
+            opts.target_root, filesystem_txn.id()); !retired) return 1;
 
     // Removing a kernel is as much a reason to regenerate the initramfs and
     // the bootloader entries as installing one, so removal runs the same
