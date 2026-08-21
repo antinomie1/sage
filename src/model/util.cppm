@@ -1,7 +1,12 @@
 module;
 
 #include <elf.h>
+#include <fcntl.h>
 #include <stdlib.h>
+#include <sys/file.h>
+#include <unistd.h>
+#include <cerrno>
+#include <cstring>
 
 export module sage.util;
 
@@ -184,6 +189,59 @@ inline bool set_env(std::string_view key, std::string_view value) {
 inline const char* get_env(std::string_view key) {
     return std::getenv(std::string(key).c_str());
 }
+
+// Same rationale as set_env above.
+inline long current_pid() {
+    return static_cast<long>(::getpid());
+}
+
+// Advisory exclusive lock serializing state-changing commands against a
+// second sage instance on the same target root. The flock lives on an open fd,
+// so the kernel releases it when the process dies -- no stale-lock cleanup
+// exists by construction. The holder's pid is recorded in the file purely so
+// a rejected instance can name it.
+class RootLock {
+public:
+    static std::expected<RootLock, std::string> acquire(
+        const std::filesystem::path& path, int wait_seconds = 0) {
+        int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+        if (fd < 0) {
+            return std::unexpected(std::format(
+                "cannot open lock file '{}': {}", path.string(), std::strerror(errno)));
+        }
+        auto locked = [&] { return ::flock(fd, LOCK_EX | LOCK_NB) == 0; };
+        if (!locked() && wait_seconds > 0) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(wait_seconds);
+            while (!locked() && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        }
+        if (!locked()) {
+            ::close(fd);
+            return std::unexpected("busy");
+        }
+        const auto pid = std::format("{}\n", static_cast<long>(getpid()));
+        (void)!::ftruncate(fd, 0);
+        (void)!::write(fd, pid.c_str(), pid.size());
+        RootLock lock;
+        lock.fd_ = fd;
+        return lock;
+    }
+
+    RootLock() = default;
+    RootLock(RootLock&& other) noexcept : fd_(std::exchange(other.fd_, -1)) {}
+    RootLock& operator=(RootLock&& other) noexcept {
+        if (fd_ >= 0) ::close(fd_);
+        fd_ = std::exchange(other.fd_, -1);
+        return *this;
+    }
+    RootLock(const RootLock&) = delete;
+    RootLock& operator=(const RootLock&) = delete;
+    ~RootLock() { if (fd_ >= 0) ::close(fd_); }
+
+private:
+    int fd_{-1};
+};
 
 // ============================================================================
 // Native Zero-Copy ELF SONAME / DT_NEEDED Scanner

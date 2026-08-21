@@ -802,6 +802,15 @@ version = "1:2.0-3"
         return 1;
     }
 
+    // The files table keeps one owner per line so shared directories can carry
+    // several; sole_owner() sees through that encoding for single-owner paths.
+    auto sole_owner = [](sage::db::Database& db, std::string_view path)
+        -> std::optional<std::string> {
+        auto owners = db.get_path_owners(path);
+        if (!owners || owners->size() != 1) return std::nullopt;
+        return std::move(owners->front());
+    };
+
     sage::package::FileEntry owned_file;
     owned_file.path = "usr/bin/database-owned";
     {
@@ -827,8 +836,8 @@ version = "1:2.0-3"
         database_conflict_rejected = !conflict_registration;
     }
     if (!database_conflict_rejected
-        || db_res->get_file_owner(owned_file.path).value_or(std::nullopt) != "database-owner:system"
-        || db_res->get_file_owner(unowned_file.path).value_or(std::nullopt)) {
+        || sole_owner(*db_res, owned_file.path) != "database-owner:system"
+        || sole_owner(*db_res, unowned_file.path)) {
         sage::util::log_error("Database file conflict registration was not atomic");
         return 1;
     }
@@ -902,7 +911,7 @@ version = "1:2.0-3"
     if (!preserved_migration || !*preserved_migration
         || sage::package::package_identity(**preserved_migration)
             != sage::package::package_identity(migration_new)
-        || migration_db->get_file_owner(migration_file.path).value_or(std::nullopt)
+        || sole_owner(*migration_db, migration_file.path)
             != "migration-race:runtime/python:3.12") {
         sage::util::log_error("Rejected stale migration changed the concurrent package state");
         return 1;
@@ -960,7 +969,7 @@ version = "1:2.0-3"
         || corrupt_db->list_installed_packages()
         || corrupt_package
         || mismatched_package
-        || corrupt_db->get_file_owner("usr/bin/broken").value_or(std::nullopt) != "broken:system") {
+        || sole_owner(*corrupt_db, "usr/bin/broken") != "broken:system") {
         sage::util::log_error("Corrupt manifest failure changed existing file ownership");
         return 1;
     }
@@ -1387,14 +1396,10 @@ version = "1:2.0-3"
         sage::util::log_error("Failed to open same-identity reinstall database");
         return 1;
     }
-    auto removed_owner = same_identity_db->get_file_owner("usr/bin/versioned");
-    auto removed_library_owner = same_identity_db->get_file_owner(
-        "usr/share/version-trigger/libversioned.so");
-    auto replacement_owner = same_identity_db->get_file_owner("usr/bin/replacement");
-    if (!removed_owner || *removed_owner
-        || !removed_library_owner || *removed_library_owner
-        || !replacement_owner || !*replacement_owner
-        || **replacement_owner != "versioned-package:system") {
+    if (sole_owner(*same_identity_db, "usr/bin/versioned")
+        || sole_owner(*same_identity_db, "usr/share/version-trigger/libversioned.so")
+        || sole_owner(*same_identity_db, "usr/bin/replacement")
+            != "versioned-package:system") {
         sage::util::log_error("Same-identity reinstall left stale file ownership");
         return 1;
     }
@@ -1471,9 +1476,9 @@ version = "1:2.0-3"
     if (!alternate_record || !*alternate_record
         || sage::package::package_identity(**alternate_record)
             != sage::package::package_identity(alternate_identity)
-        || alternate_db->get_file_owner("opt/channels/llvm/42/bin/versioned").value_or(std::nullopt)
+        || sole_owner(*alternate_db, "opt/channels/llvm/42/bin/versioned")
             != "versioned-package:toolchain/llvm:42"
-        || alternate_db->get_file_owner("usr/bin/versioned").value_or(std::nullopt)) {
+        || sole_owner(*alternate_db, "usr/bin/versioned")) {
         sage::util::log_error("Alternate direct archive identity was not recorded");
         return 1;
     }
@@ -1552,7 +1557,7 @@ version = "1:2.0-3"
             std::unexpected("database open failed"));
     if (!owner_db || !owner_a_record || !*owner_a_record
         || !owner_b_record || *owner_b_record
-        || owner_db->get_file_owner("usr/bin/shared-file").value_or(std::nullopt) != "owner-a:system"
+        || sole_owner(*owner_db, "usr/bin/shared-file") != "owner-a:system"
         || read_test_file(owner_target / "usr/bin/shared-file") != "owned by A\n") {
         sage::util::log_error("File conflict changed the first package or its ownership record");
         return 1;
@@ -1744,7 +1749,7 @@ version = "1:2.0-3"
     auto split_owner_db = sage::db::Database::open(
         split_target / "var/lib/sage/data.mdb", true);
     if (!split_owner_db
-        || split_owner_db->get_file_owner("opt/channels/llvm/77/bin/clang").value_or(std::nullopt)
+        || sole_owner(*split_owner_db, "opt/channels/llvm/77/bin/clang")
             != "split-toolchain-compiler:toolchain/llvm:77") {
         sage::util::log_error("Split toolchain removal fixture has no registered file owner");
         return 1;
@@ -1815,6 +1820,196 @@ version = "1:2.0-3"
         sage::util::log_error("Split toolchain database was not cleared after removal");
         return 1;
     }
+    // An empty directory declared by two packages is shared: both register as
+    // owners, one removal only releases its claim, and the last removal takes
+    // the directory away.
+    auto shared_repo = temp_dir / "shared-dir-repo";
+    auto shared_a_data = temp_dir / "shared-a-data";
+    auto shared_b_data = temp_dir / "shared-b-data";
+    std::filesystem::create_directories(shared_repo);
+    std::filesystem::create_directories(shared_a_data / "usr/bin");
+    std::filesystem::create_directories(shared_a_data / "usr/share/common");
+    std::filesystem::create_directories(shared_b_data / "usr/bin");
+    std::filesystem::create_directories(shared_b_data / "usr/share/common");
+    std::ofstream(shared_a_data / "usr/bin/share-a") << "a\n";
+    std::ofstream(shared_b_data / "usr/bin/share-b") << "b\n";
+    sage::package::PackageManifest share_a;
+    share_a.name = "share-a";
+    share_a.version = sage::package::Version::parse("1.0.0-1");
+    sage::package::PackageManifest share_b;
+    share_b.name = "share-b";
+    share_b.version = sage::package::Version::parse("1.0.0-1");
+    auto share_a_pkg = shared_repo / "share-a-1.0.0-1-x86_64.pkg.tar.zst";
+    auto share_b_pkg = shared_repo / "share-b-1.0.0-1-x86_64.pkg.tar.zst";
+    if (!sage::archive::create_package(share_a, shared_a_data, share_a_pkg)
+        || !sage::archive::create_package(share_b, shared_b_data, share_b_pkg)
+        || !sage::archive::generate_repo_index(shared_repo, "core")) {
+        sage::util::log_error("Failed to create shared directory fixtures");
+        return 1;
+    }
+    auto shared_target = temp_dir / "shared-dir-target";
+    if (!write_test_channel(shared_target, shared_repo)) {
+        sage::util::log_error("Failed to write shared directory test channel");
+        return 1;
+    }
+    CliOptions shared_install;
+    shared_install.target_root = shared_target;
+    shared_install.args = {"share-a", "share-b"};
+    if (cmd_install(shared_install) != 0
+        || !std::filesystem::is_directory(shared_target / "usr/share/common")) {
+        sage::util::log_error("Shared empty directory install failed");
+        return 1;
+    }
+    auto shared_db = sage::db::Database::open(
+        shared_target / "var/lib/sage/data.mdb", true);
+    auto common_owners = shared_db
+        ? shared_db->get_path_owners("usr/share/common")
+        : std::expected<std::vector<std::string>, std::string>(
+            std::unexpected("database open failed"));
+    if (!common_owners || common_owners->size() != 2) {
+        sage::util::log_error("Shared directory was not registered with both owners");
+        return 1;
+    }
+    CliOptions shared_remove_a;
+    shared_remove_a.target_root = shared_target;
+    shared_remove_a.args = {"share-a"};
+    if (cmd_remove(shared_remove_a) != 0
+        || !std::filesystem::is_directory(shared_target / "usr/share/common")) {
+        sage::util::log_error("Removing one owner deleted the shared directory");
+        return 1;
+    }
+    CliOptions shared_remove_b;
+    shared_remove_b.target_root = shared_target;
+    shared_remove_b.args = {"share-b"};
+    if (cmd_remove(shared_remove_b) != 0
+        || std::filesystem::exists(shared_target / "usr/share/common")) {
+        sage::util::log_error("Last owner removal left the shared directory behind");
+        return 1;
+    }
+
+    // A reinstall that drops directories releases their claims: a shared
+    // directory survives with its remaining owner, a sole directory goes away.
+    auto dropper_repo = temp_dir / "dropper-repo";
+    auto dropper_v1_data = temp_dir / "dropper-v1-data";
+    auto dropper_v2_data = temp_dir / "dropper-v2-data";
+    auto keeper_data = temp_dir / "keeper-data";
+    std::filesystem::create_directories(dropper_repo);
+    std::filesystem::create_directories(dropper_v1_data / "usr/bin");
+    std::filesystem::create_directories(dropper_v1_data / "usr/share/extra");
+    std::filesystem::create_directories(dropper_v1_data / "usr/share/common");
+    std::filesystem::create_directories(dropper_v2_data / "usr/bin");
+    std::filesystem::create_directories(keeper_data / "usr/bin");
+    std::filesystem::create_directories(keeper_data / "usr/share/common");
+    std::ofstream(dropper_v1_data / "usr/bin/dtool") << "dropper v1\n";
+    std::ofstream(dropper_v2_data / "usr/bin/dtool") << "dropper v2\n";
+    std::ofstream(dropper_v2_data / "usr/bin/dtool2") << "dropper v2 extra\n";
+    std::ofstream(keeper_data / "usr/bin/ktool") << "keeper\n";
+    sage::package::PackageManifest dropper_v1;
+    dropper_v1.name = "dropper";
+    dropper_v1.version = sage::package::Version::parse("1.0.0-1");
+    sage::package::PackageManifest dropper_v2 = dropper_v1;
+    dropper_v2.version = sage::package::Version::parse("2.0.0-1");
+    sage::package::PackageManifest keeper;
+    keeper.name = "keeper";
+    keeper.version = sage::package::Version::parse("1.0.0-1");
+    auto dropper_v1_pkg = dropper_repo / "dropper-1.0.0-1-x86_64.pkg.tar.zst";
+    auto dropper_v2_pkg = dropper_repo / "dropper-2.0.0-1-x86_64.pkg.tar.zst";
+    auto keeper_pkg = dropper_repo / "keeper-1.0.0-1-x86_64.pkg.tar.zst";
+    if (!sage::archive::create_package(dropper_v1, dropper_v1_data, dropper_v1_pkg)
+        || !sage::archive::create_package(dropper_v2, dropper_v2_data, dropper_v2_pkg)
+        || !sage::archive::create_package(keeper, keeper_data, keeper_pkg)
+        || !sage::archive::generate_repo_index(dropper_repo, "core")) {
+        sage::util::log_error("Failed to create dropped-directory fixtures");
+        return 1;
+    }
+    auto dropper_target = temp_dir / "dropper-target";
+    if (!write_test_channel(dropper_target, dropper_repo)) {
+        sage::util::log_error("Failed to write dropped-directory test channel");
+        return 1;
+    }
+    CliOptions dropper_install;
+    dropper_install.target_root = dropper_target;
+    dropper_install.args = {dropper_v1_pkg.string()};
+    if (cmd_install(dropper_install) != 0) {
+        sage::util::log_error("Failed to install dropper version 1");
+        return 1;
+    }
+    dropper_install.args = {"keeper"};
+    if (cmd_install(dropper_install) != 0) {
+        sage::util::log_error("Failed to install the shared-directory keeper");
+        return 1;
+    }
+    dropper_install.args = {"dropper"};
+    if (cmd_install(dropper_install) != 0
+        || std::filesystem::exists(dropper_target / "usr/share/extra")
+        || !std::filesystem::is_directory(dropper_target / "usr/share/common")
+        || read_test_file(dropper_target / "usr/bin/dtool2") != "dropper v2 extra\n") {
+        sage::util::log_error("Reinstall did not release dropped directories correctly");
+        return 1;
+    }
+    auto dropper_db = sage::db::Database::open(
+        dropper_target / "var/lib/sage/data.mdb", true);
+    if (sole_owner(*dropper_db, "usr/share/common") != "keeper:system") {
+        sage::util::log_error("Released shared directory kept the stale owner claim");
+        return 1;
+    }
+
+    // A declared directory that gained foreign content survives a reinstall
+    // that no longer ships it; only genuinely empty dropped directories go.
+    auto tool_repo = temp_dir / "tool-repo";
+    auto tool_v1_data = temp_dir / "tool-v1-data";
+    auto tool_v2_data = temp_dir / "tool-v2-data";
+    std::filesystem::create_directories(tool_repo);
+    std::filesystem::create_directories(tool_v1_data / "usr/bin");
+    std::filesystem::create_directories(tool_v1_data / "usr/share/data");
+    std::filesystem::create_directories(tool_v2_data / "usr/bin");
+    std::ofstream(tool_v1_data / "usr/bin/tool") << "tool v1\n";
+    std::ofstream(tool_v2_data / "usr/bin/tool2") << "tool v2\n";
+    sage::package::PackageManifest tool_v1;
+    tool_v1.name = "dtool";
+    tool_v1.version = sage::package::Version::parse("1.0.0-1");
+    sage::package::PackageManifest tool_v2 = tool_v1;
+    tool_v2.version = sage::package::Version::parse("2.0.0-1");
+    auto tool_v1_pkg = tool_repo / "dtool-1.0.0-1-x86_64.pkg.tar.zst";
+    auto tool_v2_pkg = tool_repo / "dtool-2.0.0-1-x86_64.pkg.tar.zst";
+    if (!sage::archive::create_package(tool_v1, tool_v1_data, tool_v1_pkg)
+        || !sage::archive::create_package(tool_v2, tool_v2_data, tool_v2_pkg)
+        || !sage::archive::generate_repo_index(tool_repo, "core")) {
+        sage::util::log_error("Failed to create declared-directory upgrade fixtures");
+        return 1;
+    }
+    auto tool_target = temp_dir / "tool-target";
+    if (!write_test_channel(tool_target, tool_repo)) {
+        sage::util::log_error("Failed to write declared-directory test channel");
+        return 1;
+    }
+    CliOptions tool_install;
+    tool_install.target_root = tool_target;
+    tool_install.args = {tool_v1_pkg.string()};
+    if (cmd_install(tool_install) != 0) {
+        sage::util::log_error("Failed to install declared-directory fixture version 1");
+        return 1;
+    }
+    std::ofstream(tool_target / "usr/share/data/foreign") << "user data\n";
+    tool_install.args = {"dtool"};
+    auto tool_record = std::optional<sage::package::PackageManifest>{};
+    if (cmd_install(tool_install) == 0) {
+        auto tool_db = sage::db::Database::open(
+            tool_target / "var/lib/sage/data.mdb", true);
+        auto tool_pkg = tool_db ? tool_db->get_package("dtool")
+            : std::expected<std::optional<sage::package::PackageManifest>, std::string>(
+                std::unexpected("database open failed"));
+        tool_record = tool_pkg ? *tool_pkg : std::nullopt;
+    }
+    if (!tool_record
+        || tool_record->version != tool_v2.version
+        || std::filesystem::exists(tool_target / "usr/bin/tool")
+        || read_test_file(tool_target / "usr/bin/tool2") != "tool v2\n"
+        || read_test_file(tool_target / "usr/share/data/foreign") != "user data\n") {
+        sage::util::log_error("Reinstall destroyed a declared directory with foreign content");
+        return 1;
+    }
+
     sage::util::log_success("9. End-to-End `sage install` & `sage remove` to Target Root OK");
 
     // 10. Complete Closed-Loop: `sage build` -> `sage repo index` -> `sage install` -> `sage remove` with Orphan Cleanup
@@ -1975,6 +2170,35 @@ install = [
 
     sage::util::log_success("10. Complete Build -> Index -> Install -> Remove (Auto Orphan Cleanup) Closed-Loop OK");
     sage::util::log_success("11. Reverse Dependency Protection & Cascade Removal Safety Locks OK");
+
+    // 12. Target root write lock: a second instance is rejected while one
+    // holds the lock, and the lock frees immediately on release (the same
+    // fd-lifetime semantics that make a killed process safe).
+    {
+        auto lock_path = temp_dir / "lock";
+        auto first = sage::util::RootLock::acquire(lock_path);
+        if (!first) {
+            sage::util::log_error("Failed to acquire an uncontended root write lock");
+            return 1;
+        }
+        auto second = sage::util::RootLock::acquire(lock_path);
+        if (second || second.error() != "busy") {
+            sage::util::log_error("A second root write lock was granted while one is held");
+            return 1;
+        }
+        int recorded_pid = 0;
+        if (std::ifstream f(lock_path); !(f.is_open() && (f >> recorded_pid)) || recorded_pid != sage::util::current_pid()) {
+            sage::util::log_error("Lock file does not name the holding pid");
+            return 1;
+        }
+        { auto moved = std::move(*first); }  // release: fd closes here
+        auto reacquired = sage::util::RootLock::acquire(lock_path);
+        if (!reacquired) {
+            sage::util::log_error("Root write lock was not reacquirable after release");
+            return 1;
+        }
+    }
+    sage::util::log_success("12. Target Root Write Lock Rejection & Release OK");
 
     std::filesystem::remove_all(temp_dir);
     sage::util::log_success("🎉 All Sage Master Architecture & Subsystem Integration Tests Passed Successfully!");

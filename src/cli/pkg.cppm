@@ -389,16 +389,21 @@ export int cmd_install(
             }
             previous_paths = std::move(*previous_paths_res);
             for (const auto& path : previous_paths) {
-                auto owner = db.get_file_owner(*package_txn, path);
-                if (!owner) {
+                auto owners = db.get_path_owners(*package_txn, path);
+                if (!owners) {
                     sage::util::log_error(
-                        "Failed to read ownership for '{}': {}", path, owner.error());
+                        "Failed to read ownership for '{}': {}", path, owners.error());
                     return 1;
                 }
-                if (!*owner || **owner != *previous_owner) {
+                // Shared directories legitimately carry several owners, so the
+                // guard is membership, not equality: only a concurrent takeover
+                // of the whole claim must abort the migration.
+                if (std::ranges::find(*owners, *previous_owner) == owners->end()) {
                     sage::util::log_error(
                         "Cannot migrate package '{}': file '{}' is owned by '{}' instead of '{}'",
-                        pkg.name, path, *owner ? **owner : "<none>", *previous_owner);
+                        pkg.name, path,
+                        owners->empty() ? "<none>" : sage::util::join(*owners, ", "),
+                        *previous_owner);
                     return 1;
                 }
             }
@@ -439,42 +444,64 @@ export int cmd_install(
         installed_pkg.triggers = ext_res->manifest.triggers;
         auto package_touched_files = installed_pkg.files;
 
-        // Reinstall/upgrade cleanup: remove physical files owned by a previously
-        // installed package that are not part of the new payload, so file
-        // ownership can transition to other packages (e.g. split -dev/-libs
+        // Reinstall/upgrade cleanup: release ownership of paths the new payload
+        // dropped so they can transition to other packages (e.g. split -dev/-libs
         // children claim headers/libs the old monolithic version used to own).
+        // Shared directories keep their remaining owners and stay on disk; sole
+        // claims are physically removed here.
+        std::vector<sage::package::FileEntry> stale_claims;
+        size_t stale_removed = 0;
         if (*previous_package) {
             std::unordered_set<std::string> new_paths;
             for (const auto& f : installed_pkg.files) {
                 new_paths.insert(sage::util::clean_rel_path(f.path));
             }
-            std::vector<sage::package::FileEntry> stale;
+            std::unordered_map<std::string, sage::package::FileType> old_types;
+            for (const auto& f : (**previous_package).files) {
+                old_types.emplace(sage::util::clean_rel_path(f.path), f.type);
+            }
             const auto& old_owner = *previous_owner;
             for (const auto& old_path : previous_paths) {
                 if (new_paths.contains(old_path)) continue;
-                auto cur_owner = db.get_file_owner(*package_txn, old_path);
-                if (!cur_owner) {
+                auto owners = db.get_path_owners(*package_txn, old_path);
+                if (!owners) {
                     sage::util::log_error(
-                        "Failed to read ownership for '{}': {}", old_path, cur_owner.error());
+                        "Failed to read ownership for '{}': {}", old_path, owners.error());
                     return 1;
                 }
-                if (*cur_owner && **cur_owner != old_owner) {
-                    continue;
-                }
-                auto remove_res = filesystem_txn.remove(old_path);
-                if (!remove_res) {
-                    sage::util::log_error(
-                        "Failed to remove stale file '{}' for '{}': {}",
-                        old_path, pkg.name, remove_res.error());
-                    return 1;
+                if (std::ranges::find(*owners, old_owner) == owners->end()) continue;
+                // Only directories accumulate several owners, so a shared
+                // claim is a directory by construction.
+                const bool shared_directory = owners->size() > 1;
+                // A directory another package has since filled must survive
+                // the upgrade; only genuinely empty ones go away.
+                const bool declared_directory =
+                    old_types.contains(old_path)
+                    && old_types.at(old_path) == sage::package::FileType::Directory;
+                if (shared_directory) {
+                    sage::util::log_info(
+                        "  ~ released shared directory '{}' ({} owner(s) remain)",
+                        old_path, owners->size() - 1);
+                } else {
+                    auto remove_res = filesystem_txn.remove(old_path, declared_directory);
+                    if (!remove_res) {
+                        sage::util::log_error(
+                            "Failed to remove stale file '{}' for '{}': {}",
+                            old_path, pkg.name, remove_res.error());
+                        return 1;
+                    }
+                    ++stale_removed;
                 }
                 sage::package::FileEntry fe;
                 fe.path = old_path;
-                stale.push_back(fe);
+                fe.type = shared_directory || declared_directory
+                    ? sage::package::FileType::Directory
+                    : sage::package::FileType::Regular;
+                stale_claims.push_back(fe);
                 package_touched_files.push_back(std::move(fe));
             }
-            if (!stale.empty()) {
-                auto unregister_res = db.unregister_files(*package_txn, stale, old_owner);
+            if (!stale_claims.empty()) {
+                auto unregister_res = db.unregister_files(*package_txn, stale_claims, old_owner);
                 if (!unregister_res) {
                     sage::util::log_error(
                         "Failed to unregister stale files for '{}': {}",
@@ -482,7 +509,7 @@ export int cmd_install(
                     return 1;
                 }
                 sage::util::log_info("  ~ removed {} stale file(s) from previous {} {}",
-                    stale.size(), pkg.name, (**previous_package).version.to_string());
+                    stale_removed, pkg.name, (**previous_package).version.to_string());
             }
         }
 
@@ -832,6 +859,10 @@ export int cmd_remove(const CliOptions& opts) {
         // registry: merge the installed manifest's file list with all files still
         // registered to this package (a previous version's leftovers may not be
         // present in the current manifest), so stale ownership records are purged.
+        std::unordered_map<std::string, sage::package::FileType> declared_types;
+        for (const auto& f : pkg.files) {
+            declared_types.emplace(sage::util::clean_rel_path(f.path), f.type);
+        }
         auto files_to_delete = pkg.files;
         std::unordered_set<std::string> seen_paths;
         for (const auto& f : files_to_delete) {
@@ -847,6 +878,8 @@ export int cmd_remove(const CliOptions& opts) {
             if (seen_paths.insert(fp).second) {
                 sage::package::FileEntry fe;
                 fe.path = fp;
+                const auto declared = declared_types.find(fp);
+                if (declared != declared_types.end()) fe.type = declared->second;
                 files_to_delete.push_back(std::move(fe));
             }
         }
@@ -856,14 +889,21 @@ export int cmd_remove(const CliOptions& opts) {
 
         std::string my_owner = std::format("{}:{}", pkg_name, pkg.channel);
         for (const auto& file_entry : files_to_delete) {
-            auto cur_owner = db.get_file_owner(*wtxn, file_entry.path);
-            if (!cur_owner) {
+            auto owners = db.get_path_owners(*wtxn, file_entry.path);
+            if (!owners) {
                 sage::util::log_error(
                     "Failed to read ownership for '{}': {}",
-                    file_entry.path, cur_owner.error());
+                    file_entry.path, owners.error());
                 return 1;
             }
-            if (*cur_owner && **cur_owner != my_owner) {
+            const bool mine =
+                std::ranges::find(*owners, my_owner) != owners->end();
+            if (!mine && !owners->empty()) {
+                continue;
+            }
+            if (mine && owners->size() > 1) {
+                // Shared directory with surviving owners: release only this
+                // package's claim below and leave the directory in place.
                 continue;
             }
 
@@ -885,18 +925,23 @@ export int cmd_remove(const CliOptions& opts) {
                 return 1;
             }
 
+            // Unregistered debris is removed best-effort; a declared directory
+            // may legitimately have gained foreign files since install.
+            const auto normalized = relative_path.generic_string();
+            const bool declared_directory =
+                declared_types.contains(normalized)
+                && declared_types.at(normalized) == sage::package::FileType::Directory;
             auto remove_res = filesystem_txn.remove(
-                relative_path.generic_string(),
-                file_entry.type == sage::package::FileType::Directory || !*cur_owner);
+                normalized, owners->empty() || declared_directory);
             if (!remove_res) {
                 sage::util::log_error(
                     "Failed to remove '{}' from package '{}': {}",
-                    relative_path.generic_string(), pkg_name, remove_res.error());
+                    normalized, pkg_name, remove_res.error());
                 return 1;
             }
 
             auto removed_entry = file_entry;
-            removed_entry.path = relative_path.generic_string();
+            removed_entry.path = normalized;
             removed_files.push_back(std::move(removed_entry));
         }
 
