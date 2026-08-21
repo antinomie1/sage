@@ -1665,10 +1665,13 @@ version = "1:2.0-3"
     auto split_compiler_library =
         split_compiler_data / "opt/channels/llvm/77/lib/libsplit-compiler.so";
     auto split_clang = split_compiler_data / "opt/channels/llvm/77/bin/clang";
+    auto split_state_dir =
+        split_compiler_data / "opt/channels/llvm/77/share/split-compiler";
     std::filesystem::create_directories(split_repo);
     std::filesystem::create_directories(split_library.parent_path());
     std::filesystem::create_directories(split_compiler_library.parent_path());
     std::filesystem::create_directories(split_clang.parent_path());
+    std::filesystem::create_directories(split_state_dir);
     std::ofstream(split_library) << "split toolchain library\n";
     std::ofstream(split_compiler_library) << "split compiler library\n";
     std::ofstream(split_clang) << "#!/bin/sh\nexit 0\n";
@@ -1747,6 +1750,12 @@ version = "1:2.0-3"
         return 1;
     }
 
+    // Removal must keep user-created content in a directory owned by the
+    // package while still unregistering the package through the CLI path.
+    auto split_user_data =
+        split_target / "opt/channels/llvm/77/share/split-compiler/user-data";
+    std::ofstream(split_user_data) << "keep\n";
+
     // Replacing an owned regular file with a non-empty directory forces a real
     // filesystem removal error. The command must fail and keep both DB records.
     auto installed_split_clang = split_target / "opt/channels/llvm/77/bin/clang";
@@ -1791,7 +1800,8 @@ version = "1:2.0-3"
         || std::filesystem::exists(split_target / "opt/channels/llvm/77/bin/clang")
         || std::filesystem::exists(split_target / "opt/channels/llvm/77/lib/libsplit.so")
         || std::filesystem::exists(
-            split_target / "opt/channels/llvm/77/lib/libsplit-compiler.so")) {
+            split_target / "opt/channels/llvm/77/lib/libsplit-compiler.so")
+        || !std::filesystem::exists(split_user_data)) {
         sage::util::log_error("Toolchain removal did not delete sysroot-relative package paths");
         return 1;
     }

@@ -841,7 +841,7 @@ export int cmd_remove(const CliOptions& opts) {
             auto remove_res = sage::archive::remove_path_anchored(
                 opts.target_root,
                 relative_path.generic_string(),
-                !*cur_owner);
+                file_entry.type == sage::package::FileType::Directory || !*cur_owner);
             if (!remove_res) {
                 sage::util::log_error(
                     "Failed to remove '{}' from package '{}': {}",
