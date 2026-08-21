@@ -587,7 +587,6 @@ inline std::expected<void, std::string> create_package(
         if (!s_res) return s_res;
     }
 
-<<<<<<< HEAD
     // 3. Append data/... filesystem payload
     if (std::filesystem::exists(data_dir)) {
         std::map<std::string, std::filesystem::directory_entry> entries;
