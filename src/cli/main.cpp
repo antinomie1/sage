@@ -17,6 +17,7 @@ struct CliOptions {
     bool force{false};        // --force, -f, --nodeps, -d
     bool cascade{false};      // --cascade, -c
     bool no_recursive{false};  // --no-recursive
+    bool no_elf_check{false};  // --no-elf-check
 };
 
 void print_banner() {
@@ -41,6 +42,7 @@ Commands:
   query [COMMAND]          Query packages, file ownership, and manifests (nanosecond LMDB)
   service [COMMAND]        Inspect and generate native init scripts (OpenRC/Runit/Systemd/Dinit/s6)
   build <RECIPE_DIR>       Build package from recipe.toml (fetch source, check sha256, build, scan ELF)
+  verify [PKG...]          Check installed files against the recorded files.idx hashes
   status [--full]          Show declared providers, channels, and database state
   test-suite               Run internal engine self-test suite
 
@@ -48,6 +50,8 @@ Global Options:
   --root, --sysroot <DIR>  Operate on target root directory (default: /)
   --dry-run                Simulate actions without modifying filesystem
   --verbose, -v            Enable verbose diagnostics
+  --no-elf-check           Skip build-time DT_NEEDED validation (bootstrap escape hatch)
+  --channel <NAME>         Restrict `install` to a single channel
   --help, -h               Show this help message
   --version, -V            Show version information
 )");
@@ -166,26 +170,108 @@ int cmd_build(const CliOptions& opts) {
     manifest.dependencies = r.host_deps;
     manifest.provides = r.provides;
     manifest.arch = r.arch;
+    manifest.capability_hooks = r.capability_hooks;
+    manifest.triggers = r.triggers;
+
+    // Every soname this package satisfies by itself, and every soname it still
+    // needs from elsewhere -- remembering which file asked, so a failure can
+    // name the offender rather than just the missing library.
+    std::set<std::string> self_sonames;
+    std::set<std::string> needed_sonames;
+    std::map<std::string, std::vector<std::string>> needed_by;
 
     if (std::filesystem::exists(pkg_dir)) {
-        std::map<std::string, std::filesystem::directory_entry> entries;
         for (const auto& entry : std::filesystem::recursive_directory_iterator(pkg_dir, std::filesystem::directory_options::skip_permission_denied)) {
-            entries.emplace(entry.path().lexically_relative(pkg_dir).generic_string(), entry);
-        }
+            auto rel = entry.path().lexically_relative(pkg_dir).generic_string();
 
-        for (const auto& item : entries) {
-            const auto& entry = item.second;
-            if (entry.is_symlink()) continue;
-            if (entry.is_regular_file()) {
-                auto elf_res = sage::util::scan_elf(entry.path());
-                if (elf_res) {
-                    if (!elf_res->soname.empty()) {
-                        manifest.provides.push_back("so:" + elf_res->soname);
-                    }
-                    for (const auto& needed : elf_res->needed) {
-                        manifest.dependencies.push_back(sage::package::Dependency::parse("so:" + needed));
-                    }
+            // A soname is normally reached through the versioned symlink the
+            // package installs next to the real file (libz.so.1 ->
+            // libz.so.1.3.1). Skipping symlinks meant those names never made
+            // it into `provides`, which is why repository indexes ended up
+            // full of so: constraints nothing satisfied.
+            if (entry.is_symlink()) {
+                auto base = entry.path().filename().string();
+                if (base.starts_with("lib") && base.find(".so") != std::string::npos) {
+                    self_sonames.insert(base);
                 }
+                continue;
+            }
+            if (!entry.is_regular_file()) continue;
+
+            auto base = entry.path().filename().string();
+            if (base.starts_with("lib") && base.find(".so") != std::string::npos) {
+                self_sonames.insert(base);
+            }
+
+            auto elf_res = sage::util::scan_elf(entry.path());
+            if (!elf_res) continue;
+            if (!elf_res->soname.empty()) {
+                self_sonames.insert(elf_res->soname);
+            }
+            for (const auto& needed : elf_res->needed) {
+                needed_sonames.insert(needed);
+                needed_by[needed].push_back(rel);
+            }
+        }
+    }
+
+    for (const auto& soname : self_sonames) {
+        manifest.provides.push_back("so:" + soname);
+    }
+
+    // A package does not depend on itself: a soname it installs is not an
+    // external constraint, and emitting it as one makes the solver chase a
+    // cycle through the package being built.
+    std::vector<std::string> external_sonames;
+    for (const auto& soname : needed_sonames) {
+        if (!self_sonames.contains(soname)) external_sonames.push_back(soname);
+    }
+    for (const auto& soname : external_sonames) {
+        manifest.dependencies.push_back(sage::package::Dependency::parse("so:" + soname));
+    }
+
+    // Deduplicate. The same soname is routinely reached from a dozen binaries
+    // in one package, and a repeated provides entry makes the index unreadable.
+    {
+        std::unordered_set<std::string> seen;
+        std::erase_if(manifest.provides, [&](const std::string& p) { return !seen.insert(p).second; });
+    }
+    {
+        std::unordered_set<std::string> seen;
+        std::erase_if(manifest.dependencies, [&](const sage::package::Dependency& d) {
+            return !seen.insert(d.to_string()).second;
+        });
+    }
+
+    // 3b. Validate every remaining DT_NEEDED against what is actually
+    // installed. Without this the build happily links against a library that
+    // only exists on the build host -- xfsprogs picking up the host's
+    // libdevmapper -- and the failure surfaces at install time on a machine
+    // that has no such file.
+    if (!opts.no_elf_check && !external_sonames.empty()) {
+        auto host_cfg = sage::config::SystemConfig::load_from_root(opts.target_root);
+        auto host_db = host_cfg
+            ? sage::db::Database::open(host_cfg->db_path, true)
+            : std::expected<sage::db::Database, std::string>(std::unexpected("no config"));
+
+        if (!host_db) {
+            sage::util::log_warn("Cannot verify DT_NEEDED: no package database at '{}'. "
+                "{} external soname(s) go unchecked -- expected while bootstrapping, a bug otherwise.",
+                host_cfg ? host_cfg->db_path.string() : std::string("<unknown>"), external_sonames.size());
+        } else {
+            std::vector<std::string> unsatisfied;
+            for (const auto& soname : external_sonames) {
+                if (host_db->get_provider("so:" + soname)) continue;
+                unsatisfied.push_back(soname);
+            }
+            if (!unsatisfied.empty()) {
+                sage::util::log_error("Build linked against {} library/libraries no installed package provides:", unsatisfied.size());
+                for (const auto& soname : unsatisfied) {
+                    sage::util::log_error("  so:{}  needed by: {}", soname, sage::util::join(needed_by[soname], ", "));
+                }
+                sage::util::log_error("These came from the build host, not from the repository. Either package them, "
+                    "or configure the build to not use them. Pass --no-elf-check to override.");
+                return 1;
             }
         }
     }
@@ -1742,6 +1828,8 @@ int main(int argc, char** argv) {
             opts.cascade = true;
         } else if (arg == "--no-recursive") {
             opts.no_recursive = true;
+        } else if (arg == "--no-elf-check") {
+            opts.no_elf_check = true;
         } else if ((arg == "--root" || arg == "--sysroot") && i + 1 < argc) {
             opts.target_root = argv[++i];
         } else if (opts.command.empty()) {
