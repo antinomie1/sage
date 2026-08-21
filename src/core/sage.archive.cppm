@@ -64,8 +64,7 @@ inline uint64_t parse_octal(const char* str, size_t len) noexcept {
 inline void write_octal(char* dest, size_t len, uint64_t val) noexcept {
     if (len == 0) return;
     dest[len - 1] = '\0';
-    if (len > 1) dest[len - 2] = ' ';
-    size_t i = len - 2;
+    size_t i = len - 1;
     if (val == 0) {
         if (i > 0) dest[--i] = '0';
     } else {
@@ -77,6 +76,38 @@ inline void write_octal(char* dest, size_t len, uint64_t val) noexcept {
     while (i > 0) {
         dest[--i] = '0';
     }
+}
+
+inline void write_tar_checksum(char* dest, uint32_t val) noexcept {
+    for (size_t i = 6; i > 0; --i) {
+        dest[i - 1] = static_cast<char>('0' + (val & 7));
+        val >>= 3;
+    }
+    dest[6] = '\0';
+    dest[7] = ' ';
+}
+
+struct UstarPathParts {
+    std::string_view prefix;
+    std::string_view name;
+};
+
+inline std::expected<UstarPathParts, std::string> split_ustar_path(std::string_view path) {
+    if (path.size() <= 100) {
+        return UstarPathParts{{}, path};
+    }
+
+    size_t slash = path.rfind('/', std::min(path.size() - 1, size_t{155}));
+    while (slash != std::string_view::npos) {
+        size_t name_size = path.size() - slash - 1;
+        if (slash > 0 && name_size > 0 && name_size <= 100) {
+            return UstarPathParts{path.substr(0, slash), path.substr(slash + 1)};
+        }
+        if (slash == 0) break;
+        slash = path.rfind('/', slash - 1);
+    }
+
+    return std::unexpected("Path cannot be represented in a POSIX USTAR header: " + std::string(path));
 }
 
 inline uint32_t compute_tar_checksum(const TarHeader& hdr) noexcept {
@@ -316,17 +347,13 @@ inline std::expected<void, std::string> create_package(
         TarHeader hdr{};
         std::memset(&hdr, 0, sizeof(hdr));
 
-        if (name.size() > sizeof(hdr.name)) {
-            size_t slash = name.rfind('/', sizeof(hdr.name));
-            if (slash != std::string_view::npos && slash < sizeof(hdr.prefix)) {
-                std::memcpy(hdr.prefix, name.data(), std::min(slash, sizeof(hdr.prefix)));
-                size_t remainder = name.size() - slash - 1;
-                std::memcpy(hdr.name, name.data() + slash + 1, std::min(remainder, sizeof(hdr.name)));
-            } else {
-                std::memcpy(hdr.name, name.data(), std::min(name.size(), sizeof(hdr.name)));
-            }
-        } else {
-            std::memcpy(hdr.name, name.data(), std::min(name.size(), sizeof(hdr.name)));
+        auto path_parts = split_ustar_path(name);
+        if (!path_parts) return std::unexpected(path_parts.error());
+        if (!path_parts->prefix.empty()) {
+            std::memcpy(hdr.prefix, path_parts->prefix.data(), path_parts->prefix.size());
+        }
+        if (!path_parts->name.empty()) {
+            std::memcpy(hdr.name, path_parts->name.data(), path_parts->name.size());
         }
 
         write_octal(hdr.mode, sizeof(hdr.mode), mode);
@@ -336,17 +363,20 @@ inline std::expected<void, std::string> create_package(
         write_octal(hdr.mtime, sizeof(hdr.mtime), 1700000000);
         hdr.typeflag = typeflag;
 
+        if (linkname.size() > sizeof(hdr.linkname)) {
+            return std::unexpected("Link target cannot be represented in a POSIX USTAR header: " + std::string(linkname));
+        }
         if (!linkname.empty()) {
-            std::memcpy(hdr.linkname, linkname.data(), std::min(linkname.size(), sizeof(hdr.linkname)));
+            std::memcpy(hdr.linkname, linkname.data(), linkname.size());
         }
 
-        std::memcpy(hdr.magic, "ustar ", 6);
-        std::memcpy(hdr.version, " \0", 2);
+        std::memcpy(hdr.magic, "ustar", 5);
+        std::memcpy(hdr.version, "00", 2);
         std::memcpy(hdr.uname, "root", 4);
         std::memcpy(hdr.gname, "root", 4);
 
         uint32_t chk = compute_tar_checksum(hdr);
-        write_octal(hdr.chksum, sizeof(hdr.chksum), chk);
+        write_tar_checksum(hdr.chksum, chk);
 
         // Write header
         auto res = write_compressed_chunk(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(&hdr), 512));
@@ -392,8 +422,13 @@ inline std::expected<void, std::string> create_package(
 
     // 3. Append data/... filesystem payload
     if (std::filesystem::exists(data_dir)) {
+        std::map<std::string, std::filesystem::directory_entry> entries;
         for (const auto& entry : std::filesystem::recursive_directory_iterator(data_dir, std::filesystem::directory_options::none)) {
             auto rel = entry.path().lexically_relative(data_dir).generic_string();
+            entries.emplace(rel, entry);
+        }
+
+        for (const auto& [rel, entry] : entries) {
             std::string tar_name = "data/" + rel;
 
             if (entry.is_symlink()) {
@@ -401,7 +436,13 @@ inline std::expected<void, std::string> create_package(
                 auto r = append_tar_entry(tar_name, {}, 0777, '2', target);
                 if (!r) return r;
             } else if (entry.is_directory()) {
-                auto r = append_tar_entry(tar_name + "/", {}, 0755, '5');
+                auto directory_name = tar_name;
+                auto path_parts = split_ustar_path(directory_name);
+                std::error_code empty_ec;
+                if (!path_parts && !std::filesystem::is_empty(entry.path(), empty_ec) && !empty_ec) {
+                    continue;
+                }
+                auto r = append_tar_entry(directory_name, {}, 0755, '5');
                 if (!r) return r;
             } else if (entry.is_regular_file()) {
                 std::ifstream f(entry.path(), std::ios::binary);

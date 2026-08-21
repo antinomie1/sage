@@ -168,7 +168,13 @@ int cmd_build(const CliOptions& opts) {
     manifest.arch = r.arch;
 
     if (std::filesystem::exists(pkg_dir)) {
+        std::map<std::string, std::filesystem::directory_entry> entries;
         for (const auto& entry : std::filesystem::recursive_directory_iterator(pkg_dir, std::filesystem::directory_options::skip_permission_denied)) {
+            entries.emplace(entry.path().lexically_relative(pkg_dir).generic_string(), entry);
+        }
+
+        for (const auto& item : entries) {
+            const auto& entry = item.second;
             if (entry.is_symlink()) continue;
             if (entry.is_regular_file()) {
                 auto elf_res = sage::util::scan_elf(entry.path());
@@ -799,12 +805,35 @@ int cmd_test_suite() {
     // 2. Tar+Zstd Archive Packaging & Streaming Extractor Test
     auto temp_dir = std::filesystem::temp_directory_path() / "sage_archive_test";
     std::filesystem::remove_all(temp_dir);
-    std::filesystem::create_directories(temp_dir / "data/usr/bin");
+    const auto long_rel = std::filesystem::path(std::string(110, 'a')) / std::string(80, 'b');
+    const auto boundary_rel = std::filesystem::path(std::string(100, 'e')) / std::string(49, 'f') / std::string(100, 'g');
+    const auto boundary_empty_dir = std::filesystem::path(std::string(100, 'i'));
+    const std::string boundary_link_target(100, 'h');
+    auto populate_payload = [&](const std::filesystem::path& root, bool long_path_first) {
+        auto write_long_path = [&] {
+            std::filesystem::create_directories((root / long_rel).parent_path());
+            std::ofstream(root / long_rel) << "long path payload\n";
+            std::filesystem::create_directories((root / boundary_rel).parent_path());
+            std::ofstream(root / boundary_rel) << "USTAR boundary payload\n";
+        };
+        auto write_dummy = [&] {
+            std::filesystem::create_directories(root / "usr/bin");
+            std::ofstream(root / "usr/bin/dummy") << "#!/bin/sh\necho 'hello sage'\n";
+            std::filesystem::permissions(root / "usr/bin/dummy", std::filesystem::perms::owner_all | std::filesystem::perms::group_read | std::filesystem::perms::group_exec);
+            std::filesystem::create_symlink(boundary_link_target, root / "usr/bin/link");
+            std::filesystem::create_directories(root / boundary_empty_dir);
+        };
 
-    std::ofstream dummy_bin(temp_dir / "data/usr/bin/dummy");
-    dummy_bin << "#!/bin/sh\necho 'hello sage'\n";
-    dummy_bin.close();
-    std::filesystem::permissions(temp_dir / "data/usr/bin/dummy", std::filesystem::perms::owner_all | std::filesystem::perms::group_read | std::filesystem::perms::group_exec);
+        if (long_path_first) {
+            write_long_path();
+            write_dummy();
+        } else {
+            write_dummy();
+            write_long_path();
+        }
+    };
+    populate_payload(temp_dir / "data", true);
+    populate_payload(temp_dir / "data_reordered", false);
 
     sage::package::PackageManifest manifest;
     manifest.name = "dummy-tool";
@@ -820,13 +849,242 @@ int cmd_test_suite() {
         return 1;
     }
 
+    auto reordered_pkg_path = temp_dir / "dummy-tool-reordered.pkg.tar.zst";
+    auto reordered_pack_res = sage::archive::create_package(manifest, temp_dir / "data_reordered", reordered_pkg_path);
+    auto pkg_hash = sage::util::compute_file_sha256(pkg_path);
+    auto reordered_pkg_hash = sage::util::compute_file_sha256(reordered_pkg_path);
+    if (!reordered_pack_res || !pkg_hash || !reordered_pkg_hash || *pkg_hash != *reordered_pkg_hash) {
+        sage::util::log_error("Archive reproducibility verification failed");
+        return 1;
+    }
+
+    auto raw_tar_path = temp_dir / "dummy-tool.tar";
+    auto decompress_cmd = std::format("zstd -dc \"{}\" > \"{}\"", pkg_path.string(), raw_tar_path.string());
+    if (std::system(decompress_cmd.c_str()) != 0) {
+        sage::util::log_error("Failed to decompress generated USTAR archive for inspection");
+        return 1;
+    }
+    sage::archive::TarHeader first_header{};
+    std::ifstream raw_tar(raw_tar_path, std::ios::binary);
+    bool checksum_digits = true;
+    if (!raw_tar.read(reinterpret_cast<char*>(&first_header), sizeof(first_header))) {
+        sage::util::log_error("Failed to inspect generated USTAR header");
+        return 1;
+    }
+    for (size_t i = 0; i < 6; ++i) {
+        checksum_digits = checksum_digits && first_header.chksum[i] >= '0' && first_header.chksum[i] <= '7';
+    }
+    if (std::memcmp(first_header.magic, "ustar\0", 6) != 0 ||
+        std::memcmp(first_header.version, "00", 2) != 0 || !checksum_digits ||
+        first_header.chksum[6] != '\0' || first_header.chksum[7] != ' ' ||
+        sage::archive::parse_octal(first_header.chksum, sizeof(first_header.chksum)) !=
+            sage::archive::compute_tar_checksum(first_header) ||
+        sage::archive::parse_octal(first_header.mtime, sizeof(first_header.mtime)) != 1700000000) {
+        sage::util::log_error("Generated POSIX USTAR header fields are not canonical");
+        return 1;
+    }
+
+    auto unrepresentable_root = temp_dir / "unrepresentable-path";
+    std::filesystem::create_directories(unrepresentable_root);
+    std::ofstream(unrepresentable_root / std::string(101, 'c')) << "must fail\n";
+    auto unrepresentable_res = sage::archive::create_package(
+        manifest, unrepresentable_root, temp_dir / "unrepresentable-path.pkg.tar.zst");
+    if (unrepresentable_res || unrepresentable_res.error().find("Path cannot be represented") == std::string::npos) {
+        sage::util::log_error("Unrepresentable USTAR path was silently accepted");
+        return 1;
+    }
+
+    auto long_link_root = temp_dir / "long-link-target";
+    std::filesystem::create_directories(long_link_root);
+    std::error_code link_ec;
+    std::filesystem::create_symlink(std::string(101, 'd'), long_link_root / "link", link_ec);
+    if (link_ec) {
+        sage::util::log_error("Failed to create long-link USTAR fixture: {}", link_ec.message());
+        return 1;
+    }
+    auto long_link_res = sage::archive::create_package(
+        manifest, long_link_root, temp_dir / "long-link-target.pkg.tar.zst");
+    if (long_link_res || long_link_res.error().find("Link target cannot be represented") == std::string::npos) {
+        sage::util::log_error("Unrepresentable USTAR link target was silently accepted");
+        return 1;
+    }
+
     auto extract_root = temp_dir / "sysroot";
     auto ext_res = sage::archive::extract_package(pkg_path, extract_root);
-    if (!ext_res || !std::filesystem::exists(extract_root / "usr/bin/dummy")) {
+    if (!ext_res || !std::filesystem::exists(extract_root / "usr/bin/dummy") ||
+        !std::filesystem::exists(extract_root / long_rel) || !std::filesystem::exists(extract_root / boundary_rel) ||
+        !std::filesystem::is_directory(extract_root / boundary_empty_dir) ||
+        !std::filesystem::is_symlink(extract_root / "usr/bin/link") ||
+        std::filesystem::read_symlink(extract_root / "usr/bin/link").generic_string() != boundary_link_target) {
         sage::util::log_error("Archive extraction verification failed");
         return 1;
     }
-    sage::util::log_success("2. Native Streaming Tar + Zstandard Engine OK");
+
+    auto verify_tar_reader = [&](std::string_view reader, const std::filesystem::path& root) {
+        std::filesystem::create_directories(root);
+        auto command = std::format("{} -xf \"{}\" -C \"{}\"", reader, pkg_path.string(), root.string());
+        return std::system(command.c_str()) == 0 &&
+            std::filesystem::exists(root / "data" / long_rel) &&
+            std::filesystem::exists(root / "data" / boundary_rel) &&
+            std::filesystem::is_directory(root / "data" / boundary_empty_dir) &&
+            std::filesystem::is_symlink(root / "data/usr/bin/link") &&
+            std::filesystem::read_symlink(root / "data/usr/bin/link").generic_string() == boundary_link_target;
+    };
+    if (!verify_tar_reader("tar", temp_dir / "tar-sysroot") ||
+        !verify_tar_reader("bsdtar", temp_dir / "bsdtar-sysroot")) {
+        sage::util::log_error("POSIX USTAR compatibility verification failed");
+        return 1;
+    }
+    sage::util::log_success("2. Deterministic POSIX USTAR + Zstandard Engine OK");
+
+    // 2b. `cmd_build` ELF scan order must be reflected deterministically in the final manifest.
+    auto write_test_elf = [](const std::filesystem::path& path,
+                             std::string_view soname,
+                             std::string_view needed) {
+        constexpr size_t phoff = 64;
+        constexpr size_t dynoff = 176;
+        constexpr size_t stroff = 256;
+        constexpr std::uint64_t base = 0x400000;
+
+        std::string strings(1, '\0');
+        const std::uint64_t soname_offset = strings.size();
+        strings.append(soname);
+        strings.push_back('\0');
+        const std::uint64_t needed_offset = strings.size();
+        strings.append(needed);
+        strings.push_back('\0');
+
+        std::vector<std::uint8_t> elf(stroff + strings.size());
+        auto put = [&](size_t offset, std::uint64_t value, size_t width) {
+            for (size_t i = 0; i < width; ++i) {
+                elf[offset + i] = static_cast<std::uint8_t>(value >> (8 * i));
+            }
+        };
+
+        elf[0] = 0x7f;
+        elf[1] = 'E';
+        elf[2] = 'L';
+        elf[3] = 'F';
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[6] = 1;
+        put(16, 3, 2);
+        put(18, 62, 2);
+        put(20, 1, 4);
+        put(32, phoff, 8);
+        put(52, 64, 2);
+        put(54, 56, 2);
+        put(56, 2, 2);
+
+        put(64, 1, 4);
+        put(68, 4, 4);
+        put(80, base, 8);
+        put(88, base, 8);
+        put(96, elf.size(), 8);
+        put(104, elf.size(), 8);
+        put(112, 0x1000, 8);
+
+        put(120, 2, 4);
+        put(124, 4, 4);
+        put(128, dynoff, 8);
+        put(136, base + dynoff, 8);
+        put(144, base + dynoff, 8);
+        put(152, 80, 8);
+        put(160, 80, 8);
+        put(168, 8, 8);
+
+        auto put_dynamic = [&](size_t index, std::uint64_t tag, std::uint64_t value) {
+            put(dynoff + index * 16, tag, 8);
+            put(dynoff + index * 16 + 8, value, 8);
+        };
+        put_dynamic(0, 5, base + stroff);
+        put_dynamic(1, 10, strings.size());
+        put_dynamic(2, 1, needed_offset);
+        put_dynamic(3, 14, soname_offset);
+        put_dynamic(4, 0, 0);
+
+        std::memcpy(elf.data() + stroff, strings.data(), strings.size());
+        std::ofstream out(path, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(elf.data()), static_cast<std::streamsize>(elf.size()));
+        return out.good();
+    };
+
+    auto write_elf_recipe = [&](const std::filesystem::path& recipe_dir, bool z_first) {
+        std::filesystem::create_directories(recipe_dir);
+        if (!write_test_elf(recipe_dir / "a.elf", "liba-provider.so.1", "liba-needed.so.1") ||
+            !write_test_elf(recipe_dir / "z.elf", "libz-provider.so.1", "libz-needed.so.1")) {
+            return false;
+        }
+
+        std::ofstream recipe(recipe_dir / "recipe.toml");
+        recipe << R"(schema_version = 1
+[package]
+name = "elf-order-test"
+version = "1.0.0"
+release = "1"
+description = "ELF manifest ordering fixture"
+license = "BSD-2-Clause"
+channel = "system"
+dependencies = ["declared-runtime"]
+provides = ["elf-order"]
+install = [
+    'mkdir -p "$DESTDIR/usr/lib"',
+)";
+        if (z_first) {
+            recipe << "    'cp \"$RECIPE_DIR/z.elf\" \"$DESTDIR/usr/lib/z-provider.so\"',\n";
+            recipe << "    'cp \"$RECIPE_DIR/a.elf\" \"$DESTDIR/usr/lib/a-provider.so\"',\n";
+        } else {
+            recipe << "    'cp \"$RECIPE_DIR/a.elf\" \"$DESTDIR/usr/lib/a-provider.so\"',\n";
+            recipe << "    'cp \"$RECIPE_DIR/z.elf\" \"$DESTDIR/usr/lib/z-provider.so\"',\n";
+        }
+        recipe << "]\n";
+        return recipe.good();
+    };
+
+    auto elf_test_root = temp_dir / "elf-order";
+    auto z_first_dir = elf_test_root / "z-first";
+    auto a_first_dir = elf_test_root / "a-first";
+    if (!write_elf_recipe(z_first_dir, true) || !write_elf_recipe(a_first_dir, false)) {
+        sage::util::log_error("Failed to create ELF manifest ordering fixtures");
+        return 1;
+    }
+
+    auto build_elf_fixture = [&](const std::filesystem::path& recipe_dir,
+                                 const std::filesystem::path& extract_dir)
+        -> std::expected<sage::package::PackageManifest, std::string> {
+        CliOptions build_opts;
+        build_opts.args = {recipe_dir.string()};
+        if (cmd_build(build_opts) != 0) {
+            return std::unexpected("cmd_build failed for " + recipe_dir.string());
+        }
+        auto package_path = recipe_dir / "elf-order-test-1.0.0-1-x86_64.pkg.tar.zst";
+        auto extracted = sage::archive::extract_package(package_path, extract_dir);
+        if (!extracted) return std::unexpected(extracted.error());
+        return std::move(extracted->manifest);
+    };
+
+    auto z_first_manifest = build_elf_fixture(z_first_dir, elf_test_root / "z-first-extracted");
+    auto a_first_manifest = build_elf_fixture(a_first_dir, elf_test_root / "a-first-extracted");
+    auto has_expected_elf_order = [](const sage::package::PackageManifest& built) {
+        return built.dependencies.size() == 3 && built.provides.size() == 3 &&
+            built.dependencies[0].to_string() == "declared-runtime" &&
+            built.dependencies[1].to_string() == "so:liba-needed.so.1" &&
+            built.dependencies[2].to_string() == "so:libz-needed.so.1" &&
+            built.provides[0] == "elf-order" &&
+            built.provides[1] == "so:liba-provider.so.1" &&
+            built.provides[2] == "so:libz-provider.so.1";
+    };
+    auto z_first_hash = sage::util::compute_file_sha256(
+        z_first_dir / "elf-order-test-1.0.0-1-x86_64.pkg.tar.zst");
+    auto a_first_hash = sage::util::compute_file_sha256(
+        a_first_dir / "elf-order-test-1.0.0-1-x86_64.pkg.tar.zst");
+    if (!z_first_manifest || !a_first_manifest ||
+        !has_expected_elf_order(*z_first_manifest) || !has_expected_elf_order(*a_first_manifest) ||
+        !z_first_hash || !a_first_hash || *z_first_hash != *a_first_hash) {
+        sage::util::log_error("cmd_build ELF manifest ordering is not deterministic");
+        return 1;
+    }
+    sage::util::log_success("   Deterministic cmd_build ELF Manifest Ordering OK");
 
     // 3. PubGrub Dependency Solver & Toolchain MSRV Resolution Test
     std::vector<sage::package::PackageManifest> repo_pool;
