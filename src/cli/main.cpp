@@ -18,6 +18,7 @@ struct CliOptions {
     bool cascade{false};      // --cascade, -c
     bool no_recursive{false};  // --no-recursive
     bool no_elf_check{false};  // --no-elf-check
+    std::string channel_filter;  // --channel <NAME>
 };
 
 void print_banner() {
@@ -37,9 +38,9 @@ Commands:
   java [list|use <slot>]   Manage OpenJDK/GraalVM/Temurin versions and JAVA_HOME
   rust [list|use <slot>]   Manage Rust stable/nightly versions and targets
   shell [--with <spec...>] Launch ephemeral sandboxed shell with custom toolchains
-  channel [COMMAND]        Manage multi-layer channels (list, add, sync)
+  channel [COMMAND]        Manage multi-layer channels (list, add, remove, sync)
   repo index <DIR> [NAME]  Generate index.toml for local repository directory
-  query [COMMAND]          Query packages, file ownership, and manifests (nanosecond LMDB)
+  query [COMMAND]          Query packages, files, capabilities and ownership (nanosecond LMDB)
   service [COMMAND]        Inspect and generate native init scripts (OpenRC/Runit/Systemd/Dinit/s6)
   build <RECIPE_DIR>       Build package from recipe.toml (fetch source, check sha256, build, scan ELF)
   verify [PKG...]          Check installed files against the recorded files.idx hashes
@@ -334,8 +335,14 @@ int cmd_install(const CliOptions& opts) {
     std::vector<sage::package::PackageManifest> pool;
     std::map<std::string, std::filesystem::path> package_archive_map;
 
+    bool channel_filter_matched = opts.channel_filter.empty();
     for (const auto& ch_cfg : cfg.channels) {
         if (!ch_cfg.enabled) continue;
+        // --channel narrows the pool to one channel. Installed packages are
+        // still added below, so a restricted install can still satisfy
+        // constraints that are already met on the system.
+        if (!opts.channel_filter.empty() && ch_cfg.name != opts.channel_filter) continue;
+        channel_filter_matched = true;
         sage::channel::Channel ch;
         ch.name = ch_cfg.name;
         ch.url = ch_cfg.url;
@@ -366,6 +373,12 @@ int cmd_install(const CliOptions& opts) {
                 package_archive_map[pkg.name] = local_p;
             }
         }
+    }
+
+    if (!channel_filter_matched) {
+        sage::util::log_error("No enabled channel named '{}' is configured for '{}'",
+            opts.channel_filter, opts.target_root.string());
+        return 1;
     }
 
     // Include already-installed packages in the pool so that installed providers
@@ -451,6 +464,36 @@ int cmd_install(const CliOptions& opts) {
         to_install.push_back(std::move(pkg));
     }
     unique_to_install = std::move(to_install);
+
+    // Enforce exclusive capabilities.
+    //
+    // An exclusive capability -- virtual/init, virtual/udev, virtual/libc --
+    // is one where two providers on the same root cannot both work. Shared
+    // capabilities are exempt by construction: two initramfs builders or two
+    // kernels coexisting is the normal case, and rejecting them here is
+    // exactly the mistake this distinction exists to prevent.
+    {
+        std::map<std::string, std::string> claimed;
+        for (const auto& [name, pkg] : installed_by_name) {
+            for (const auto& prov : pkg.provides) {
+                if (cfg.is_exclusive_capability(prov)) claimed.emplace(prov, name);
+            }
+        }
+        for (const auto& pkg : unique_to_install) {
+            for (const auto& prov : pkg.provides) {
+                if (!cfg.is_exclusive_capability(prov)) continue;
+                auto [it, fresh] = claimed.emplace(prov, pkg.name);
+                if (!fresh && it->second != pkg.name) {
+                    sage::util::log_error("Exclusive capability '{}' would have two providers: '{}' and '{}'",
+                        prov, it->second, pkg.name);
+                    sage::util::log_error("Swap the provider through '{}' [providers] and 'sage rebuild', "
+                        "or drop the capability to \"shared\" under [capabilities] if they really do coexist.",
+                        cfg.system_config_path.string());
+                    return 1;
+                }
+            }
+        }
+    }
 
     sage::util::log_info("Resolved {} packages to install into target root '{}':", unique_to_install.size(), opts.target_root.string());
     for (const auto& pkg : unique_to_install) {
@@ -1528,7 +1571,7 @@ install = [
 
 int cmd_query(const CliOptions& opts) {
     if (opts.args.empty()) {
-        std::println("Usage: sage query [installed|info <pkg>|owner <path>]");
+        std::println("Usage: sage query [installed|info <pkg>|owner <path>|files <pkg>|capabilities]");
         return 1;
     }
 
@@ -1540,6 +1583,57 @@ int cmd_query(const CliOptions& opts) {
         return 0;
     }
     auto& db = *db_res;
+
+    if (sub == "files" && opts.args.size() >= 2) {
+        std::string pkg_name = opts.args[1];
+        auto pkg = db.get_package(pkg_name);
+        if (!pkg) {
+            sage::util::log_error("Package '{}' is not installed", pkg_name);
+            return 1;
+        }
+        if (pkg->files.empty()) {
+            // Packages registered before files.idx existed have paths in the
+            // files table but no per-file metadata; fall back to those rather
+            // than claiming the package owns nothing.
+            auto paths = db.get_package_files(pkg_name);
+            if (paths.empty()) {
+                std::println("{} owns no files", pkg_name);
+                return 0;
+            }
+            sage::util::log_warn("'{}' predates files.idx: listing paths without hashes", pkg_name);
+            for (const auto& path : paths) std::println("/{}", path);
+            return 0;
+        }
+        for (const auto& f : pkg->files) {
+            std::println("{:<4} {:>6o} {:>10}  {:<64}  /{}",
+                sage::package::to_string(f.type), f.mode, f.size,
+                f.sha256.empty() ? "-" : f.sha256, f.path);
+        }
+        return 0;
+    }
+
+    if (sub == "capabilities") {
+        auto list = db.list_installed_packages();
+        std::map<std::string, std::vector<std::string>> by_cap;
+        for (const auto& pkg : list) {
+            for (const auto& prov : pkg.provides) {
+                if (!prov.starts_with("virtual/")) continue;
+                by_cap[prov].push_back(pkg.name);
+            }
+        }
+        auto cfg = cfg_res ? *cfg_res : sage::config::SystemConfig::default_config();
+        std::println("Virtual capabilities in '{}':", opts.target_root.string());
+        for (const auto& [cap, providers] : by_cap) {
+            auto bound = cfg.provider_for(cap);
+            std::println("  • {:<34} {:<10} providers: {}{}",
+                cap,
+                sage::config::to_string(cfg.capability_kind(cap)),
+                sage::util::join(providers, ", "),
+                bound ? std::format("  (bound: {})", *bound) : std::string{});
+        }
+        if (by_cap.empty()) std::println("  (none)");
+        return 0;
+    }
 
     if (sub == "installed") {
         auto list = db.list_installed_packages();
@@ -1569,6 +1663,72 @@ int cmd_query(const CliOptions& opts) {
         }
     }
     return 0;
+}
+
+// Check installed files against the hashes recorded at install time.
+int cmd_verify(const CliOptions& opts) {
+    auto cfg_res = sage::config::SystemConfig::load_from_root(opts.target_root);
+    if (!cfg_res) {
+        sage::util::log_error("Failed to load configuration: {}", cfg_res.error());
+        return 1;
+    }
+    auto db_res = sage::db::Database::open(cfg_res->db_path, true);
+    if (!db_res) {
+        sage::util::log_error("Failed to open database at {}: {}", cfg_res->db_path.string(), db_res.error());
+        return 1;
+    }
+
+    std::vector<sage::package::PackageManifest> targets;
+    if (opts.args.empty()) {
+        targets = db_res->list_installed_packages();
+    } else {
+        for (const auto& name : opts.args) {
+            auto pkg = db_res->get_package(name);
+            if (!pkg) {
+                sage::util::log_error("Package '{}' is not installed", name);
+                return 1;
+            }
+            targets.push_back(std::move(*pkg));
+        }
+    }
+
+    size_t checked = 0;
+    size_t modified = 0;
+    size_t missing = 0;
+    size_t unhashed = 0;
+
+    for (const auto& pkg : targets) {
+        for (const auto& f : pkg.files) {
+            if (f.type != sage::package::FileType::Regular) continue;
+            if (f.sha256.empty()) { unhashed++; continue; }
+
+            std::filesystem::path on_disk = opts.target_root / f.path;
+            if (!std::filesystem::exists(on_disk)) {
+                std::println("missing   {:<20} /{}", pkg.name, f.path);
+                missing++;
+                continue;
+            }
+            auto hash = sage::util::compute_file_sha256(on_disk);
+            checked++;
+            if (!hash) {
+                std::println("unreadable {:<20} /{}", pkg.name, f.path);
+                missing++;
+            } else if (*hash != f.sha256) {
+                std::println("modified  {:<20} /{}", pkg.name, f.path);
+                modified++;
+            }
+        }
+    }
+
+    if (unhashed > 0) {
+        sage::util::log_warn("{} file(s) carry no recorded hash (installed before files.idx existed)", unhashed);
+    }
+    if (modified == 0 && missing == 0) {
+        sage::util::log_success("Verified {} file(s) across {} package(s): all match", checked, targets.size());
+        return 0;
+    }
+    sage::util::log_error("{} modified, {} missing out of {} file(s) checked", modified, missing, checked);
+    return 1;
 }
 
 int cmd_toolchain(const CliOptions& opts) {
@@ -1716,18 +1876,128 @@ int cmd_service(const CliOptions& opts) {
     return 0;
 }
 
-int cmd_channel(const CliOptions& opts) {
-    auto cfg = sage::config::SystemConfig::load_from_root(opts.target_root);
-    if (!cfg) {
-        sage::util::log_error("Failed to load configuration: {}", cfg.error());
+// Persist the channel list to the *target root's* channels.toml.
+//
+// This must always write the target's own file. SystemConfig falls back to the
+// host's /etc/sage/channels.toml when the target root has none, so a target
+// that is merely borrowing the host's channels would otherwise have an edit
+// silently applied to the host instead.
+int write_channels(const sage::config::SystemConfig& cfg) {
+    std::error_code ec;
+    std::filesystem::create_directories(cfg.channels_config_path.parent_path(), ec);
+    std::ofstream out(cfg.channels_config_path);
+    if (!out.is_open()) {
+        sage::util::log_error("Cannot write {}", cfg.channels_config_path.string());
         return 1;
     }
-    std::println("Configured Channels for '{}':", opts.target_root.string());
-    for (const auto& ch : cfg->channels) {
-        std::println("  • {:<15} {:<35} scope: {:<10} priority: {}", 
-            ch.name, ch.url, ch.scope, ch.priority);
-    }
+    out << cfg.serialize_channels_toml();
     return 0;
+}
+
+int cmd_channel(const CliOptions& opts) {
+    auto cfg_res = sage::config::SystemConfig::load_from_root(opts.target_root);
+    if (!cfg_res) {
+        sage::util::log_error("Failed to load configuration: {}", cfg_res.error());
+        return 1;
+    }
+    auto& cfg = *cfg_res;
+
+    std::string sub = opts.args.empty() ? "list" : opts.args[0];
+
+    if (sub == "list") {
+        std::println("Configured Channels for '{}':", opts.target_root.string());
+        if (cfg.channels.empty()) {
+            std::println("  (none configured)");
+        }
+        for (const auto& ch : cfg.channels) {
+            std::println("  • {:<15} {:<45} scope: {:<10} priority: {:<5} {}",
+                ch.name, ch.url, ch.scope, ch.priority, ch.enabled ? "enabled" : "disabled");
+        }
+        return 0;
+    }
+
+    if (sub == "add") {
+        if (opts.args.size() < 3) {
+            std::println("Usage: sage channel add <NAME> <URL> [SCOPE] [PRIORITY]");
+            std::println("  SCOPE: system (default) | runtime | toolchain | user");
+            return 1;
+        }
+        sage::config::ChannelConfig ch;
+        ch.name = opts.args[1];
+        ch.url = opts.args[2];
+        ch.scope = opts.args.size() >= 4 ? opts.args[3] : "system";
+        ch.priority = opts.args.size() >= 5 ? std::atoi(opts.args[4].c_str()) : 50;
+        ch.enabled = true;
+
+        auto existing = std::ranges::find(cfg.channels, ch.name, &sage::config::ChannelConfig::name);
+        if (existing != cfg.channels.end()) {
+            sage::util::log_info("Updating existing channel '{}'", ch.name);
+            *existing = std::move(ch);
+        } else {
+            cfg.channels.push_back(std::move(ch));
+        }
+
+        if (int rc = write_channels(cfg); rc != 0) return rc;
+        sage::util::log_success("Channel '{}' written to {}", opts.args[1], cfg.channels_config_path.string());
+        return 0;
+    }
+
+    if (sub == "remove" || sub == "rm") {
+        if (opts.args.size() < 2) {
+            std::println("Usage: sage channel remove <NAME>");
+            return 1;
+        }
+        const std::string& name = opts.args[1];
+        auto removed = std::erase_if(cfg.channels, [&](const sage::config::ChannelConfig& c) { return c.name == name; });
+        if (removed == 0) {
+            sage::util::log_error("No channel named '{}' is configured", name);
+            return 1;
+        }
+        if (int rc = write_channels(cfg); rc != 0) return rc;
+        sage::util::log_success("Channel '{}' removed from {}", name, cfg.channels_config_path.string());
+        return 0;
+    }
+
+    if (sub == "sync") {
+        // Optional second argument narrows the sync to a single channel;
+        // --channel does the same, so accept whichever the user reached for.
+        std::string only = opts.args.size() >= 2 ? opts.args[1] : opts.channel_filter;
+
+        size_t synced = 0;
+        size_t failed = 0;
+        for (const auto& ch_cfg : cfg.channels) {
+            if (!only.empty() && ch_cfg.name != only) continue;
+            if (!ch_cfg.enabled) {
+                sage::util::log_info("Skipping disabled channel '{}'", ch_cfg.name);
+                continue;
+            }
+            sage::channel::Channel ch;
+            ch.name = ch_cfg.name;
+            ch.url = ch_cfg.url;
+            ch.scope = sage::channel::parse_scope(ch_cfg.scope);
+
+            auto idx = sage::channel::ProfileManager::sync_channel(ch, cfg.cache_dir);
+            if (!idx) {
+                sage::util::log_error("Channel '{}': {}", ch_cfg.name, idx.error());
+                failed++;
+                continue;
+            }
+            sage::util::log_success("Channel '{}': {} packages", ch_cfg.name, idx->available_packages.size());
+            synced++;
+        }
+
+        if (synced == 0 && failed == 0) {
+            sage::util::log_warn("Nothing to sync{}", only.empty() ? "" : std::format(": no enabled channel named '{}'", only));
+            return only.empty() ? 0 : 1;
+        }
+        // A partial sync is still a failure: the pool is now inconsistent with
+        // what the caller asked for, and installing from it would pick stale
+        // versions without saying so.
+        return failed == 0 ? 0 : 1;
+    }
+
+    std::println("Usage: sage channel [list|add <NAME> <URL> [SCOPE] [PRIORITY]|remove <NAME>|sync [NAME]]");
+    return 1;
 }
 
 int cmd_status(const CliOptions& opts) {
@@ -1856,6 +2126,8 @@ int main(int argc, char** argv) {
             opts.no_recursive = true;
         } else if (arg == "--no-elf-check") {
             opts.no_elf_check = true;
+        } else if (arg == "--channel" && i + 1 < argc) {
+            opts.channel_filter = argv[++i];
         } else if ((arg == "--root" || arg == "--sysroot") && i + 1 < argc) {
             opts.target_root = argv[++i];
         } else if (opts.command.empty()) {
@@ -1906,6 +2178,9 @@ int main(int argc, char** argv) {
     }
     if (opts.command == "repo") {
         return cmd_repo(opts);
+    }
+    if (opts.command == "verify") {
+        return cmd_verify(opts);
     }
 
     std::println(std::cerr, "Unknown command: '{}'", opts.command);
