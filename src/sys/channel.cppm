@@ -535,12 +535,16 @@ public:
         auto index_res = ChannelIndex::parse_toml(*content);
         if (!index_res) return index_res;
 
-        // Cache index locally
+        // Cache index locally, best effort: a read-only or missing cache dir
+        // must not fail the sync itself.
         std::filesystem::path local_idx = cache_dir / "channels" / (ch.name + ".toml");
-        std::filesystem::create_directories(local_idx.parent_path());
-        std::ofstream f(local_idx);
-        if (f.is_open()) {
-            f << *content;
+        std::error_code cache_ec;
+        std::filesystem::create_directories(local_idx.parent_path(), cache_ec);
+        if (!cache_ec) {
+            std::ofstream f(local_idx);
+            if (f.is_open()) {
+                f << *content;
+            }
         }
 
         return index_res;

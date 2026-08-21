@@ -954,14 +954,45 @@ version = "1:2.0-3"
     sage::config::SystemConfig sys_cfg;
     sys_cfg.providers["virtual/init"] = "openrc";
     sys_cfg.capabilities["virtual/init"] = sage::config::CapabilityKind::Exclusive;
-    auto plan_res = sage::rebuild::ReconcileEngine::calculate_diff(*db_res, sys_cfg, repo_pool);
+    sys_cfg.cache_dir = temp_dir / "cache";
+
+    // Reconcile installs provider packages for real now, so back it with a
+    // local file:// channel whose openrc archive carries an actual payload.
+    auto reconcile_repo = temp_dir / "reconcile-repo";
+    auto openrc_pkg_dir = temp_dir / "openrc-pkg";
+    std::filesystem::create_directories(openrc_pkg_dir / "usr/bin");
+    {
+        std::ofstream openrc_bin(openrc_pkg_dir / "usr/bin/openrc");
+        openrc_bin << "#!/bin/sh\nexit 0\n";
+    }
+    std::filesystem::create_directories(reconcile_repo);
+    if (!sage::archive::create_package(openrc_pkg, openrc_pkg_dir,
+            reconcile_repo / "openrc-0.54.0-1-x86_64.pkg.tar.zst")) {
+        sage::util::log_error("Failed to pack the reconcile fixture archive");
+        return 1;
+    }
+    {
+        std::ofstream idx(reconcile_repo / "index.toml");
+        idx << "schema_version = 1\n\n[channel]\nname = \"reconcile-test\"\n\n[[packages]]\n"
+            << "name = \"openrc\"\nversion = \"0.54.0\"\nrelease = \"1\"\n"
+            << "channel = \"system\"\narch = \"x86_64\"\n"
+            << "file = \"openrc-0.54.0-1-x86_64.pkg.tar.zst\"\n";
+    }
+    sage::config::ChannelConfig reconcile_channel;
+    reconcile_channel.name = "reconcile-test";
+    reconcile_channel.url = "file://" + reconcile_repo.string();
+    reconcile_channel.enabled = true;
+    sys_cfg.channels.push_back(reconcile_channel);
+
+    auto plan_res = sage::rebuild::ReconcileEngine::calculate_diff(*db_res, sys_cfg);
     if (!plan_res) {
         sage::util::log_error("Reconcile plan failed: {}", plan_res.error());
         return 1;
     }
     auto exec_res = sage::rebuild::ReconcileEngine::execute(*db_res, *plan_res, extract_root, false);
-    if (!exec_res) {
-        sage::util::log_error("Reconcile execute failed: {}", exec_res.error());
+    if (!exec_res || !std::filesystem::exists(extract_root / "usr/bin/openrc")) {
+        sage::util::log_error("Reconcile execute did not install the new provider payload: {}",
+            exec_res.error_or("payload missing"));
         return 1;
     }
 
@@ -988,7 +1019,7 @@ version = "1:2.0-3"
         }
     }
     auto stale_plan = sage::rebuild::ReconcileEngine::calculate_diff(
-        *reconcile_race_db, sys_cfg, repo_pool);
+        *reconcile_race_db, sys_cfg);
     auto replacement_init = old_init;
     replacement_init.version = sage::package::Version::parse("2.0.0-1");
     {
@@ -1026,7 +1057,7 @@ version = "1:2.0-3"
         }
     }
     auto stale_provider_plan = sage::rebuild::ReconcileEngine::calculate_diff(
-        *reconcile_race_db, sys_cfg, repo_pool);
+        *reconcile_race_db, sys_cfg);
     {
         auto update_txn = reconcile_race_db->begin_write_txn();
         if (!stale_provider_plan || !update_txn

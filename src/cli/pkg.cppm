@@ -59,69 +59,14 @@ export int cmd_install(const CliOptions& opts) {
     auto installed_packages = std::move(*installed_res);
 
     // 1. Gather Available Package Pool from Channels and Local Repos
-    std::vector<sage::package::PackageManifest> pool;
-    std::map<sage::package::PackageIdentity, std::filesystem::path> package_archive_map;
-
-    auto channel_configs = cfg.channels;
-    std::ranges::stable_sort(channel_configs, std::greater{},
-        &sage::config::ChannelConfig::priority);
-    bool channel_filter_matched = opts.channel_filter.empty();
-    for (const auto& ch_cfg : channel_configs) {
-        if (!ch_cfg.enabled) continue;
-        // --channel narrows the pool to one channel. Installed packages are
-        // still added below, so a restricted install can still satisfy
-        // constraints that are already met on the system.
-        if (!opts.channel_filter.empty() && ch_cfg.name != opts.channel_filter) continue;
-        channel_filter_matched = true;
-        sage::channel::Channel ch;
-        ch.name = ch_cfg.name;
-        ch.url = ch_cfg.url;
-        ch.scope = sage::channel::parse_scope(ch_cfg.scope);
-        ch.priority = ch_cfg.priority;
-
-        // Fetch channel index
-        auto idx_res = sage::channel::ProfileManager::sync_channel(ch, cfg.cache_dir);
-        if (idx_res) {
-            for (const auto& pkg : idx_res->available_packages) {
-                pool.push_back(pkg);
-                // Map archive url / path
-                std::filesystem::path dir_base;
-                if (ch.url.starts_with("file://")) {
-                    dir_base = std::filesystem::path(ch.url.substr(7));
-                } else if (ch.url.starts_with("/")) {
-                    dir_base = std::filesystem::path(ch.url);
-                } else {
-                    dir_base = cfg.cache_dir / "pkg";
-                }
-
-                std::filesystem::path local_p;
-                if (!pkg.file.empty()) {
-                    // Use the file field from index if present
-                    local_p = dir_base / pkg.file;
-                } else {
-                    // Fallback to old naming scheme for backward compatibility
-                    local_p = dir_base / std::format("{}-{}-{}-{}.pkg.tar.zst", pkg.name, pkg.version.ver, pkg.version.rel, pkg.arch);
-                    if (!std::filesystem::exists(local_p)) {
-                        local_p = dir_base / std::format("{}-{}-{}.pkg.tar.zst", pkg.name, pkg.version.ver, pkg.version.rel);
-                    }
-                    if (!std::filesystem::exists(local_p)) {
-                        local_p = dir_base / std::format("{}-{}.pkg.tar.zst", pkg.name, pkg.version.ver);
-                    }
-                }
-                // Equal-version solver ties keep the first candidate. Preserve
-                // the same priority-ordered source here so metadata and payload
-                // always come from one repository.
-                package_archive_map.try_emplace(
-                    sage::package::package_identity(pkg), std::move(local_p));
-            }
-        }
-    }
-
-    if (!channel_filter_matched) {
-        sage::util::log_error("No enabled channel named '{}' is configured for '{}'",
-            opts.channel_filter, opts.target_root.string());
+    auto snapshot_res = sage::rebuild::fetch_repo_snapshot(cfg, opts.channel_filter);
+    if (!snapshot_res) {
+        sage::util::log_error("{}", snapshot_res.error());
         return 1;
     }
+    auto snapshot = std::move(*snapshot_res);
+    auto& pool = snapshot.pool;
+    auto& package_archive_map = snapshot.archives;
 
     // Include already-installed packages in the pool so that installed providers
     // (e.g. glibc providing so:libc.so.6) satisfy dependencies during bootstrap,
@@ -840,12 +785,8 @@ export int cmd_remove(const CliOptions& opts) {
                 files_to_delete.push_back(std::move(fe));
             }
         }
-        auto path_depth = [](std::string_view path) {
-            const auto relative = std::filesystem::path(sage::util::clean_rel_path(path));
-            return static_cast<size_t>(std::distance(relative.begin(), relative.end()));
-        };
         std::ranges::stable_sort(files_to_delete, [&](const auto& lhs, const auto& rhs) {
-            return path_depth(lhs.path) > path_depth(rhs.path);
+            return sage::util::path_depth(lhs.path) > sage::util::path_depth(rhs.path);
         });
 
         std::string my_owner = std::format("{}:{}", pkg_name, pkg.channel);
@@ -968,8 +909,7 @@ export int cmd_rebuild(const CliOptions& opts) {
         return 1;
     }
 
-    std::vector<sage::package::PackageManifest> pool;
-    auto plan_res = sage::rebuild::ReconcileEngine::calculate_diff(*db_res, *cfg_res, pool);
+    auto plan_res = sage::rebuild::ReconcileEngine::calculate_diff(*db_res, *cfg_res);
     if (!plan_res) {
         sage::util::log_error("Failed to calculate reconcile plan: {}", plan_res.error());
         return 1;

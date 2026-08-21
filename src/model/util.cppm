@@ -168,6 +168,13 @@ inline std::string clean_rel_path(std::string_view path) {
     return std::string(path);
 }
 
+// Number of components in a relative package path; file removal walks deepest
+// first so parent directories empty out and can be pruned.
+inline size_t path_depth(std::string_view path) {
+    const auto relative = std::filesystem::path(clean_rel_path(path));
+    return static_cast<size_t>(std::distance(relative.begin(), relative.end()));
+}
+
 // Process environment. The CLI layer stays pure `import sage;`, so the one
 // POSIX call it needs (setenv, absent from std) lives here.
 inline bool set_env(std::string_view key, std::string_view value) {
