@@ -112,10 +112,7 @@ public:
         return t;
     }
 
-    static size_t run(
-        const TriggerContext& ctx,
-        std::set<std::string>& already_run)
-    {
+    static void run(const TriggerContext& ctx) {
         // Capabilities brought in by this transaction, for on_capability.
         std::set<std::string> txn_capabilities;
         for (const auto& pkg : ctx.transaction_packages) {
@@ -131,7 +128,9 @@ public:
 
         std::ranges::stable_sort(candidates, {}, &package::Trigger::priority);
 
-        size_t executed_count = 0;
+        // One resolved command runs at most once per transaction, however many
+        // triggers and however many touched files ask for it.
+        std::set<std::string> already_run;
 
         for (const auto& trig : candidates) {
             if (!fires(trig, ctx, txn_capabilities)) continue;
@@ -139,18 +138,9 @@ public:
             auto cmd = resolve_command(trig, ctx);
             if (!cmd) continue;
 
-            if (already_run.contains(*cmd)) continue;
-            if (execute(*cmd, trig.name, ctx)) {
-                already_run.insert(*cmd);
-                ++executed_count;
-            }
+            if (!already_run.insert(*cmd).second) continue;
+            (void)execute(*cmd, trig.name, ctx);
         }
-        return executed_count;
-    }
-
-    static size_t run(const TriggerContext& ctx) {
-        std::set<std::string> already_run;
-        return run(ctx, already_run);
     }
 
 private:
@@ -254,6 +244,7 @@ private:
         int ret = std::system(full.c_str());
         if (ret != 0) {
             util::log_warn("Trigger '{}' failed (exit {}): {}", trigger_name, ret, full);
+            return false;
         }
         return true;
     }
