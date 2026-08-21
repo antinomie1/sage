@@ -441,17 +441,6 @@ public:
             return {};
         }
 
-        auto pending_fs = db.pending_filesystem_transactions();
-        if (!pending_fs) return std::unexpected(pending_fs.error());
-        for (const auto& id : *pending_fs) {
-            auto recovered = archive::FilesystemTransaction::recover(sysroot, id);
-            if (!recovered) return std::unexpected(recovered.error());
-            auto finished = db.finish_filesystem_transaction(id);
-            if (!finished) return std::unexpected(finished.error());
-            auto retired = archive::FilesystemTransaction::retire(sysroot, id);
-            if (!retired) return std::unexpected(retired.error());
-        }
-
         auto wtxn = db.begin_write_txn();
         if (!wtxn) return std::unexpected(std::string("Failed to open database write transaction"));
         auto filesystem_txn_res = archive::FilesystemTransaction::create(sysroot);
@@ -636,13 +625,14 @@ public:
         if (!pending) return std::unexpected(pending.error());
         auto commit_res = wtxn->commit();
         if (!commit_res) return std::unexpected("Database commit failed: " + commit_res.error());
+        filesystem_txn.release();
         auto published = filesystem_txn.publish();
         if (!published) return std::unexpected(
             "Database committed; filesystem publication will be recovered: " + published.error());
         auto finished = db.finish_filesystem_transaction(filesystem_txn.id());
         if (!finished) return std::unexpected(finished.error());
         auto retired = archive::FilesystemTransaction::retire(sysroot, filesystem_txn.id());
-        if (!retired) return std::unexpected(retired.error());
+        if (!retired) util::log_warn("{}", retired.error());
 
         // 5. Execute post-transaction triggers
         TriggerContext trig_ctx;

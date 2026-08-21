@@ -128,4 +128,86 @@ inline std::expected<util::RootLock, int> acquire_root_write_lock(const CliOptio
     return std::expected<util::RootLock, int>(std::move(*lock));
 }
 
+inline void warn_pending_filesystem_transactions(sage::db::Database& db) {
+    auto pending = db.pending_filesystem_transactions();
+    if (pending && !pending->empty()) {
+        sage::util::log_warn(
+            "Filesystem state has {} pending transaction(s); run any write command to recover them",
+            pending->size());
+    }
+}
+
+inline std::expected<void, std::string> run_full_postprocessing(
+    sage::db::Database& db, const std::filesystem::path& root,
+    const sage::config::SystemConfig& cfg,
+    const std::optional<std::filesystem::path>& trigger_sysroot = std::nullopt)
+{
+    auto installed = db.list_installed_packages();
+    if (!installed) return std::unexpected(installed.error());
+    std::vector<sage::channel::Channel> channels;
+    for (const auto& configured : cfg.channels) {
+        sage::channel::Channel channel;
+        channel.name = configured.name;
+        channel.scope = sage::channel::parse_scope(configured.scope);
+        channel.enabled = configured.enabled;
+        channels.push_back(std::move(channel));
+    }
+    for (const auto& pkg : *installed) {
+        const auto spec = sage::channel::SubChannelSpec::parse(pkg.channel);
+        if (spec.scope == sage::channel::ChannelScope::Toolchain
+            && !spec.category.empty() && !spec.slot.empty()) {
+            auto activated = sage::channel::ProfileManager::switch_active_toolchain(
+                root, spec.category, spec.slot);
+            if (!activated) sage::util::log_warn(
+                "Failed to reactivate toolchain '{}:{}': {}",
+                spec.category, spec.slot, activated.error());
+        }
+    }
+    if (auto profile = sage::channel::ProfileManager::regenerate_fhs_profile(root, channels); !profile)
+        sage::util::log_warn("Failed to regenerate FHS profile after recovery: {}", profile.error());
+
+    sage::rebuild::TriggerContext context;
+    context.sysroot = trigger_sysroot.value_or(root);
+    context.installed_packages = *installed;
+    context.transaction_packages = *installed;
+    context.providers = cfg.providers;
+    std::unordered_set<std::string> touched_paths;
+    for (const auto& pkg : *installed) {
+        context.touched_files.insert(context.touched_files.end(), pkg.files.begin(), pkg.files.end());
+        for (const auto& file : pkg.files) touched_paths.insert(file.path);
+        auto registered = db.get_package_files(pkg.name);
+        if (!registered) return std::unexpected(registered.error());
+        for (const auto& path : *registered) {
+            if (touched_paths.insert(path).second)
+                context.touched_files.push_back({.path = path});
+        }
+    }
+    sage::rebuild::TriggerEngine::run(context);
+    return {};
+}
+
+inline std::expected<sage::db::Database, std::string> open_write_database(
+    const sage::config::SystemConfig& cfg, const std::filesystem::path& root,
+    const std::optional<std::filesystem::path>& trigger_sysroot = std::nullopt)
+{
+    auto database = sage::db::Database::open(cfg.db_path);
+    if (!database) return std::unexpected(database.error());
+    auto pending = database->pending_filesystem_transactions();
+    if (!pending) return std::unexpected(pending.error());
+    for (const auto& id : *pending) {
+        auto replayed = sage::archive::FilesystemTransaction::recover(root, id);
+        if (!replayed) return std::unexpected(
+            "Cannot recover filesystem transaction '" + id + "': " + replayed.error());
+        auto finished = database->finish_filesystem_transaction(id);
+        if (!finished) return std::unexpected(finished.error());
+        if (auto retired = sage::archive::FilesystemTransaction::retire(root, id); !retired)
+            sage::util::log_warn("{}", retired.error());
+    }
+    if (!pending->empty()) {
+        auto processed = run_full_postprocessing(*database, root, cfg, trigger_sysroot);
+        if (!processed) return std::unexpected(processed.error());
+    }
+    return database;
+}
+
 } // namespace sage::cli

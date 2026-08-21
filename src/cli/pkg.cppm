@@ -8,22 +8,6 @@ import sage.cli;
 
 namespace sage::cli {
 
-inline std::expected<void, std::string> recover_filesystem_transactions(
-    sage::db::Database& db, const std::filesystem::path& root)
-{
-    auto pending = db.pending_filesystem_transactions();
-    if (!pending) return std::unexpected(pending.error());
-    for (const auto& id : *pending) {
-        auto replayed = sage::archive::FilesystemTransaction::recover(root, id);
-        if (!replayed) return std::unexpected("Cannot recover filesystem transaction '" + id + "': " + replayed.error());
-        auto finished = db.finish_filesystem_transaction(id);
-        if (!finished) return std::unexpected(finished.error());
-        auto retired = sage::archive::FilesystemTransaction::retire(root, id);
-        if (!retired) return std::unexpected(retired.error());
-    }
-    return {};
-}
-
 // ============================================================================
 // End-to-End `sage install <PKG...>` Implementation
 // ============================================================================
@@ -66,16 +50,12 @@ export int cmd_install(
     }
     const auto& cfg = *cfg_res;
 
-    auto db_res = sage::db::Database::open(cfg.db_path);
+    auto db_res = open_write_database(cfg, opts.target_root, trigger_sysroot);
     if (!db_res) {
         sage::util::log_error("Failed to open database at {}: {}", cfg.db_path.string(), db_res.error());
         return 1;
     }
     auto& db = *db_res;
-    if (auto recovered = recover_filesystem_transactions(db, opts.target_root); !recovered) {
-        sage::util::log_error("{}", recovered.error());
-        return 1;
-    }
     auto installed_res = db.list_installed_packages();
     if (!installed_res) {
         sage::util::log_error("Installed package database is inconsistent: {}", installed_res.error());
@@ -551,6 +531,7 @@ export int cmd_install(
             sage::util::log_error("Failed to commit package '{}': {}", installed_pkg.name, package_commit.error());
             return 1;
         }
+        filesystem_txn.release();
         auto published = filesystem_txn.publish();
         if (!published) {
             sage::util::log_error("Package metadata committed; filesystem publication will be recovered: {}", published.error());
@@ -562,8 +543,7 @@ export int cmd_install(
         }
         if (auto retired = sage::archive::FilesystemTransaction::retire(
                 opts.target_root, filesystem_txn.id()); !retired) {
-            sage::util::log_error("{}", retired.error());
-            return 1;
+            sage::util::log_warn("{}", retired.error());
         }
 
         committed_packages.push_back(installed_pkg);
@@ -609,16 +589,12 @@ export int cmd_remove(const CliOptions& opts) {
     }
     const auto& cfg = *cfg_res;
 
-    auto db_res = sage::db::Database::open(cfg.db_path);
+    auto db_res = open_write_database(cfg, opts.target_root);
     if (!db_res) {
         sage::util::log_error("Failed to open database: {}", db_res.error());
         return 1;
     }
     auto& db = *db_res;
-    if (auto recovered = recover_filesystem_transactions(db, opts.target_root); !recovered) {
-        sage::util::log_error("{}", recovered.error());
-        return 1;
-    }
 
     auto all_installed = db.list_installed_packages();
     if (!all_installed) {
@@ -980,6 +956,7 @@ export int cmd_remove(const CliOptions& opts) {
     if (!pending) return 1;
     auto commit_res = wtxn->commit();
     if (!commit_res) return 1;
+    filesystem_txn.release();
     auto published = filesystem_txn.publish();
     if (!published) {
         sage::util::log_error("Removal committed; filesystem publication will be recovered: {}", published.error());
@@ -987,7 +964,8 @@ export int cmd_remove(const CliOptions& opts) {
     }
     if (auto finished = db.finish_filesystem_transaction(filesystem_txn.id()); !finished) return 1;
     if (auto retired = sage::archive::FilesystemTransaction::retire(
-            opts.target_root, filesystem_txn.id()); !retired) return 1;
+            opts.target_root, filesystem_txn.id()); !retired)
+        sage::util::log_warn("{}", retired.error());
 
     // Removing a kernel is as much a reason to regenerate the initramfs and
     // the bootloader entries as installing one, so removal runs the same
@@ -1031,7 +1009,7 @@ export int cmd_rebuild(const CliOptions& opts) {
         return 1;
     }
 
-    auto db_res = sage::db::Database::open(cfg_res->db_path);
+    auto db_res = open_write_database(*cfg_res, opts.target_root);
     if (!db_res) {
         sage::util::log_error("Failed to open database: {}", db_res.error());
         return 1;

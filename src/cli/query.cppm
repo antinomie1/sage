@@ -27,6 +27,7 @@ collect_installed(const CliOptions& opts, std::string_view pattern) {
     auto db_res = sage::db::Database::open(
         cfg_res ? cfg_res->db_path : std::filesystem::path("/var/lib/sage/data.mdb"), true);
     if (!db_res) return std::unexpected(db_res.error());
+    warn_pending_filesystem_transactions(*db_res);
 
     auto list = db_res->list_installed_packages();
     if (!list) return std::unexpected(list.error());
@@ -115,6 +116,7 @@ export int cmd_query(const CliOptions& opts) {
         return 0;
     }
     auto& db = *db_res;
+    warn_pending_filesystem_transactions(db);
 
     if (sub == "files" && opts.args.size() >= 2) {
         std::string pkg_name = opts.args[1];
@@ -252,6 +254,7 @@ export int cmd_verify(const CliOptions& opts) {
         sage::util::log_error("Failed to open database at {}: {}", cfg_res->db_path.string(), db_res.error());
         return 1;
     }
+    warn_pending_filesystem_transactions(*db_res);
 
     std::vector<sage::package::PackageManifest> targets;
     if (opts.args.empty()) {
@@ -354,6 +357,7 @@ export int cmd_status(const CliOptions& opts) {
         std::println("Installed Packages: (database unavailable)");
         return 0;
     }
+    warn_pending_filesystem_transactions(*db_res);
     auto installed = db_res->list_installed_packages();
     if (!installed) {
         sage::util::log_error("Installed package database is inconsistent: {}", installed.error());

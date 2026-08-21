@@ -223,6 +223,7 @@ export int cmd_build(const CliOptions& opts) {
                 "{} external soname(s) go unchecked -- expected while bootstrapping, a bug otherwise.",
                 host_cfg ? host_cfg->db_path.string() : std::string("<unknown>"), external_sonames.size());
         } else {
+            warn_pending_filesystem_transactions(*host_db);
             std::vector<std::string> unsatisfied;
             for (const auto& soname : external_sonames) {
                 if (host_db->get_provider("so:" + soname)) continue;

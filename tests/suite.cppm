@@ -1,3 +1,6 @@
+module;
+#include <cstdlib>
+
 export module sage.tests;
 
 // Master architecture & subsystem integration suite (`sage-tests` binary).
@@ -165,6 +168,83 @@ export int run_all() {
         || !sage::archive::FilesystemTransaction::retire(replay_root, replay_id)
         || std::filesystem::exists(replay_journal)) {
         sage::util::log_error("Filesystem transaction replay evidence lifecycle failed");
+        return 1;
+    }
+
+    // Preparing a staged tree must fsync real directories without following
+    // package symlinks such as the conventional lib -> usr/lib layout.
+    auto symlink_root = temp_dir / "filesystem-symlink-root";
+    auto symlink_txn_result = sage::archive::FilesystemTransaction::create(symlink_root);
+    if (!symlink_txn_result) return 1;
+    {
+        auto symlink_txn = std::move(*symlink_txn_result);
+        std::filesystem::create_directories(symlink_txn.payload_root() / "usr/lib");
+        std::filesystem::create_directory_symlink("usr/lib", symlink_txn.payload_root() / "lib");
+        if (!symlink_txn.install("lib") || !symlink_txn.prepare()) {
+            sage::util::log_error("Filesystem transaction treated a package symlink as a directory");
+            return 1;
+        }
+    }
+    if (std::filesystem::exists(symlink_root / "var/lib/sage/transactions")) {
+        auto entries = std::filesystem::directory_iterator(
+            symlink_root / "var/lib/sage/transactions");
+        if (entries != std::filesystem::directory_iterator{}) {
+            sage::util::log_error("Uncommitted filesystem transaction escaped RAII cleanup");
+            return 1;
+        }
+    }
+
+    // A write-side database open is the recovery entrance used before command
+    // decisions. Recover a faulted publish and assert that full-tree trigger
+    // post-processing is rerun from the committed LMDB state.
+    auto recovery_root = temp_dir / "full-recovery-root";
+    auto recovery_count = temp_dir / "full-recovery-trigger-count";
+    sage::config::SystemConfig recovery_cfg;
+    recovery_cfg.db_path = recovery_root / "var/lib/sage/data.mdb";
+    recovery_cfg.root_dir = recovery_root;
+    auto recovery_db = sage::db::Database::open(recovery_cfg.db_path);
+    auto recovery_fs_result = sage::archive::FilesystemTransaction::create(recovery_root);
+    if (!recovery_db || !recovery_fs_result) return 1;
+    auto recovery_fs = std::move(*recovery_fs_result);
+    std::filesystem::create_directories(recovery_fs.payload_root() / "usr/share/recovery");
+    std::ofstream(recovery_fs.payload_root() / "usr/share/recovery/input") << "recovered\n";
+    if (!recovery_fs.install("usr/share/recovery/input") || !recovery_fs.prepare()) return 1;
+    sage::package::PackageManifest recovery_package;
+    recovery_package.name = "recovery-package";
+    recovery_package.version = sage::package::Version::parse("1.0.0-1");
+    recovery_package.channel = "system";
+    recovery_package.files.push_back({.path = "usr/share/recovery/input"});
+    sage::package::Trigger recovery_trigger;
+    recovery_trigger.name = "recovery-trigger";
+    recovery_trigger.on_paths = {"usr/share/recovery/"};
+    recovery_trigger.exec = "/bin/sh";
+    recovery_trigger.args = {"-c", "'test -e \""
+        + (recovery_root / "usr/share/recovery/input").string()
+        + "\" && echo x >> \"" + recovery_count.string() + "\"'"};
+    recovery_package.triggers = {recovery_trigger};
+    auto recovery_write = recovery_db->begin_write_txn();
+    if (!recovery_write
+        || !recovery_db->put_package(*recovery_write, recovery_package)
+        || !recovery_db->add_pending_filesystem_transaction(*recovery_write, recovery_fs.id())
+        || !recovery_write->commit()) return 1;
+    recovery_fs.release();
+    ::setenv("SAGE_FAULT_FS_PUBLISH_AFTER", "1", 1);
+    auto interrupted_publish = recovery_fs.publish();
+    ::unsetenv("SAGE_FAULT_FS_PUBLISH_AFTER");
+    recovery_db = std::unexpected(std::string("closed after fault injection"));
+    auto recovered_database = open_write_database(recovery_cfg, recovery_root, "/");
+    auto recovered_pending = recovered_database
+        ? recovered_database->pending_filesystem_transactions()
+        : std::expected<std::vector<std::string>, std::string>(
+            std::unexpected("recovery database did not open"));
+    std::ifstream recovery_count_input(recovery_count, std::ios::binary);
+    const std::string recovery_count_contents(
+        std::istreambuf_iterator<char>(recovery_count_input), {});
+    if (interrupted_publish || !recovered_database
+        || !std::filesystem::exists(recovery_root / "usr/share/recovery/input")
+        || recovery_count_contents != "x\n"
+        || !recovered_pending || !recovered_pending->empty()) {
+        sage::util::log_error("Write-entry recovery skipped publication or full post-processing");
         return 1;
     }
 

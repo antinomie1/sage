@@ -54,13 +54,25 @@ public:
         return tx;
     }
 
-    FilesystemTransaction(FilesystemTransaction&&) noexcept = default;
-    FilesystemTransaction& operator=(FilesystemTransaction&&) noexcept = default;
+    ~FilesystemTransaction() {
+        if (!committed_) {
+            std::error_code ignored;
+            std::filesystem::remove_all(directory_, ignored);
+        }
+    }
+    FilesystemTransaction(FilesystemTransaction&& other) noexcept
+        : id_(std::move(other.id_)), root_(std::move(other.root_)),
+          directory_(std::move(other.directory_)), payload_(std::move(other.payload_)),
+          journal_(std::move(other.journal_)), committed_(other.committed_) {
+        other.committed_ = true;
+    }
+    FilesystemTransaction& operator=(FilesystemTransaction&&) = delete;
     FilesystemTransaction(const FilesystemTransaction&) = delete;
     FilesystemTransaction& operator=(const FilesystemTransaction&) = delete;
 
     [[nodiscard]] const std::string& id() const noexcept { return id_; }
     [[nodiscard]] const std::filesystem::path& payload_root() const noexcept { return payload_; }
+    void release() noexcept { committed_ = true; }
 
     std::expected<void, std::string> install(std::string_view path) {
         return append('I', path, true);
@@ -102,7 +114,7 @@ public:
         if (payload_directory.get() < 0 || ::fsync(payload_directory.get()) != 0)
             return std::unexpected("Cannot sync staged payload directory: " + std::string(std::strerror(errno)));
         for (const auto& entry : std::filesystem::recursive_directory_iterator(payload_)) {
-            if (!entry.is_directory()) continue;
+            if (entry.is_symlink() || !entry.is_directory()) continue;
             UniqueFd staged_directory(::open(entry.path().c_str(), flags | O_DIRECTORY | O_NOFOLLOW));
             if (staged_directory.get() < 0 || ::fsync(staged_directory.get()) != 0)
                 return std::unexpected("Cannot sync staged directory: " + std::string(std::strerror(errno)));
@@ -224,6 +236,7 @@ private:
 
     std::string id_;
     std::filesystem::path root_, directory_, payload_, journal_;
+    bool committed_{false};
 };
 
 inline std::expected<void, std::string> remove_path_anchored(
