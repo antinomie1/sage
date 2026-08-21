@@ -172,8 +172,9 @@ int cmd_build(const CliOptions& opts) {
         for (const auto& entry : std::filesystem::recursive_directory_iterator(pkg_dir, std::filesystem::directory_options::skip_permission_denied)) {
             entries.push_back(entry);
         }
-        std::ranges::sort(entries, {}, [&](const auto& entry) {
-            return entry.path().lexically_relative(pkg_dir).generic_string();
+        std::sort(entries.begin(), entries.end(), [&](const auto& lhs, const auto& rhs) {
+            return lhs.path().lexically_relative(pkg_dir).generic_string()
+                < rhs.path().lexically_relative(pkg_dir).generic_string();
         });
 
         for (const auto& entry : entries) {

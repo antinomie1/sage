@@ -396,8 +396,9 @@ inline std::expected<void, std::string> create_package(
         for (const auto& entry : std::filesystem::recursive_directory_iterator(data_dir, std::filesystem::directory_options::none)) {
             entries.push_back(entry);
         }
-        std::ranges::sort(entries, {}, [&](const auto& entry) {
-            return entry.path().lexically_relative(data_dir).generic_string();
+        std::sort(entries.begin(), entries.end(), [&](const auto& lhs, const auto& rhs) {
+            return lhs.path().lexically_relative(data_dir).generic_string()
+                < rhs.path().lexically_relative(data_dir).generic_string();
         });
 
         for (const auto& entry : entries) {
