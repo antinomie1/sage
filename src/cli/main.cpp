@@ -365,12 +365,19 @@ int cmd_install(const CliOptions& opts) {
                     dir_base = cfg.cache_dir / "pkg";
                 }
 
-                std::filesystem::path local_p = dir_base / std::format("{}-{}-{}-{}.pkg.tar.zst", pkg.name, pkg.version.ver, pkg.version.rel, pkg.arch);
-                if (!std::filesystem::exists(local_p)) {
-                    local_p = dir_base / std::format("{}-{}-{}.pkg.tar.zst", pkg.name, pkg.version.ver, pkg.version.rel);
-                }
-                if (!std::filesystem::exists(local_p)) {
-                    local_p = dir_base / std::format("{}-{}.pkg.tar.zst", pkg.name, pkg.version.ver);
+                std::filesystem::path local_p;
+                if (!pkg.file.empty()) {
+                    // Use the file field from index if present
+                    local_p = dir_base / pkg.file;
+                } else {
+                    // Fallback to old naming scheme for backward compatibility
+                    local_p = dir_base / std::format("{}-{}-{}-{}.pkg.tar.zst", pkg.name, pkg.version.ver, pkg.version.rel, pkg.arch);
+                    if (!std::filesystem::exists(local_p)) {
+                        local_p = dir_base / std::format("{}-{}-{}.pkg.tar.zst", pkg.name, pkg.version.ver, pkg.version.rel);
+                    }
+                    if (!std::filesystem::exists(local_p)) {
+                        local_p = dir_base / std::format("{}-{}.pkg.tar.zst", pkg.name, pkg.version.ver);
+                    }
                 }
                 package_archive_map[pkg.name] = local_p;
             }

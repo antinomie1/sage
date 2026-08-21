@@ -167,6 +167,7 @@ struct ChannelIndex {
                     m.channel = (*ptab)["channel"].value_or("system");
                     m.arch = (*ptab)["arch"].value_or("x86_64");
                     m.installed_size = (*ptab)["installed_size"].value_or(0ULL);
+                    m.file = (*ptab)["file"].value_or("");
 
                     if (auto* deps = ptab->get_as<vendor::toml::array>("dependencies")) {
                         for (auto&& d : *deps) {

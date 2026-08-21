@@ -437,6 +437,7 @@ struct PackageManifest {
     std::string channel{"system"};
     std::string arch{"x86_64"};
     uint64_t installed_size{0};
+    std::string file;  // Relative path in repository (e.g. "acl/acl-2.4.0-2-x86_64.pkg.tar.zst")
 
     std::vector<Dependency> dependencies;
     std::vector<std::string> provides; // e.g. "virtual/init", "so:libz.so.1"

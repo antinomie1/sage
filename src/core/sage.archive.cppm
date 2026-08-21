@@ -640,8 +640,8 @@ inline std::expected<void, std::string> create_package(
 // ============================================================================
 
 inline std::expected<void, std::string> generate_repo_index(
-    const std::filesystem::path& repo_dir, 
-    std::string_view channel_name = "core") 
+    const std::filesystem::path& repo_dir,
+    std::string_view channel_name = "core")
 {
     if (!std::filesystem::exists(repo_dir)) {
         return std::unexpected("Repository directory does not exist: " + repo_dir.string());
@@ -654,31 +654,43 @@ inline std::expected<void, std::string> generate_repo_index(
     ss << "updated_at = \"" << "2026-08-20T00:00:00Z" << "\"\n\n";
 
     size_t count = 0;
-    for (const auto& entry : std::filesystem::directory_iterator(repo_dir)) {
+
+    // Collect all .pkg.tar.zst files recursively, building relative paths
+    std::vector<std::pair<std::filesystem::path, std::string>> packages;
+
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(
+             repo_dir,
+             std::filesystem::directory_options::skip_permission_denied)) {
         if (entry.is_regular_file() && entry.path().string().ends_with(".pkg.tar.zst")) {
-            auto temp_sysroot = std::filesystem::temp_directory_path() / ("sage_idx_" + std::to_string(count));
-            std::filesystem::remove_all(temp_sysroot);
-            auto ext_res = extract_package(entry.path(), temp_sysroot);
-            std::filesystem::remove_all(temp_sysroot);
-            if (ext_res) {
-                const auto& m = ext_res->manifest;
-                ss << "[[packages]]\n";
-                ss << "name = \"" << m.name << "\"\n";
-                ss << "version = \"" << m.version.ver << "\"\n";
-                ss << "release = \"" << m.version.rel << "\"\n";
-                ss << "description = \"" << m.description << "\"\n";
-                ss << "license = \"" << m.license << "\"\n";
-                ss << "channel = \"" << m.channel << "\"\n";
-                ss << "arch = \"" << m.arch << "\"\n";
-                ss << "installed_size = " << m.installed_size << "\n";
-                ss << "dependencies = [\n";
-                for (const auto& d : m.dependencies) ss << "    \"" << d.to_string() << "\",\n";
-                ss << "]\n";
-                ss << "provides = [\n";
-                for (const auto& p : m.provides) ss << "    \"" << p << "\",\n";
-                ss << "]\n\n";
-                count++;
-            }
+            auto rel_path = entry.path().lexically_relative(repo_dir).generic_string();
+            packages.emplace_back(entry.path(), rel_path);
+        }
+    }
+
+    for (const auto& [abs_path, rel_path] : packages) {
+        auto temp_sysroot = std::filesystem::temp_directory_path() / ("sage_idx_" + std::to_string(count));
+        std::filesystem::remove_all(temp_sysroot);
+        auto ext_res = extract_package(abs_path, temp_sysroot);
+        std::filesystem::remove_all(temp_sysroot);
+        if (ext_res) {
+            const auto& m = ext_res->manifest;
+            ss << "[[packages]]\n";
+            ss << "name = \"" << m.name << "\"\n";
+            ss << "version = \"" << m.version.ver << "\"\n";
+            ss << "release = \"" << m.version.rel << "\"\n";
+            ss << "description = \"" << m.description << "\"\n";
+            ss << "license = \"" << m.license << "\"\n";
+            ss << "channel = \"" << m.channel << "\"\n";
+            ss << "arch = \"" << m.arch << "\"\n";
+            ss << "installed_size = " << m.installed_size << "\n";
+            ss << "file = \"" << rel_path << "\"\n";
+            ss << "dependencies = [\n";
+            for (const auto& d : m.dependencies) ss << "    \"" << d.to_string() << "\",\n";
+            ss << "]\n";
+            ss << "provides = [\n";
+            for (const auto& p : m.provides) ss << "    \"" << p << "\",\n";
+            ss << "]\n\n";
+            count++;
         }
     }
 
