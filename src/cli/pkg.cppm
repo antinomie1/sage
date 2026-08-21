@@ -8,6 +8,20 @@ import sage.cli;
 
 namespace sage::cli {
 
+inline std::expected<void, std::string> recover_filesystem_transactions(
+    sage::db::Database& db, const std::filesystem::path& root)
+{
+    auto pending = db.pending_filesystem_transactions();
+    if (!pending) return std::unexpected(pending.error());
+    for (const auto& id : *pending) {
+        auto replayed = sage::archive::FilesystemTransaction::recover(root, id);
+        if (!replayed) return std::unexpected("Cannot recover filesystem transaction '" + id + "': " + replayed.error());
+        auto finished = db.finish_filesystem_transaction(id);
+        if (!finished) return std::unexpected(finished.error());
+    }
+    return {};
+}
+
 // ============================================================================
 // End-to-End `sage install <PKG...>` Implementation
 // ============================================================================
@@ -56,6 +70,10 @@ export int cmd_install(
         return 1;
     }
     auto& db = *db_res;
+    if (auto recovered = recover_filesystem_transactions(db, opts.target_root); !recovered) {
+        sage::util::log_error("{}", recovered.error());
+        return 1;
+    }
     auto installed_res = db.list_installed_packages();
     if (!installed_res) {
         sage::util::log_error("Installed package database is inconsistent: {}", installed_res.error());
@@ -339,6 +357,12 @@ export int cmd_install(
             sage::util::log_error("Failed to open database transaction for '{}': {}", pkg.name, package_txn.error());
             return 1;
         }
+        auto filesystem_txn_res = sage::archive::FilesystemTransaction::create(opts.target_root);
+        if (!filesystem_txn_res) {
+            sage::util::log_error("Cannot stage filesystem transaction: {}", filesystem_txn_res.error());
+            return 1;
+        }
+        auto filesystem_txn = std::move(*filesystem_txn_res);
 
         auto expected_it = installed_by_name.find(pkg.name);
         auto expected_previous_identity = expected_it != installed_by_name.end()
@@ -396,7 +420,7 @@ export int cmd_install(
         // opt/channels/gcc/15/bin/gcc), so always extract to the target root directly.
         sage::util::log_info("Unpacking {} -> {}...", pkg.name, opts.target_root.string());
         auto ext_res = sage::archive::extract_package(
-            archive_it->second, opts.target_root, &pkg, &inspected_it->second);
+            archive_it->second, opts.target_root, &pkg, &inspected_it->second, &filesystem_txn);
         if (!ext_res) {
             sage::util::log_error("Failed to extract package '{}': {}", pkg.name, ext_res.error());
             return 1;
@@ -437,8 +461,7 @@ export int cmd_install(
                 if (*cur_owner && **cur_owner != old_owner) {
                     continue;
                 }
-                auto remove_res = sage::archive::remove_path_anchored(
-                    opts.target_root, old_path);
+                auto remove_res = filesystem_txn.remove(old_path);
                 if (!remove_res) {
                     sage::util::log_error(
                         "Failed to remove stale file '{}' for '{}': {}",
@@ -486,9 +509,26 @@ export int cmd_install(
             return 1;
         }
 
+        auto prepared = filesystem_txn.prepare();
+        if (!prepared) {
+            sage::util::log_error("Failed to prepare package filesystem transaction: {}", prepared.error());
+            return 1;
+        }
+        auto pending = db.add_pending_filesystem_transaction(*package_txn, filesystem_txn.id());
+        if (!pending) return 1;
+
         auto package_commit = package_txn->commit();
         if (!package_commit) {
             sage::util::log_error("Failed to commit package '{}': {}", installed_pkg.name, package_commit.error());
+            return 1;
+        }
+        auto published = filesystem_txn.publish();
+        if (!published) {
+            sage::util::log_error("Package metadata committed; filesystem publication will be recovered: {}", published.error());
+            return 1;
+        }
+        if (auto finished = db.finish_filesystem_transaction(filesystem_txn.id()); !finished) {
+            sage::util::log_error("Cannot retire filesystem transaction: {}", finished.error());
             return 1;
         }
 
@@ -541,6 +581,10 @@ export int cmd_remove(const CliOptions& opts) {
         return 1;
     }
     auto& db = *db_res;
+    if (auto recovered = recover_filesystem_transactions(db, opts.target_root); !recovered) {
+        sage::util::log_error("{}", recovered.error());
+        return 1;
+    }
 
     auto all_installed = db.list_installed_packages();
     if (!all_installed) {
@@ -743,6 +787,9 @@ export int cmd_remove(const CliOptions& opts) {
 
     auto wtxn = db.begin_write_txn();
     if (!wtxn) return 1;
+    auto filesystem_txn_res = sage::archive::FilesystemTransaction::create(opts.target_root);
+    if (!filesystem_txn_res) return 1;
+    auto filesystem_txn = std::move(*filesystem_txn_res);
 
     // The dependency/removal plan was built before taking the writer lock.
     // Abort if any package was installed, removed, or replaced in that window;
@@ -838,8 +885,7 @@ export int cmd_remove(const CliOptions& opts) {
                 return 1;
             }
 
-            auto remove_res = sage::archive::remove_path_anchored(
-                opts.target_root,
+            auto remove_res = filesystem_txn.remove(
                 relative_path.generic_string(),
                 file_entry.type == sage::package::FileType::Directory || !*cur_owner);
             if (!remove_res) {
@@ -876,8 +922,18 @@ export int cmd_remove(const CliOptions& opts) {
         }
     }
 
+    auto prepared = filesystem_txn.prepare();
+    if (!prepared) return 1;
+    auto pending = db.add_pending_filesystem_transaction(*wtxn, filesystem_txn.id());
+    if (!pending) return 1;
     auto commit_res = wtxn->commit();
     if (!commit_res) return 1;
+    auto published = filesystem_txn.publish();
+    if (!published) {
+        sage::util::log_error("Removal committed; filesystem publication will be recovered: {}", published.error());
+        return 1;
+    }
+    if (auto finished = db.finish_filesystem_transaction(filesystem_txn.id()); !finished) return 1;
 
     // Removing a kernel is as much a reason to regenerate the initramfs and
     // the bootloader entries as installing one, so removal runs the same

@@ -5,6 +5,8 @@ module;
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <cerrno>
+#include <cstdlib>
+#include <cstring>
 
 // Mutations on the target root: anchored cleanup and streaming extraction.
 export module sage.archive:extract;
@@ -23,6 +25,175 @@ using std::size_t;
 using std::uint8_t;
 using std::uint32_t;
 using std::uint64_t;
+
+inline std::expected<std::string, std::string> normalize_data_path(std::string_view);
+inline std::expected<void, std::string> remove_path_anchored(
+    const std::filesystem::path&, std::string_view, bool);
+
+// Durable, redo-only filesystem transaction.  Payloads are built below the
+// target root and the operation list is fsync'd before its id is committed to
+// LMDB.  Publication is idempotent, so startup recovery can finish a commit
+// interrupted at any instruction (including after rename/unlink + fsync).
+export class FilesystemTransaction {
+public:
+    static std::expected<FilesystemTransaction, std::string> create(
+        const std::filesystem::path& root)
+    {
+        auto id = std::format("{:x}-{:x}-{:x}", static_cast<uint64_t>(::getpid()),
+            static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()),
+            static_cast<uint64_t>(std::random_device{}()));
+        FilesystemTransaction tx(root, std::move(id));
+        std::error_code ec;
+        std::filesystem::create_directories(tx.payload_, ec);
+        if (ec) return std::unexpected("Cannot create filesystem transaction: " + ec.message());
+        return tx;
+    }
+
+    FilesystemTransaction(FilesystemTransaction&&) noexcept = default;
+    FilesystemTransaction& operator=(FilesystemTransaction&&) noexcept = default;
+    FilesystemTransaction(const FilesystemTransaction&) = delete;
+    FilesystemTransaction& operator=(const FilesystemTransaction&) = delete;
+
+    [[nodiscard]] const std::string& id() const noexcept { return id_; }
+    [[nodiscard]] const std::filesystem::path& payload_root() const noexcept { return payload_; }
+
+    std::expected<void, std::string> install(std::string_view path) {
+        return append('I', path, true);
+    }
+    std::expected<void, std::string> remove(std::string_view path, bool ignore_nonempty = true) {
+        return append(ignore_nonempty ? 'R' : 'r', path, false);
+    }
+
+    std::expected<void, std::string> prepare() {
+        int flags = O_RDONLY;
+#ifdef O_CLOEXEC
+        flags |= O_CLOEXEC;
+#endif
+        UniqueFd journal(::open(journal_.c_str(), flags));
+        if (journal.get() < 0 || ::fsync(journal.get()) != 0)
+            return std::unexpected("Cannot sync filesystem transaction journal: " + std::string(std::strerror(errno)));
+        UniqueFd directory(::open(directory_.c_str(), flags | O_DIRECTORY));
+        if (directory.get() < 0 || ::fsync(directory.get()) != 0)
+            return std::unexpected("Cannot sync filesystem transaction directory: " + std::string(std::strerror(errno)));
+        UniqueFd payload_directory(::open(payload_.c_str(), flags | O_DIRECTORY));
+        if (payload_directory.get() < 0 || ::fsync(payload_directory.get()) != 0)
+            return std::unexpected("Cannot sync staged payload directory: " + std::string(std::strerror(errno)));
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(payload_)) {
+            if (!entry.is_directory()) continue;
+            UniqueFd staged_directory(::open(entry.path().c_str(), flags | O_DIRECTORY | O_NOFOLLOW));
+            if (staged_directory.get() < 0 || ::fsync(staged_directory.get()) != 0)
+                return std::unexpected("Cannot sync staged directory: " + std::string(std::strerror(errno)));
+        }
+        UniqueFd transaction_root(::open(directory_.parent_path().c_str(), flags | O_DIRECTORY));
+        if (transaction_root.get() < 0 || ::fsync(transaction_root.get()) != 0)
+            return std::unexpected("Cannot sync filesystem transaction root: " + std::string(std::strerror(errno)));
+        return {};
+    }
+
+    std::expected<void, std::string> publish() { return publish_impl(root_, id_); }
+    static std::expected<void, std::string> recover(
+        const std::filesystem::path& root, std::string_view id) {
+        return publish_impl(root, id);
+    }
+
+private:
+    FilesystemTransaction(std::filesystem::path root, std::string id)
+        : root_(std::move(root)), id_(std::move(id)),
+          directory_(root_ / "var/lib/sage/transactions" / id_),
+          payload_(directory_ / "payload"), journal_(directory_ / "operations") {}
+
+    std::expected<void, std::string> append(char kind, std::string_view raw, bool install_op) {
+        auto path = normalize_data_path(raw);
+        if (!path) return std::unexpected(path.error());
+        if (path->contains('\n') || path->contains('\r')) return std::unexpected("Transaction path contains a newline");
+        std::ofstream out(journal_, std::ios::app | std::ios::binary);
+        if (!out) return std::unexpected("Cannot open filesystem transaction journal");
+        out << kind << ' ' << *path << '\n';
+        if (!out.flush()) return std::unexpected("Cannot write filesystem transaction journal");
+        (void)install_op;
+        return {};
+    }
+
+    static std::expected<void, std::string> publish_impl(
+        const std::filesystem::path& root, std::string_view id)
+    {
+        auto dir = root / "var/lib/sage/transactions" / std::string(id);
+        auto payload = dir / "payload";
+        std::ifstream in(dir / "operations", std::ios::binary);
+        if (!in) return std::unexpected("Missing committed filesystem transaction " + std::string(id));
+        std::vector<std::pair<char, std::string>> ops;
+        char kind; std::string path;
+        while (in >> kind && in.get() == ' ' && std::getline(in, path)) ops.emplace_back(kind, path);
+        if (!in.eof()) return std::unexpected("Corrupt filesystem transaction " + std::string(id));
+        size_t published_ops = 0;
+        const auto fault_after = []() -> std::optional<size_t> {
+            const char* value = ::getenv("SAGE_FAULT_FS_PUBLISH_AFTER");
+            if (!value) return std::nullopt;
+            size_t parsed = 0;
+            auto [end, error] = std::from_chars(value, value + std::strlen(value), parsed);
+            if (error != std::errc{} || *end != '\0') return std::nullopt;
+            return parsed;
+        }();
+        auto inject_fault = [&]() -> std::expected<void, std::string> {
+            if (fault_after && ++published_ops >= *fault_after)
+                return std::unexpected("Injected filesystem publication failure");
+            return {};
+        };
+
+        // Removes precede installs, matching upgrades/provider swaps. Replays
+        // tolerate already absent paths and already non-empty directories.
+        for (const auto& [op, rel] : ops) if (op == 'R' || op == 'r') {
+            auto removed = remove_path_anchored(root, rel, true);
+            if (!removed) return removed;
+            if (auto fault = inject_fault(); !fault) return fault;
+        }
+        for (const auto& [op, rel] : ops) if (op == 'I') {
+            auto source = payload / rel;
+            std::error_code ec;
+            auto status = std::filesystem::symlink_status(source, ec);
+            if (ec) return std::unexpected("Missing staged path '" + rel + "': " + ec.message());
+            int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW;
+#ifdef O_CLOEXEC
+            flags |= O_CLOEXEC;
+#endif
+            UniqueFd root_fd(::open(root.c_str(), flags));
+            if (root_fd.get() < 0) return std::unexpected(std::strerror(errno));
+            auto destination = open_anchored_parent(root_fd.get(), std::filesystem::path(rel));
+            if (!destination) return std::unexpected(destination.error());
+            if (std::filesystem::is_directory(status)) {
+                auto made = ensure_anchored_directory(destination->directory.get(), destination->leaf);
+                if (!made) return made;
+            } else {
+                auto removed = remove_anchored_leaf(destination->directory.get(), destination->leaf);
+                if (!removed) return removed;
+                if (std::filesystem::is_symlink(status)) {
+                    auto target = std::filesystem::read_symlink(source, ec);
+                    if (ec || ::symlinkat(target.c_str(), destination->directory.get(), destination->leaf.c_str()) != 0)
+                        return std::unexpected(ec ? ec.message() : std::string(std::strerror(errno)));
+                } else {
+                    std::ifstream input(source, std::ios::binary);
+                    std::vector<uint8_t> bytes(std::istreambuf_iterator<char>(input), {});
+                    auto temp = UniqueTempFile::create(std::move(destination->directory));
+                    if (!temp) return std::unexpected(temp.error());
+                    auto written = temp->write_all(bytes); if (!written) return written;
+                    auto installed = temp->install(destination->leaf,
+                        static_cast<uint32_t>(status.permissions()) & 07777); if (!installed) return installed;
+                    if (auto fault = inject_fault(); !fault) return fault;
+                    continue;
+                }
+                if (::fsync(destination->directory.get()) != 0) return std::unexpected(std::strerror(errno));
+            }
+            if (auto fault = inject_fault(); !fault) return fault;
+        }
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+        if (ec) return std::unexpected("Cannot retire filesystem transaction: " + ec.message());
+        return {};
+    }
+
+    std::filesystem::path root_, directory_, payload_, journal_;
+    std::string id_;
+};
 
 inline std::expected<void, std::string> remove_path_anchored(
     const std::filesystem::path& target_root,
@@ -85,7 +256,8 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
     const std::filesystem::path& archive_path,
     const std::filesystem::path& target_root,
     const package::PackageManifest* expected_manifest = nullptr,
-    const InspectedPackage* expected_inspection = nullptr)
+    const InspectedPackage* expected_inspection = nullptr,
+    FilesystemTransaction* transaction = nullptr)
 {
     auto snapshot_res = PrivateArchiveSnapshot::create(
         archive_path, target_root / "var/lib/sage/tmp");
@@ -121,8 +293,9 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
     result.service = std::move(inspect_res->service);
     result.declared_files = std::move(inspect_res->declared_files);
 
+    const auto& extraction_path = transaction ? transaction->payload_root() : target_root;
     std::error_code root_ec;
-    std::filesystem::create_directories(target_root, root_ec);
+    std::filesystem::create_directories(extraction_path, root_ec);
     if (root_ec) {
         return std::unexpected(
             "Cannot create target root: " + root_ec.message());
@@ -131,7 +304,7 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
 #ifdef O_CLOEXEC
     root_flags |= O_CLOEXEC;
 #endif
-    int root_fd = ::open(target_root.c_str(), root_flags);
+    int root_fd = ::open(extraction_path.c_str(), root_flags);
     if (root_fd < 0) {
         return std::unexpected(
             "Cannot securely open target root: " + std::string(std::strerror(errno)));
@@ -218,6 +391,10 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
             entry.sha256 = hasher.finalize();
         }
 
+        if (transaction) {
+            auto staged = transaction->install(rel_path);
+            if (!staged) return staged;
+        }
         result.extracted_files.push_back(std::move(entry));
         return {};
     });

@@ -73,6 +73,46 @@ public:
         return vendor::lmdb::MdbTxn::begin(env_, false);
     }
 
+    // A filesystem publication is deliberately recorded in the same LMDB
+    // transaction as the package metadata it belongs to.  Consequently a
+    // crash can leave either no marker (the staged tree is disposable), or a
+    // committed marker which is safe to replay idempotently.  There is never
+    // an ambiguous "did LMDB commit?" window.
+    std::expected<void, std::string> add_pending_filesystem_transaction(
+        vendor::lmdb::MdbTxn& txn, std::string_view id)
+    {
+        return dbi_system_.put(txn, std::string("fs-txn/") + std::string(id), "pending");
+    }
+
+    std::expected<std::vector<std::string>, std::string> pending_filesystem_transactions()
+    {
+        auto txn = begin_read_txn();
+        if (!txn) return std::unexpected(txn.error());
+        std::vector<std::string> result;
+        auto cursor = vendor::lmdb::MdbCursor::open(*txn, dbi_system_);
+        if (!cursor) return std::unexpected(cursor.error());
+        std::string_view key, value;
+        auto entry = cursor->first(key, value);
+        if (!entry) return std::unexpected(entry.error());
+        while (*entry) {
+            if (key.starts_with("fs-txn/") && value == "pending") {
+                result.emplace_back(key.substr(7));
+            }
+            entry = cursor->next(key, value);
+            if (!entry) return std::unexpected(entry.error());
+        }
+        return result;
+    }
+
+    std::expected<void, std::string> finish_filesystem_transaction(std::string_view id)
+    {
+        auto txn = begin_write_txn();
+        if (!txn) return std::unexpected(txn.error());
+        auto removed = dbi_system_.del(*txn, std::string("fs-txn/") + std::string(id));
+        if (!removed) return removed;
+        return txn->commit();
+    }
+
     // ========================================================================
     // Packages Table
     // ========================================================================

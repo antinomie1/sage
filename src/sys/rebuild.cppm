@@ -441,8 +441,20 @@ public:
             return {};
         }
 
+        auto pending_fs = db.pending_filesystem_transactions();
+        if (!pending_fs) return std::unexpected(pending_fs.error());
+        for (const auto& id : *pending_fs) {
+            auto recovered = archive::FilesystemTransaction::recover(sysroot, id);
+            if (!recovered) return std::unexpected(recovered.error());
+            auto finished = db.finish_filesystem_transaction(id);
+            if (!finished) return std::unexpected(finished.error());
+        }
+
         auto wtxn = db.begin_write_txn();
         if (!wtxn) return std::unexpected("Failed to open database write transaction");
+        auto filesystem_txn_res = archive::FilesystemTransaction::create(sysroot);
+        if (!filesystem_txn_res) return std::unexpected(filesystem_txn_res.error());
+        auto filesystem_txn = std::move(*filesystem_txn_res);
 
         // The plan was computed before taking the writer lock. Validate every
         // provider binding before changing any of them so a stale reconcile
@@ -506,7 +518,7 @@ public:
                     auto owner = db.get_file_owner(*wtxn, path);
                     if (!owner) return std::unexpected(owner.error());
                     if (*owner && **owner != my_owner) continue;
-                    auto rm_res = archive::remove_path_anchored(sysroot, path);
+                    auto rm_res = filesystem_txn.remove(path);
                     if (!rm_res) {
                         return std::unexpected(std::format(
                             "Failed to remove '{}' of outgoing provider '{}': {}",
@@ -520,12 +532,17 @@ public:
                 if (!provide_res) return std::unexpected(provide_res.error());
                 auto delete_res = db.del_package(*wtxn, removal.name);
                 if (!delete_res) return std::unexpected(delete_res.error());
-                // Remove legacy service scripts
-                service::remove_service(removal.name, service::InitType::OpenRC, sysroot);
-                service::remove_service(removal.name, service::InitType::Systemd, sysroot);
-                service::remove_service(removal.name, service::InitType::Runit, sysroot);
-                service::remove_service(removal.name, service::InitType::Dinit, sysroot);
-                service::remove_service(removal.name, service::InitType::S6, sysroot);
+                // Service artifacts participate in the same recoverable
+                // publication as package payloads.
+                for (const auto& path : std::array{
+                         std::format("etc/init.d/{}", removal.name),
+                         std::format("usr/lib/systemd/system/{}.service", removal.name),
+                         std::format("etc/sv/{}/run", removal.name),
+                         std::format("etc/dinit.d/{}", removal.name),
+                         std::format("etc/s6/services/{}/run", removal.name)}) {
+                    auto staged = filesystem_txn.remove(path);
+                    if (!staged) return std::unexpected(staged.error());
+                }
             }
         }
 
@@ -562,7 +579,7 @@ public:
             }
 
             util::log_info("Unpacking {} -> {}...", selected.name, sysroot.string());
-            auto ext_res = archive::extract_package(archive_it->second, sysroot, &selected, &*inspect_res);
+            auto ext_res = archive::extract_package(archive_it->second, sysroot, &selected, &*inspect_res, &filesystem_txn);
             if (!ext_res) {
                 return std::unexpected(std::format(
                     "Failed to extract package '{}': {}", selected.name, ext_res.error()));
@@ -582,26 +599,35 @@ public:
             installed_now.push_back(std::move(installed_pkg));
         }
 
-        auto commit_res = wtxn->commit();
-        if (!commit_res) return std::unexpected("Database commit failed: " + commit_res.error());
-
-        // 4. Automatically re-generate native service configurations for ALL installed daemons
-        auto installed = db.list_installed_packages();
-        if (!installed) {
-            return std::unexpected("Installed package database is inconsistent after reconcile: " + installed.error());
-        }
+        // Generate services into the staged tree before committing LMDB.
+        auto installed = db.list_installed_packages(*wtxn);
+        if (!installed) return std::unexpected(installed.error());
         size_t gen_count = 0;
         for (const auto& pkg : *installed) {
-            // Check if package has service definition in database or package files
             service::ServiceSpec spec;
             spec.name = pkg.name;
             spec.description = pkg.description;
-            spec.exec_start = "/usr/bin/" + pkg.name; // default convention
-            auto gen_res = service::generate_service(spec, plan.target_init, sysroot);
-            if (gen_res) {
-                gen_count++;
-            }
+            spec.exec_start = "/usr/bin/" + pkg.name;
+            auto generated = service::generate_service(
+                spec, plan.target_init, filesystem_txn.payload_root());
+            if (!generated) continue;
+            auto relative = generated->lexically_relative(filesystem_txn.payload_root()).generic_string();
+            auto staged = filesystem_txn.install(relative);
+            if (!staged) return std::unexpected(staged.error());
+            ++gen_count;
         }
+
+        auto prepared = filesystem_txn.prepare();
+        if (!prepared) return std::unexpected(prepared.error());
+        auto pending = db.add_pending_filesystem_transaction(*wtxn, filesystem_txn.id());
+        if (!pending) return std::unexpected(pending.error());
+        auto commit_res = wtxn->commit();
+        if (!commit_res) return std::unexpected("Database commit failed: " + commit_res.error());
+        auto published = filesystem_txn.publish();
+        if (!published) return std::unexpected(
+            "Database committed; filesystem publication will be recovered: " + published.error());
+        auto finished = db.finish_filesystem_transaction(filesystem_txn.id());
+        if (!finished) return std::unexpected(finished.error());
 
         // 5. Execute post-transaction triggers
         TriggerContext trig_ctx;
