@@ -56,7 +56,7 @@ The state database `/var/lib/sage/data.mdb` uses dedicated named databases (tabl
 | Table Name (DBI) | Key | Value | Purpose |
 | :--- | :--- | :--- | :--- |
 | `packages` | `pkg_name` | Serialized Package Metadata | Complete metadata, version, release, channel, license |
-| `files` | `rel_path` (e.g. `usr/bin/rg`) | `pkg_name:channel_name` | Instant conflict detection & file ownership lookup |
+| `files` | `rel_path` (e.g. `usr/bin/rg`) | `pkg_name:channel_name` (newline-separated set; shared directories carry one claim per installing package) | Instant conflict detection & file ownership lookup |
 | `provides` | `symbol` (e.g. `virtual/init`, `so:libzstd.so.1`) | `pkg_name` | Fast symbol & virtual provider reverse lookup |
 | `channels` | `channel_name` | Channel Scope, Target Root, Triplet, Priority | Channel registry |
 | `system` | `interface` (e.g. `virtual/init`) | Active provider (`openrc`) | Declarative system state lock |
@@ -85,8 +85,10 @@ moving an already-open target directory.
 
 Install replacement, remove plans, and provider rebuilds revalidate the state
 they planned from inside the LMDB write transaction. Existing files may migrate
-only from the exact `pkg_name:channel_name` owner recorded by that transaction;
-a concurrent package or provider change aborts the stale operation. LMDB state
+only while the `pkg_name:channel_name` owner recorded by that transaction is
+still present in the path's ownership set; a concurrent package or provider
+change aborts the stale operation. Shared directories release one claim per
+removal and are deleted only when the last owner lets go. LMDB state
 updates are transactional, but filesystem extraction/removal is not journaled
 for rollback if a later step fails.
 

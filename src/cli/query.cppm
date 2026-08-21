@@ -226,15 +226,15 @@ export int cmd_query(const CliOptions& opts) {
         }
     } else if (sub == "owner" && opts.args.size() >= 2) {
         std::string path = opts.args[1];
-        auto owner = db.get_file_owner(path);
-        if (!owner) {
-            sage::util::log_error("Failed to read file ownership: {}", owner.error());
+        auto owners = db.get_path_owners(path);
+        if (!owners) {
+            sage::util::log_error("Failed to read file ownership: {}", owners.error());
             return 1;
         }
-        if (*owner) {
-            std::println("{} is owned by {}", path, **owner);
-        } else {
+        if (owners->empty()) {
             std::println("No installed package owns {}", path);
+        } else {
+            std::println("{} is owned by {}", path, sage::util::join(*owners, ", "));
         }
     }
     return 0;

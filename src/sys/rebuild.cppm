@@ -502,11 +502,22 @@ public:
                     return util::path_depth(a) > util::path_depth(b);
                 });
 
+                std::unordered_map<std::string, package::FileType> declared_types;
+                for (const auto& f : old_manifest.files) {
+                    declared_types.emplace(util::clean_rel_path(f.path), f.type);
+                }
                 for (const auto& path : ordered) {
-                    auto owner = db.get_file_owner(*wtxn, path);
-                    if (!owner) return std::unexpected(owner.error());
-                    if (*owner && **owner != my_owner) continue;
-                    auto rm_res = archive::remove_path_anchored(sysroot, path);
+                    auto owners = db.get_path_owners(*wtxn, path);
+                    if (!owners) return std::unexpected(owners.error());
+                    const bool mine =
+                        std::ranges::find(*owners, my_owner) != owners->end();
+                    if (!mine && !owners->empty()) continue;
+                    if (mine && owners->size() > 1) continue;
+                    const bool declared_directory =
+                        declared_types.contains(path)
+                        && declared_types.at(path) == package::FileType::Directory;
+                    auto rm_res = archive::remove_path_anchored(
+                        sysroot, path, !mine || declared_directory);
                     if (!rm_res) {
                         return std::unexpected(std::format(
                             "Failed to remove '{}' of outgoing provider '{}': {}",
@@ -514,7 +525,7 @@ public:
                     }
                 }
 
-                auto file_res = db.unregister_files(*wtxn, old_manifest.files);
+                auto file_res = db.unregister_files(*wtxn, old_manifest.files, my_owner);
                 if (!file_res) return std::unexpected(file_res.error());
                 auto provide_res = db.unregister_provides(*wtxn, old_manifest.provides);
                 if (!provide_res) return std::unexpected(provide_res.error());

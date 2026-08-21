@@ -9,6 +9,33 @@ export namespace sage::db {
 
 using std::size_t;
 
+// A files-table value is a newline-separated set of "pkg:channel" owners.
+// Regular files and symlinks always carry exactly one; explicitly declared
+// directories accumulate one claim per installing package, so removing one
+// claimant releases only its own claim and the last claimant deletes the
+// directory. Single-owner values are byte-identical to the historical format.
+std::vector<std::string_view> split_owners(std::string_view value) {
+    std::vector<std::string_view> owners;
+    for (const auto owner : util::split(value, '\n')) {
+        if (!owner.empty()) owners.push_back(owner);
+    }
+    return owners;
+}
+
+std::string join_owners(const std::vector<std::string_view>& owners) {
+    std::string joined;
+    for (size_t i = 0; i < owners.size(); ++i) {
+        if (i > 0) joined.push_back('\n');
+        joined.append(owners[i]);
+    }
+    return joined;
+}
+
+std::string_view owner_package(std::string_view owner) {
+    const auto colon = owner.find(':');
+    return colon == std::string_view::npos ? owner : owner.substr(0, colon);
+}
+
 class Database {
 public:
     Database() = default;
@@ -166,17 +193,18 @@ public:
     // Files Table & Conflict Detection
     // ========================================================================
 
-    std::expected<std::optional<std::string>, std::string> get_file_owner(
+    std::expected<std::vector<std::string>, std::string> get_path_owners(
         std::string_view rel_path)
     {
         auto txn = begin_read_txn();
         if (!txn) {
             return std::unexpected("Failed to open file ownership read transaction: " + txn.error());
         }
-        return get_file_owner(*txn, rel_path);
+        return get_path_owners(*txn, rel_path);
     }
 
-    std::expected<std::optional<std::string>, std::string> get_file_owner(
+    // Every owner registered for a path, empty when the path is unregistered.
+    std::expected<std::vector<std::string>, std::string> get_path_owners(
         vendor::lmdb::MdbTxn& txn,
         std::string_view rel_path)
     {
@@ -185,8 +213,11 @@ public:
         if (!val) {
             return std::unexpected("Failed to read file ownership: " + val.error());
         }
-        if (!*val) return std::optional<std::string>{};
-        return std::optional<std::string>{std::string(**val)};
+        std::vector<std::string> owners;
+        if (*val) {
+            for (const auto owner : split_owners(**val)) owners.emplace_back(owner);
+        }
+        return owners;
     }
 
     std::expected<std::vector<std::string>, std::string> get_package_files(
@@ -209,8 +240,11 @@ public:
         auto entry = cursor.first(k, v);
         if (!entry) return std::unexpected("Failed to read file ownership cursor: " + entry.error());
         while (*entry) {
-            if (v == package_name || v.starts_with(std::string(package_name) + ":")) {
-                files.emplace_back(k);
+            for (const auto owner : split_owners(v)) {
+                if (owner_package(owner) == package_name) {
+                    files.emplace_back(k);
+                    break;
+                }
             }
             entry = cursor.next(k, v);
             if (!entry) return std::unexpected("Failed to advance file ownership cursor: " + entry.error());
@@ -257,10 +291,29 @@ public:
 
         // Insert file records (new owner claims file)
         for (const auto& f : files) {
-            if (f.type == package::FileType::Directory) continue;
             auto cleaned = util::clean_rel_path(f.path);
             if (cleaned == "usr/share/info/dir" || cleaned.ends_with("/info/dir")) continue;
-            auto res = dbi_files_.put(txn, cleaned, owner_val);
+            if (f.type != package::FileType::Directory) {
+                auto res = dbi_files_.put(txn, cleaned, owner_val);
+                if (!res) return res;
+                continue;
+            }
+            // Directories accumulate one claim per package; a re-registering
+            // package replaces its previous claim so a channel migration does
+            // not stack stale entries onto the shared set.
+            auto existing = dbi_files_.get_checked(txn, cleaned);
+            if (!existing) {
+                return std::unexpected(std::format(
+                    "Failed to read ownership for '{}': {}", cleaned, existing.error()));
+            }
+            std::vector<std::string_view> owners;
+            if (*existing) {
+                for (const auto owner : split_owners(**existing)) {
+                    if (owner_package(owner) != pkg_name) owners.push_back(owner);
+                }
+            }
+            owners.push_back(owner_val);
+            auto res = dbi_files_.put(txn, cleaned, join_owners(owners));
             if (!res) return res;
         }
 
@@ -270,12 +323,39 @@ public:
     std::expected<void, std::string> unregister_files(
         vendor::lmdb::MdbTxn& txn,
         const std::vector<package::FileEntry>& files,
-        std::string_view expected_owner = "") 
+        std::string_view expected_owner = "")
     {
         for (const auto& f : files) {
-            if (f.type == package::FileType::Directory) continue;
             auto cleaned = util::clean_rel_path(f.path);
             if (cleaned == "usr/share/info/dir" || cleaned.ends_with("/info/dir")) continue;
+
+            if (f.type == package::FileType::Directory) {
+                // Release only this package's claim; the entry survives while
+                // other claimants remain and dies with the last one.
+                auto existing = dbi_files_.get_checked(txn, cleaned);
+                if (!existing) {
+                    return std::unexpected(std::format(
+                        "Failed to read ownership for '{}': {}", cleaned, existing.error()));
+                }
+                if (!*existing) continue;
+                const auto owners = split_owners(**existing);
+                if (expected_owner.empty()) {
+                    auto res = dbi_files_.del(txn, cleaned);
+                    if (!res) return res;
+                    continue;
+                }
+                std::vector<std::string_view> remaining;
+                for (const auto owner : owners) {
+                    if (owner != expected_owner) remaining.push_back(owner);
+                }
+                if (remaining.size() == owners.size()) continue;
+                auto res = remaining.empty()
+                    ? dbi_files_.del(txn, cleaned)
+                    : dbi_files_.put(txn, cleaned, join_owners(remaining));
+                if (!res) return res;
+                continue;
+            }
+
             if (!expected_owner.empty()) {
                 auto existing = dbi_files_.get_checked(txn, cleaned);
                 if (!existing) {
@@ -309,20 +389,24 @@ public:
         auto entry = cursor.first(k, v);
         if (!entry) return std::unexpected("Failed to read orphaned-file cursor: " + entry.error());
         while (*entry) {
-            std::string_view owner = v;
-            auto colon = owner.find(':');
-            std::string package_name(
-                colon == std::string_view::npos ? owner : owner.substr(0, colon));
-            auto known = package_exists.find(package_name);
-            if (known == package_exists.end()) {
-                auto package = dbi_packages_.get_checked(txn, package_name);
-                if (!package) {
-                    return std::unexpected(
-                        "Failed to check package while pruning ownership: " + package.error());
+            bool any_owner_installed = false;
+            for (const auto owner : split_owners(v)) {
+                const auto package_name = owner_package(owner);
+                auto known = package_exists.find(std::string(package_name));
+                if (known == package_exists.end()) {
+                    auto package = dbi_packages_.get_checked(txn, package_name);
+                    if (!package) {
+                        return std::unexpected(
+                            "Failed to check package while pruning ownership: " + package.error());
+                    }
+                    known = package_exists.emplace(package_name, package->has_value()).first;
                 }
-                known = package_exists.emplace(package_name, package->has_value()).first;
+                if (known->second) {
+                    any_owner_installed = true;
+                    break;
+                }
             }
-            if (!known->second) {
+            if (!any_owner_installed) {
                 orphaned.emplace_back(k);
             }
             entry = cursor.next(k, v);
