@@ -31,7 +31,7 @@ graph TB
 
     subgraph SolverLayer["4. 依赖求解与重构层 (Solver & Reconcile Layer)"]
         PubGrub["<b>Native C++23 PubGrub / CDCL SAT Solver</b><br/>(Version Ranges, Virtual Providers, SONAMEs)"]
-        RebuildEngine["<b>Reconcile Engine (`sage rebuild`)</b><br/>(Diff system.toml vs LMDB -> Atomic Swap)"]
+        RebuildEngine["<b>Reconcile Engine (`sage rebuild`)</b><br/>(Diff system.toml vs LMDB -> Guarded State Transition)"]
     end
 
     subgraph ArchiveLayer["5. 归档与解包层 (Streaming Archive Layer)"]

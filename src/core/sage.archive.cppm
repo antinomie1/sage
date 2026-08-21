@@ -206,6 +206,7 @@ struct InspectedPackage {
     std::optional<service::ServiceSpec> service;
     std::vector<package::FileEntry> data_files;
     std::vector<package::FileEntry> declared_files;
+    std::string archive_sha256;
 };
 
 struct ArchiveEntryView {
@@ -221,7 +222,8 @@ template <typename Handler>
 inline std::expected<void, std::string> walk_archive_entries(
     std::istream& file,
     std::string_view archive_name,
-    Handler&& handler)
+    Handler&& handler,
+    util::Sha256* archive_hasher = nullptr)
 {
     vendor::zstd::ZstdDecompressStream zstd_stream;
     if (!zstd_stream) {
@@ -301,6 +303,9 @@ inline std::expected<void, std::string> walk_archive_entries(
 
     while (file.read(reinterpret_cast<char*>(in_buffer.data()), in_buf_size) || file.gcount() > 0) {
         size_t read_bytes = static_cast<size_t>(file.gcount());
+        if (archive_hasher && read_bytes > 0) {
+            archive_hasher->update(in_buffer.data(), read_bytes);
+        }
         ZSTD_inBuffer in = { in_buffer.data(), read_bytes, 0 };
 
         while (in.pos < in.size) {
@@ -591,6 +596,59 @@ inline std::expected<std::string, std::string> normalize_data_path(std::string_v
     return normalized.generic_string();
 }
 
+inline std::expected<void, std::string> remove_path_anchored(
+    const std::filesystem::path& target_root,
+    std::string_view raw_path,
+    bool ignore_nonempty_directory = false)
+{
+    auto normalized = normalize_data_path(raw_path);
+    if (!normalized) return std::unexpected(normalized.error());
+
+    int root_flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW;
+#ifdef O_CLOEXEC
+    root_flags |= O_CLOEXEC;
+#endif
+    int root_fd = ::open(target_root.c_str(), root_flags);
+    if (root_fd < 0) {
+        return std::unexpected(
+            "Cannot securely open target root: " + std::string(std::strerror(errno)));
+    }
+    UniqueFd current(root_fd);
+    const auto relative = std::filesystem::path(*normalized);
+    for (const auto& component : relative.parent_path()) {
+        if (component == ".") continue;
+        const auto name = component.string();
+        int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW;
+#ifdef O_CLOEXEC
+        flags |= O_CLOEXEC;
+#endif
+        int next = ::openat(current.get(), name.c_str(), flags);
+        if (next < 0 && errno == ENOENT) return {};
+        if (next < 0) {
+            return std::unexpected(std::format(
+                "Cannot securely open parent directory '{}': {}",
+                name, std::strerror(errno)));
+        }
+        current = UniqueFd(next);
+    }
+
+    const auto leaf = relative.filename().string();
+    struct stat status {};
+    if (::fstatat(current.get(), leaf.c_str(), &status, AT_SYMLINK_NOFOLLOW) != 0) {
+        if (errno == ENOENT) return {};
+        return std::unexpected(std::strerror(errno));
+    }
+    const bool is_directory = S_ISDIR(status.st_mode);
+    if (::unlinkat(current.get(), leaf.c_str(), is_directory ? AT_REMOVEDIR : 0) != 0) {
+        if (ignore_nonempty_directory && is_directory
+            && (errno == ENOTEMPTY || errno == EEXIST)) {
+            return {};
+        }
+        return std::unexpected(std::strerror(errno));
+    }
+    return {};
+}
+
 inline std::expected<void, std::string> validate_target_path(
     const PackageDataEntry& entry,
     const std::filesystem::path& target_root,
@@ -664,6 +722,7 @@ inline std::expected<InspectedPackage, std::string> inspect_package_stream(
     std::vector<PackageDataEntry> data_entries;
     std::unordered_set<std::string> data_paths;
     std::unordered_map<std::string, char> archive_entry_types;
+    util::Sha256 archive_hasher;
 
     auto walk_res = walk_archive_entries(archive_file, archive_name, [&](const ArchiveEntryView& entry)
         -> std::expected<void, std::string> {
@@ -734,7 +793,7 @@ inline std::expected<InspectedPackage, std::string> inspect_package_stream(
         });
         archive_entry_types.emplace(*path_res, entry.typeflag);
         return {};
-    });
+    }, &archive_hasher);
     if (!walk_res) return std::unexpected(walk_res.error());
 
     if (!manifest_seen) {
@@ -747,6 +806,7 @@ inline std::expected<InspectedPackage, std::string> inspect_package_stream(
 
     InspectedPackage result;
     result.manifest = std::move(*manifest_res);
+    result.archive_sha256 = archive_hasher.finalize();
 
     // A standalone trigger manifest is the package-authoring source of truth
     // and overrides trigger tables embedded in manifest.toml.
@@ -892,7 +952,8 @@ inline std::expected<InspectedPackage, std::string> inspect_package(
 inline std::expected<ExtractedPackage, std::string> extract_package(
     const std::filesystem::path& archive_path,
     const std::filesystem::path& target_root,
-    const package::PackageManifest* expected_manifest = nullptr)
+    const package::PackageManifest* expected_manifest = nullptr,
+    const InspectedPackage* expected_inspection = nullptr)
 {
     std::ifstream archive_file(archive_path, std::ios::binary);
     if (!archive_file.is_open()) {
@@ -910,6 +971,11 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
             expected_manifest->arch, expected_manifest->channel,
             inspect_res->manifest.name, inspect_res->manifest.version.to_string(),
             inspect_res->manifest.arch, inspect_res->manifest.channel));
+    }
+    if (expected_inspection
+        && inspect_res->archive_sha256 != expected_inspection->archive_sha256) {
+        return std::unexpected(
+            "Package archive changed after ownership preflight");
     }
 
     ExtractedPackage result;

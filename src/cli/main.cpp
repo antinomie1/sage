@@ -729,7 +729,7 @@ int cmd_install(const CliOptions& opts) {
         // opt/channels/gcc/15/bin/gcc), so always extract to the target root directly.
         sage::util::log_info("Unpacking {} -> {}...", pkg.name, opts.target_root.string());
         auto ext_res = sage::archive::extract_package(
-            archive_it->second, opts.target_root, &pkg);
+            archive_it->second, opts.target_root, &pkg, &inspected_it->second);
         if (!ext_res) {
             sage::util::log_error("Failed to extract package '{}': {}", pkg.name, ext_res.error());
             return 1;
@@ -770,30 +770,13 @@ int cmd_install(const CliOptions& opts) {
                 if (*cur_owner && **cur_owner != old_owner) {
                     continue;
                 }
-                std::filesystem::path disk_p = opts.target_root / old_path;
-                std::error_code ec;
-                auto status = std::filesystem::symlink_status(disk_p, ec);
-                if (ec == std::errc::no_such_file_or_directory
-                    || status.type() == std::filesystem::file_type::not_found) {
-                    ec.clear();
-                } else if (ec) {
+                auto remove_res = sage::archive::remove_path_anchored(
+                    opts.target_root, old_path);
+                if (!remove_res) {
                     sage::util::log_error(
-                        "Failed to inspect stale file '{}' for '{}': {}",
-                        disk_p.string(), pkg.name, ec.message());
+                        "Failed to remove stale file '{}' for '{}': {}",
+                        old_path, pkg.name, remove_res.error());
                     return 1;
-                } else if (std::filesystem::is_directory(status)) {
-                    sage::util::log_error(
-                        "Cannot remove stale file '{}' for '{}': path is a directory",
-                        disk_p.string(), pkg.name);
-                    return 1;
-                } else {
-                    std::filesystem::remove(disk_p, ec);
-                    if (ec) {
-                        sage::util::log_error(
-                            "Failed to remove stale file '{}' for '{}': {}",
-                            disk_p.string(), pkg.name, ec.message());
-                        return 1;
-                    }
                 }
                 sage::package::FileEntry fe;
                 fe.path = old_path;
@@ -1119,8 +1102,7 @@ int cmd_remove(const CliOptions& opts) {
     for (const auto& current : *current_installed) {
         auto planned = installed_map.find(current.name);
         if (planned == installed_map.end()
-            || sage::package::package_identity(planned->second)
-                != sage::package::package_identity(current)) {
+            || planned->second.serialize_toml() != current.serialize_toml()) {
             sage::util::log_error(
                 "Installed package '{}' changed while planning removal; retry the command",
                 current.name);
@@ -1199,28 +1181,15 @@ int cmd_remove(const CliOptions& opts) {
                 return 1;
             }
 
-            std::filesystem::path p = opts.target_root / relative_path;
-            std::error_code ec;
-            auto status = std::filesystem::symlink_status(p, ec);
-            if (ec == std::errc::no_such_file_or_directory
-                || status.type() == std::filesystem::file_type::not_found) {
-                ec.clear();
-            } else if (ec) {
+            auto remove_res = sage::archive::remove_path_anchored(
+                opts.target_root,
+                relative_path.generic_string(),
+                !*cur_owner);
+            if (!remove_res) {
                 sage::util::log_error(
-                    "Failed to inspect '{}' while removing '{}': {}",
-                    p.string(), pkg_name, ec.message());
+                    "Failed to remove '{}' from package '{}': {}",
+                    relative_path.generic_string(), pkg_name, remove_res.error());
                 return 1;
-            } else {
-                std::filesystem::remove(p, ec);
-                const bool shared_nonempty_directory =
-                    std::filesystem::is_directory(status) && !*cur_owner
-                    && ec == std::errc::directory_not_empty;
-                if (ec && !shared_nonempty_directory) {
-                    sage::util::log_error(
-                        "Failed to remove '{}' from package '{}': {}",
-                        p.string(), pkg_name, ec.message());
-                    return 1;
-                }
             }
 
             auto removed_entry = file_entry;
@@ -1304,6 +1273,19 @@ int cmd_test_suite() {
         sage::util::log_error("Version comparator test failed");
         return 1;
     }
+    auto legacy_config = sage::config::SystemConfig::parse_system_toml(
+        "[providers]\ninit = \"openrc\"\n");
+    auto shared_override = sage::config::SystemConfig::parse_system_toml(
+        "[providers]\ninit = \"openrc\"\n\n[capabilities]\ninit = \"shared\"\n");
+    if (!legacy_config
+        || !legacy_config->is_exclusive_capability("virtual/init")
+        || !legacy_config->is_exclusive_capability("virtual/udev")
+        || !legacy_config->is_exclusive_capability("virtual/libc")
+        || !shared_override
+        || shared_override->is_exclusive_capability("virtual/init")) {
+        sage::util::log_error("Legacy capability defaults or explicit override failed");
+        return 1;
+    }
     sage::util::log_success("1. Semantic & Alphanum Version Comparator OK");
 
     // 2. Tar+Zstd Archive Packaging & Streaming Extractor Test
@@ -1359,6 +1341,42 @@ int cmd_test_suite() {
     auto reordered_pkg_hash = sage::util::compute_file_sha256(reordered_pkg_path);
     if (!reordered_pack_res || !pkg_hash || !reordered_pkg_hash || *pkg_hash != *reordered_pkg_hash) {
         sage::util::log_error("Archive reproducibility verification failed");
+        return 1;
+    }
+
+    // The ownership preflight and extraction must refer to the same payload,
+    // even when a replacement archive keeps the same package identity.
+    auto preflight_package = sage::archive::inspect_package(pkg_path);
+    auto replaced_payload = temp_dir / "replaced-payload";
+    std::filesystem::create_directories(replaced_payload / "usr/bin");
+    std::ofstream(replaced_payload / "usr/bin/injected") << "must not extract\n";
+    auto replacement_archive = temp_dir / "replacement-same-identity.pkg.tar.zst";
+    auto replacement_pack = sage::archive::create_package(
+        manifest, replaced_payload, replacement_archive);
+    auto binding_root = temp_dir / "binding-root";
+    auto binding_result = preflight_package && replacement_pack
+        ? sage::archive::extract_package(
+            replacement_archive, binding_root, &manifest, &*preflight_package)
+        : std::expected<sage::archive::ExtractedPackage, std::string>(
+            std::unexpected("fixture failed"));
+    if (binding_result || std::filesystem::exists(binding_root / "usr/bin/injected")) {
+        sage::util::log_error("Archive replacement bypassed ownership preflight");
+        return 1;
+    }
+
+    // Cleanup follows the same anchored traversal as extraction. An
+    // intermediate symlink must never redirect unlink outside the sysroot.
+    auto anchored_remove_root = temp_dir / "anchored-remove-root";
+    auto anchored_remove_outside = temp_dir / "anchored-remove-outside";
+    std::filesystem::create_directories(anchored_remove_root / "opt");
+    std::filesystem::create_directories(anchored_remove_outside);
+    std::ofstream(anchored_remove_outside / "keep") << "must survive\n";
+    std::filesystem::create_directory_symlink(
+        anchored_remove_outside, anchored_remove_root / "opt/app");
+    auto anchored_remove = sage::archive::remove_path_anchored(
+        anchored_remove_root, "opt/app/keep");
+    if (anchored_remove || !std::filesystem::exists(anchored_remove_outside / "keep")) {
+        sage::util::log_error("Anchored cleanup followed an intermediate symlink");
         return 1;
     }
 
