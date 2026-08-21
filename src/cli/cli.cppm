@@ -22,6 +22,7 @@ struct CliOptions {
     bool no_recursive{false};  // --no-recursive
     bool no_elf_check{false};  // --no-elf-check
     std::string channel_filter;  // --channel <NAME>
+    int wait_seconds{0};      // --wait[=SECONDS]: wait for a concurrent sage
 };
 
 void print_banner() {
@@ -55,6 +56,7 @@ Global Options:
   --verbose, -v            Enable verbose diagnostics
   --no-elf-check           Skip build-time DT_NEEDED validation (bootstrap escape hatch)
   --channel <NAME>         Restrict `install` to a single channel
+  --wait[=SECONDS]         Wait for a concurrent sage on the same root (default: fail fast)
   --help, -h               Show this help message
   --version, -V            Show version information
 )");
@@ -88,6 +90,10 @@ inline std::optional<CliOptions> parse_args(int argc, char* argv[]) {
             opts.no_elf_check = true;
         } else if (arg == "--channel" && i + 1 < argc) {
             opts.channel_filter = argv[++i];
+        } else if (arg == "--wait") {
+            opts.wait_seconds = 30;
+        } else if (arg.starts_with("--wait=")) {
+            opts.wait_seconds = std::atoi(std::string(arg.substr(7)).c_str());
         } else if ((arg == "--root" || arg == "--sysroot") && i + 1 < argc) {
             opts.target_root = argv[++i];
         } else if (opts.command.empty()) {
@@ -97,6 +103,29 @@ inline std::optional<CliOptions> parse_args(int argc, char* argv[]) {
         }
     }
     return opts;
+}
+
+// Serialize state-changing commands (install/remove/rebuild) against a second
+// sage instance on the same target root: flock on <db_dir>/lock, held by the
+// returned RootLock for the command's lifetime. Read-only commands never take
+// it and are never blocked.
+inline std::expected<util::RootLock, int> acquire_root_write_lock(const CliOptions& opts) {
+    auto cfg_res = sage::config::SystemConfig::load_from_root(opts.target_root);
+    if (!cfg_res) {
+        sage::util::log_error("Failed to load configuration: {}", cfg_res.error());
+        return std::unexpected(1);
+    }
+    const auto lock_path = cfg_res->db_path.parent_path() / "lock";
+    auto lock = sage::util::RootLock::acquire(lock_path, opts.wait_seconds);
+    if (!lock) {
+        int holder = 0;
+        if (std::ifstream f(lock_path); f.is_open()) (void)(f >> holder);
+        sage::util::log_error("another sage instance (pid {}) is operating on '{}'; retry once it finishes",
+            holder > 0 ? std::format("{}", holder) : std::string("unknown"),
+            cfg_res->root_dir.string());
+        return std::unexpected(1);
+    }
+    return std::expected<util::RootLock, int>(std::move(*lock));
 }
 
 } // namespace sage::cli

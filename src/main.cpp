@@ -20,6 +20,15 @@ int main(int argc, char* argv[]) {
 
     using namespace sage::cli;
 
+    // State-changing commands take the target root's write lock first, so a
+    // second concurrent sage fails fast at the entrance instead of racing.
+    std::optional<sage::util::RootLock> mutation_lock;
+    if (opts.command == "install" || opts.command == "remove" || opts.command == "rebuild") {
+        auto lock_res = acquire_root_write_lock(opts);
+        if (!lock_res) return lock_res.error();
+        mutation_lock = std::move(*lock_res);
+    }
+
     if (opts.command == "install") {
         return cmd_install(opts);
     }

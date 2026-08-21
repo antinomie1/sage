@@ -1952,6 +1952,35 @@ install = [
     sage::util::log_success("10. Complete Build -> Index -> Install -> Remove (Auto Orphan Cleanup) Closed-Loop OK");
     sage::util::log_success("11. Reverse Dependency Protection & Cascade Removal Safety Locks OK");
 
+    // 12. Target root write lock: a second instance is rejected while one
+    // holds the lock, and the lock frees immediately on release (the same
+    // fd-lifetime semantics that make a killed process safe).
+    {
+        auto lock_path = temp_dir / "lock";
+        auto first = sage::util::RootLock::acquire(lock_path);
+        if (!first) {
+            sage::util::log_error("Failed to acquire an uncontended root write lock");
+            return 1;
+        }
+        auto second = sage::util::RootLock::acquire(lock_path);
+        if (second || second.error() != "busy") {
+            sage::util::log_error("A second root write lock was granted while one is held");
+            return 1;
+        }
+        int recorded_pid = 0;
+        if (std::ifstream f(lock_path); !(f.is_open() && (f >> recorded_pid)) || recorded_pid != sage::util::current_pid()) {
+            sage::util::log_error("Lock file does not name the holding pid");
+            return 1;
+        }
+        { auto moved = std::move(*first); }  // release: fd closes here
+        auto reacquired = sage::util::RootLock::acquire(lock_path);
+        if (!reacquired) {
+            sage::util::log_error("Root write lock was not reacquirable after release");
+            return 1;
+        }
+    }
+    sage::util::log_success("12. Target Root Write Lock Rejection & Release OK");
+
     std::filesystem::remove_all(temp_dir);
     sage::util::log_success("🎉 All Sage Master Architecture & Subsystem Integration Tests Passed Successfully!");
     return 0;
