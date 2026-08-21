@@ -92,8 +92,15 @@ public:
         ReconcilePlan plan;
         auto current_providers = db.get_all_system_providers();
 
-        // 1. Calculate provider diffs (virtual/init, virtual/udev, virtual/libc)
-        for (const auto& [iface, target_prov] : desired_config.providers) {
+        // 1. Calculate provider diffs.
+        //
+        // Only *exclusive* capabilities take part: they are the ones where at
+        // most one provider may exist, so a changed binding means packages
+        // must actually be swapped. Retargeting a shared default such as
+        // virtual/initramfs-generator changes which tool later transactions
+        // call, not what is installed -- reconciling on it would uninstall a
+        // perfectly valid coexisting provider.
+        for (const auto& [iface, target_prov] : desired_config.exclusive_providers()) {
             std::string cur = current_providers.contains(iface) ? current_providers.at(iface) : "";
             if (cur != target_prov) {
                 plan.swaps.push_back(ProviderSwap{

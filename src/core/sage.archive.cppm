@@ -125,6 +125,69 @@ inline uint32_t compute_tar_checksum(const TarHeader& hdr) noexcept {
 }
 
 // ============================================================================
+// .METADATA/files.idx -- per-file integrity index
+// ============================================================================
+//
+// Tab-separated, path last but one so a path containing whitespace still
+// parses: type, mode (octal), size, sha256 ("-" when not applicable), path,
+// symlink target ("-" when not a symlink).
+
+inline std::string serialize_files_idx(const std::vector<package::FileEntry>& files) {
+    std::ostringstream ss;
+    ss << "# sage files index v1\n";
+    ss << "# type\tmode\tsize\tsha256\tpath\ttarget\n";
+    for (const auto& f : files) {
+        ss << package::to_string(f.type) << '\t'
+           << std::format("{:o}", f.mode) << '\t'
+           << f.size << '\t'
+           << (f.sha256.empty() ? "-" : f.sha256) << '\t'
+           << f.path << '\t'
+           << (f.link_target.empty() ? "-" : f.link_target) << '\n';
+    }
+    return ss.str();
+}
+
+inline std::vector<package::FileEntry> parse_files_idx(std::string_view content) {
+    std::vector<package::FileEntry> out;
+    size_t pos = 0;
+    while (pos < content.size()) {
+        size_t eol = content.find('\n', pos);
+        if (eol == std::string_view::npos) eol = content.size();
+        std::string_view line = content.substr(pos, eol - pos);
+        pos = eol + 1;
+        if (line.empty() || line.front() == '#') continue;
+
+        std::array<std::string_view, 6> fields{};
+        size_t fpos = 0;
+        size_t idx = 0;
+        for (; idx < fields.size(); ++idx) {
+            if (idx + 1 == fields.size()) {
+                fields[idx] = line.substr(fpos);
+                break;
+            }
+            size_t tab = line.find('\t', fpos);
+            if (tab == std::string_view::npos) break;
+            fields[idx] = line.substr(fpos, tab - fpos);
+            fpos = tab + 1;
+        }
+        if (idx + 1 != fields.size()) continue; // malformed line
+
+        package::FileEntry fe;
+        fe.type = package::parse_file_type(fields[0]);
+        fe.mode = static_cast<uint32_t>(parse_octal(fields[1].data(), fields[1].size()));
+        fe.size = 0;
+        for (char c : fields[2]) {
+            if (c >= '0' && c <= '9') fe.size = fe.size * 10 + static_cast<uint64_t>(c - '0');
+        }
+        if (fields[3] != "-") fe.sha256 = std::string(fields[3]);
+        fe.path = std::string(fields[4]);
+        if (fields[5] != "-") fe.link_target = std::string(fields[5]);
+        if (!fe.path.empty()) out.push_back(std::move(fe));
+    }
+    return out;
+}
+
+// ============================================================================
 // Extracted Package Result
 // ============================================================================
 
@@ -132,6 +195,8 @@ struct ExtractedPackage {
     package::PackageManifest manifest;
     std::optional<service::ServiceSpec> service;
     std::vector<package::FileEntry> extracted_files;
+    // What .METADATA/files.idx claimed, when the archive shipped one.
+    std::vector<package::FileEntry> declared_files;
 };
 
 // ============================================================================
@@ -164,6 +229,8 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
     ExtractedPackage result;
     std::string manifest_content;
     std::string service_content;
+    std::string triggers_content;
+    std::string files_idx_content;
 
     auto process_decompressed_bytes = [&](std::span<const uint8_t> chunk) -> std::expected<void, std::string> {
         ring.insert(ring.end(), chunk.begin(), chunk.end());
@@ -211,6 +278,10 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
                 manifest_content.assign(reinterpret_cast<const char*>(payload_data), file_size);
             } else if (full_name == ".METADATA/service.toml") {
                 service_content.assign(reinterpret_cast<const char*>(payload_data), file_size);
+            } else if (full_name == ".METADATA/triggers.toml") {
+                triggers_content.assign(reinterpret_cast<const char*>(payload_data), file_size);
+            } else if (full_name == ".METADATA/files.idx") {
+                files_idx_content.assign(reinterpret_cast<const char*>(payload_data), file_size);
             } else if (full_name.starts_with("data/")) {
                 std::string rel_path = full_name.substr(5); // strip "data/"
                 if (!rel_path.empty()) {
@@ -290,6 +361,40 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
     if (!manifest_res) return std::unexpected("Failed to parse manifest.toml: " + manifest_res.error());
     result.manifest = std::move(*manifest_res);
     result.manifest.files = result.extracted_files;
+
+    // Triggers may travel either inside manifest.toml or as their own
+    // document. The standalone file wins: it is the one a recipe author edits.
+    if (!triggers_content.empty()) {
+        auto trig_res = package::parse_triggers_toml(triggers_content);
+        if (!trig_res) {
+            return std::unexpected("Failed to parse triggers.toml: " + trig_res.error());
+        }
+        result.manifest.triggers = std::move(*trig_res);
+    }
+
+    // files.idx is the package's own claim about its payload. Checking the
+    // freshly computed hashes against it is the only point where a tampered or
+    // truncated archive can still be caught, so a mismatch is fatal.
+    if (!files_idx_content.empty()) {
+        result.declared_files = parse_files_idx(files_idx_content);
+        std::unordered_map<std::string, const package::FileEntry*> actual;
+        for (const auto& f : result.extracted_files) actual.emplace(f.path, &f);
+
+        for (const auto& want : result.declared_files) {
+            if (want.type != package::FileType::Regular || want.sha256.empty()) continue;
+            auto it = actual.find(want.path);
+            if (it == actual.end()) {
+                return std::unexpected(std::format(
+                    "Package integrity failure: files.idx lists '{}' but the archive does not contain it",
+                    want.path));
+            }
+            if (!it->second->sha256.empty() && it->second->sha256 != want.sha256) {
+                return std::unexpected(std::format(
+                    "Package integrity failure for '{}':\n  files.idx: {}\n  archive:   {}",
+                    want.path, want.sha256, it->second->sha256));
+            }
+        }
+    }
 
     if (!service_content.empty()) {
         auto svc_res = service::ServiceSpec::parse_toml(service_content);
@@ -398,12 +503,74 @@ inline std::expected<void, std::string> create_package(
         return {};
     };
 
-    // 1. Append .METADATA/manifest.toml
-    std::string manifest_toml = manifest.serialize_toml();
+    // 1. Inventory the payload before writing anything.
+    //
+    // The metadata blocks lead the tar stream, and files.idx plus
+    // installed_size can only be filled in once every payload file has been
+    // walked and hashed -- hence a pass over data/ first. It costs one extra
+    // traversal; the file contents are read once either way.
+    package::PackageManifest final_manifest = manifest;
+    final_manifest.files.clear();
+    uint64_t total_size = 0;
+
+    if (std::filesystem::exists(data_dir)) {
+        std::vector<std::filesystem::path> payload;
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(data_dir, std::filesystem::directory_options::none)) {
+            payload.push_back(entry.path());
+        }
+        // Deterministic ordering: two builds of the same tree must produce the
+        // same files.idx, otherwise nothing downstream can compare them.
+        std::ranges::sort(payload);
+
+        for (const auto& path : payload) {
+            package::FileEntry fe;
+            fe.path = path.lexically_relative(data_dir).generic_string();
+
+            if (std::filesystem::is_symlink(path)) {
+                fe.type = package::FileType::Symlink;
+                fe.mode = 0777;
+                std::error_code ec;
+                fe.link_target = std::filesystem::read_symlink(path, ec).generic_string();
+            } else if (std::filesystem::is_directory(path)) {
+                fe.type = package::FileType::Directory;
+                fe.mode = 0755;
+            } else if (std::filesystem::is_regular_file(path)) {
+                fe.type = package::FileType::Regular;
+                auto perms = std::filesystem::status(path).permissions();
+                fe.mode = ((perms & std::filesystem::perms::owner_exec) != std::filesystem::perms::none) ? 0755 : 0644;
+                std::error_code ec;
+                fe.size = std::filesystem::file_size(path, ec);
+                if (ec) fe.size = 0;
+                total_size += fe.size;
+                if (auto h = util::compute_file_sha256(path)) {
+                    fe.sha256 = *h;
+                }
+            } else {
+                continue;
+            }
+            final_manifest.files.push_back(std::move(fe));
+        }
+    }
+    final_manifest.installed_size = total_size;
+
+    // 2. Append .METADATA/manifest.toml
+    std::string manifest_toml = final_manifest.serialize_toml();
     auto m_res = append_tar_entry(".METADATA/manifest.toml", std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(manifest_toml.data()), manifest_toml.size()), 0644);
     if (!m_res) return m_res;
 
-    // 2. Append .METADATA/service.toml if present
+    // 3. Append .METADATA/files.idx
+    std::string files_idx = serialize_files_idx(final_manifest.files);
+    auto fi_res = append_tar_entry(".METADATA/files.idx", std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(files_idx.data()), files_idx.size()), 0644);
+    if (!fi_res) return fi_res;
+
+    // 4. Append .METADATA/triggers.toml if the package declares any
+    if (!final_manifest.triggers.empty()) {
+        std::string trig_toml = package::serialize_triggers_toml(final_manifest.triggers);
+        auto t_res = append_tar_entry(".METADATA/triggers.toml", std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(trig_toml.data()), trig_toml.size()), 0644);
+        if (!t_res) return t_res;
+    }
+
+    // 5. Append .METADATA/service.toml if present
     if (service_spec) {
         std::ostringstream ss;
         ss << "[service]\n";
@@ -420,6 +587,7 @@ inline std::expected<void, std::string> create_package(
         if (!s_res) return s_res;
     }
 
+<<<<<<< HEAD
     // 3. Append data/... filesystem payload
     if (std::filesystem::exists(data_dir)) {
         std::map<std::string, std::filesystem::directory_entry> entries;
@@ -458,12 +626,12 @@ inline std::expected<void, std::string> create_package(
         }
     }
 
-    // 4. Two 512-byte zero blocks marking end of Tar archive
+    // 7. Two 512-byte zero blocks marking end of Tar archive
     static const uint8_t end_blocks[1024] = {0};
     auto end_res = write_compressed_chunk(std::span<const uint8_t>(end_blocks, sizeof(end_blocks)));
     if (!end_res) return end_res;
 
-    // 5. Flush and finish ZSTD stream
+    // 8. Flush and finish ZSTD stream
     return write_compressed_chunk({}, true);
 }
 
