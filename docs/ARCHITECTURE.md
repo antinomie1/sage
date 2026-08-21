@@ -75,6 +75,18 @@ pkgname-1.0.0-1-x86_64.pkg.tar.zst
 └── data/                 # Direct filesystem payload (usr/bin/..., etc/...)
 ```
 
+Extraction is fail-closed: package paths are normalized and preflighted before
+the payload is written, and every parent directory is then opened relative to a
+trusted target-root file descriptor with symlink following disabled. Temporary
+regular files and their final rename stay relative to that verified directory,
+so replacing a checked parent path cannot redirect extraction outside the
+target root.
+
+Package replacement also revalidates the complete installed identity inside
+the LMDB write transaction. Existing files may migrate only from the exact
+`pkg_name:channel_name` owner recorded by that transaction; a concurrent
+same-name update aborts the install instead of being treated as an upgrade.
+
 ---
 
 ## 4. Multi-Init Service Generation Mapping

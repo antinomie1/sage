@@ -284,20 +284,134 @@ struct PackageDataEntry {
     std::string link_target;
 };
 
+class UniqueFd {
+public:
+    explicit UniqueFd(int fd = -1) noexcept : fd_(fd) {}
+    UniqueFd(const UniqueFd&) = delete;
+    UniqueFd& operator=(const UniqueFd&) = delete;
+
+    UniqueFd(UniqueFd&& other) noexcept
+        : fd_(std::exchange(other.fd_, -1)) {}
+
+    UniqueFd& operator=(UniqueFd&& other) noexcept {
+        if (this != &other) {
+            reset();
+            fd_ = std::exchange(other.fd_, -1);
+        }
+        return *this;
+    }
+
+    ~UniqueFd() noexcept { reset(); }
+
+    [[nodiscard]] int get() const noexcept { return fd_; }
+
+private:
+    void reset() noexcept {
+        if (fd_ >= 0) {
+            ::close(fd_);
+            fd_ = -1;
+        }
+    }
+
+    int fd_{-1};
+};
+
+struct AnchoredPath {
+    UniqueFd directory;
+    std::string leaf;
+};
+
+inline std::expected<AnchoredPath, std::string> open_anchored_parent(
+    int root_fd,
+    const std::filesystem::path& relative)
+{
+    int duplicate = ::fcntl(root_fd, F_DUPFD_CLOEXEC, 0);
+    if (duplicate < 0) {
+        return std::unexpected(
+            "Cannot duplicate target-root directory: " + std::string(std::strerror(errno)));
+    }
+    UniqueFd current(duplicate);
+
+    for (const auto& component : relative.parent_path()) {
+        if (component == ".") continue;
+        const auto name = component.string();
+        int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW;
+#ifdef O_CLOEXEC
+        flags |= O_CLOEXEC;
+#endif
+        int next = ::openat(current.get(), name.c_str(), flags);
+        if (next < 0 && errno == ENOENT) {
+            if (::mkdirat(current.get(), name.c_str(), 0755) != 0 && errno != EEXIST) {
+                return std::unexpected(std::format(
+                    "Cannot create parent directory '{}': {}", name, std::strerror(errno)));
+            }
+            next = ::openat(current.get(), name.c_str(), flags);
+        }
+        if (next < 0) {
+            return std::unexpected(std::format(
+                "Cannot securely open parent directory '{}': {}", name, std::strerror(errno)));
+        }
+        current = UniqueFd(next);
+    }
+
+    return AnchoredPath{
+        .directory = std::move(current),
+        .leaf = relative.filename().string(),
+    };
+}
+
+inline std::expected<void, std::string> ensure_anchored_directory(
+    int parent_fd,
+    std::string_view leaf)
+{
+    const auto name = std::string(leaf);
+    if (::mkdirat(parent_fd, name.c_str(), 0755) == 0) return {};
+    if (errno != EEXIST) {
+        return std::unexpected(std::strerror(errno));
+    }
+
+    struct stat status {};
+    if (::fstatat(parent_fd, name.c_str(), &status, AT_SYMLINK_NOFOLLOW) != 0) {
+        return std::unexpected(std::strerror(errno));
+    }
+    if (!S_ISDIR(status.st_mode)) {
+        return std::unexpected("existing path is not a directory");
+    }
+    return {};
+}
+
+inline std::expected<void, std::string> remove_anchored_leaf(
+    int parent_fd,
+    std::string_view leaf)
+{
+    const auto name = std::string(leaf);
+    struct stat status {};
+    if (::fstatat(parent_fd, name.c_str(), &status, AT_SYMLINK_NOFOLLOW) != 0) {
+        if (errno == ENOENT) return {};
+        return std::unexpected(std::strerror(errno));
+    }
+
+    const int flags = S_ISDIR(status.st_mode) ? AT_REMOVEDIR : 0;
+    if (::unlinkat(parent_fd, name.c_str(), flags) != 0) {
+        return std::unexpected(std::strerror(errno));
+    }
+    return {};
+}
+
 class UniqueTempFile {
 public:
     UniqueTempFile(const UniqueTempFile&) = delete;
     UniqueTempFile& operator=(const UniqueTempFile&) = delete;
 
     UniqueTempFile(UniqueTempFile&& other) noexcept
-        : directory_fd_(std::exchange(other.directory_fd_, -1)),
+        : directory_(std::move(other.directory_)),
           fd_(std::exchange(other.fd_, -1)),
           name_(std::exchange(other.name_, {})) {}
 
     UniqueTempFile& operator=(UniqueTempFile&& other) noexcept {
         if (this != &other) {
             cleanup();
-            directory_fd_ = std::exchange(other.directory_fd_, -1);
+            directory_ = std::move(other.directory_);
             fd_ = std::exchange(other.fd_, -1);
             name_ = std::exchange(other.name_, {});
         }
@@ -306,19 +420,8 @@ public:
 
     ~UniqueTempFile() noexcept { cleanup(); }
 
-    static std::expected<UniqueTempFile, std::string> create(
-        const std::filesystem::path& directory)
+    static std::expected<UniqueTempFile, std::string> create(UniqueFd directory)
     {
-        int directory_flags = O_RDONLY | O_DIRECTORY;
-#ifdef O_CLOEXEC
-        directory_flags |= O_CLOEXEC;
-#endif
-        int directory_fd = ::open(directory.c_str(), directory_flags);
-        if (directory_fd < 0) {
-            return std::unexpected(std::format(
-                "Cannot open temporary-file directory: {}", std::strerror(errno)));
-        }
-
         static std::atomic<uint64_t> sequence{0};
         for (size_t attempt = 0; attempt < 128; ++attempt) {
             auto name = std::format(
@@ -330,18 +433,15 @@ public:
 #ifdef O_CLOEXEC
             flags |= O_CLOEXEC;
 #endif
-            int fd = ::openat(directory_fd, name.c_str(), flags, 0600);
+            int fd = ::openat(directory.get(), name.c_str(), flags, 0600);
             if (fd >= 0) {
-                return UniqueTempFile(directory_fd, fd, std::move(name));
+                return UniqueTempFile(std::move(directory), fd, std::move(name));
             }
             if (errno != EEXIST) {
-                auto message = std::string(std::strerror(errno));
-                ::close(directory_fd);
                 return std::unexpected(std::format(
-                    "Cannot create temporary file: {}", message));
+                    "Cannot create temporary file: {}", std::strerror(errno)));
             }
         }
-        ::close(directory_fd);
         return std::unexpected("Cannot create a unique temporary file after repeated collisions");
     }
 
@@ -359,7 +459,7 @@ public:
     }
 
     std::expected<void, std::string> install(
-        const std::filesystem::path& destination,
+        std::string_view destination,
         uint32_t mode)
     {
         if (::fchmod(fd_, mode ? mode : 0644) != 0) {
@@ -372,9 +472,9 @@ public:
             return std::unexpected("Cannot close temporary file: " + message);
         }
         fd_ = -1;
-        auto destination_name = destination.filename().string();
+        auto destination_name = std::string(destination);
         if (::renameat(
-                directory_fd_, name_.c_str(), directory_fd_, destination_name.c_str()) != 0) {
+                directory_.get(), name_.c_str(), directory_.get(), destination_name.c_str()) != 0) {
             return std::unexpected(
                 "Cannot atomically install temporary file: " + std::string(std::strerror(errno)));
         }
@@ -383,25 +483,21 @@ public:
     }
 
 private:
-    UniqueTempFile(int directory_fd, int fd, std::string name)
-        : directory_fd_(directory_fd), fd_(fd), name_(std::move(name)) {}
+    UniqueTempFile(UniqueFd directory, int fd, std::string name)
+        : directory_(std::move(directory)), fd_(fd), name_(std::move(name)) {}
 
     void cleanup() noexcept {
         if (fd_ >= 0) {
             ::close(fd_);
             fd_ = -1;
         }
-        if (directory_fd_ >= 0 && !name_.empty()) {
-            (void)::unlinkat(directory_fd_, name_.c_str(), 0);
+        if (directory_.get() >= 0 && !name_.empty()) {
+            (void)::unlinkat(directory_.get(), name_.c_str(), 0);
             name_.clear();
-        }
-        if (directory_fd_ >= 0) {
-            ::close(directory_fd_);
-            directory_fd_ = -1;
         }
     }
 
-    int directory_fd_{-1};
+    UniqueFd directory_;
     int fd_{-1};
     std::string name_;
 };
@@ -426,18 +522,6 @@ inline std::expected<std::string, std::string> normalize_data_path(std::string_v
     return normalized.generic_string();
 }
 
-inline bool path_is_within(
-    const std::filesystem::path& root,
-    const std::filesystem::path& candidate)
-{
-    auto root_it = root.begin();
-    auto candidate_it = candidate.begin();
-    for (; root_it != root.end(); ++root_it, ++candidate_it) {
-        if (candidate_it == candidate.end() || *candidate_it != *root_it) return false;
-    }
-    return true;
-}
-
 inline std::expected<void, std::string> validate_target_path(
     const PackageDataEntry& entry,
     const std::filesystem::path& target_root,
@@ -460,25 +544,8 @@ inline std::expected<void, std::string> validate_target_path(
                 "Cannot inspect parent directory for '{}': {}", entry.path, status_ec.message()));
         }
         if (std::filesystem::is_symlink(status)) {
-            std::error_code link_ec;
-            auto link_target = std::filesystem::read_symlink(current, link_ec);
-            if (link_ec) {
-                return std::unexpected(std::format(
-                    "Cannot inspect parent symlink for '{}': {}", entry.path, link_ec.message()));
-            }
-            auto resolved = link_target.is_absolute()
-                ? link_target
-                : current.parent_path() / link_target;
-            resolved = std::filesystem::weakly_canonical(resolved, link_ec);
-            if (link_ec) {
-                return std::unexpected(std::format(
-                    "Cannot resolve parent symlink for '{}': {}", entry.path, link_ec.message()));
-            }
-            if (!path_is_within(resolved_root, resolved)) {
-                return std::unexpected(std::format(
-                    "Parent symlink for '{}' escapes target root", entry.path));
-            }
-            current = std::move(resolved);
+            return std::unexpected(std::format(
+                "Parent symlink for '{}' is not allowed", entry.path));
         } else if (!std::filesystem::is_directory(status)) {
             return std::unexpected(std::format(
                 "Parent path for '{}' is not a directory", entry.path));
@@ -713,6 +780,23 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
     result.manifest = std::move(inspect_res->manifest);
     result.service = std::move(inspect_res->service);
 
+    std::error_code root_ec;
+    std::filesystem::create_directories(target_root, root_ec);
+    if (root_ec) {
+        return std::unexpected(
+            "Cannot create target root: " + root_ec.message());
+    }
+    int root_flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW;
+#ifdef O_CLOEXEC
+    root_flags |= O_CLOEXEC;
+#endif
+    int root_fd = ::open(target_root.c_str(), root_flags);
+    if (root_fd < 0) {
+        return std::unexpected(
+            "Cannot securely open target root: " + std::string(std::strerror(errno)));
+    }
+    UniqueFd extraction_root(root_fd);
+
     archive_file.clear();
     archive_file.seekg(0);
     if (!archive_file) {
@@ -726,12 +810,11 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
         auto path_res = normalize_data_path(std::string_view(archive_entry.name).substr(5));
         if (!path_res) return std::unexpected(path_res.error());
         std::string rel_path = std::move(*path_res);
-        std::filesystem::path dest_file = target_root / rel_path;
-        std::error_code parent_ec;
-        std::filesystem::create_directories(dest_file.parent_path(), parent_ec);
-        if (parent_ec) {
+        auto destination = open_anchored_parent(
+            extraction_root.get(), std::filesystem::path(rel_path));
+        if (!destination) {
             return std::unexpected(std::format(
-                "Cannot create parent directory for '{}': {}", rel_path, parent_ec.message()));
+                "Cannot open parent directory for '{}': {}", rel_path, destination.error()));
         }
 
         package::FileEntry entry;
@@ -741,29 +824,32 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
 
         if (archive_entry.typeflag == '5') {
             entry.type = package::FileType::Directory;
-            std::error_code dir_ec;
-            std::filesystem::create_directories(dest_file, dir_ec);
-            if (dir_ec) {
+            auto directory_res = ensure_anchored_directory(
+                destination->directory.get(), destination->leaf);
+            if (!directory_res) {
                 return std::unexpected(std::format(
-                    "Cannot create directory '{}': {}", rel_path, dir_ec.message()));
+                    "Cannot create directory '{}': {}", rel_path, directory_res.error()));
             }
         } else if (archive_entry.typeflag == '2') {
             entry.type = package::FileType::Symlink;
             entry.link_target = archive_entry.linkname;
-            std::error_code ec;
-            std::filesystem::remove(dest_file, ec);
-            if (ec) {
+            auto remove_res = remove_anchored_leaf(
+                destination->directory.get(), destination->leaf);
+            if (!remove_res) {
                 return std::unexpected(std::format(
-                    "Cannot replace '{}' with symlink: {}", rel_path, ec.message()));
+                    "Cannot replace '{}' with symlink: {}", rel_path, remove_res.error()));
             }
-            std::filesystem::create_symlink(archive_entry.linkname, dest_file, ec);
-            if (ec) {
+            const auto link_target = std::string(archive_entry.linkname);
+            if (::symlinkat(
+                    link_target.c_str(), destination->directory.get(), destination->leaf.c_str()) != 0) {
                 return std::unexpected(std::format(
-                    "Cannot create symlink '{}' -> '{}': {}", rel_path, archive_entry.linkname, ec.message()));
+                    "Cannot create symlink '{}' -> '{}': {}",
+                    rel_path, archive_entry.linkname, std::strerror(errno)));
             }
         } else {
             entry.type = package::FileType::Regular;
-            auto temp_res = UniqueTempFile::create(dest_file.parent_path());
+            const auto destination_name = destination->leaf;
+            auto temp_res = UniqueTempFile::create(std::move(destination->directory));
             if (!temp_res) {
                 return std::unexpected(std::format(
                     "Cannot create temporary file for '{}': {}", rel_path, temp_res.error()));
@@ -773,7 +859,7 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
                 return std::unexpected(std::format(
                     "Cannot write '{}': {}", rel_path, write_res.error()));
             }
-            auto install_res = temp_res->install(dest_file, archive_entry.mode);
+            auto install_res = temp_res->install(destination_name, archive_entry.mode);
             if (!install_res) {
                 return std::unexpected(std::format(
                     "Cannot install '{}': {}", rel_path, install_res.error()));

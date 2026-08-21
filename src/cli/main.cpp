@@ -207,6 +207,26 @@ int cmd_build(const CliOptions& opts) {
 // End-to-End `sage install <PKG...>` Implementation
 // ============================================================================
 
+inline std::expected<std::optional<sage::package::PackageManifest>, std::string>
+load_install_snapshot(
+    sage::db::Database& db,
+    auto& txn,
+    std::string_view package_name,
+    const std::optional<sage::package::PackageIdentity>& expected_identity)
+{
+    auto current = db.get_package(txn, package_name);
+    if (!current) return std::unexpected(current.error());
+
+    auto current_identity = *current
+        ? std::optional{sage::package::package_identity(**current)}
+        : std::nullopt;
+    if (current_identity != expected_identity) {
+        return std::unexpected(std::format(
+            "Installed package '{}' changed after dependency resolution", package_name));
+    }
+    return current;
+}
+
 int cmd_install(const CliOptions& opts) {
     if (opts.args.empty()) {
         std::println("Usage: sage install <PKG...>");
@@ -490,8 +510,52 @@ int cmd_install(const CliOptions& opts) {
             return 1;
         }
 
+        auto expected_it = installed_by_name.find(pkg.name);
+        auto expected_previous_identity = expected_it != installed_by_name.end()
+            ? std::optional{sage::package::package_identity(expected_it->second)}
+            : std::nullopt;
+        auto previous_package = load_install_snapshot(
+            db, *package_txn, pkg.name, expected_previous_identity);
+        if (!previous_package) {
+            sage::util::log_error(
+                "Cannot install package '{}': {}", pkg.name, previous_package.error());
+            return 1;
+        }
+
+        std::optional<std::string> previous_owner;
+        std::vector<std::string> previous_paths;
+        if (*previous_package) {
+            previous_owner = std::format("{}:{}", pkg.name, (**previous_package).channel);
+            auto previous_paths_res = db.get_package_files(*package_txn, pkg.name);
+            if (!previous_paths_res) {
+                sage::util::log_error(
+                    "Failed to read previous files for '{}': {}",
+                    pkg.name, previous_paths_res.error());
+                return 1;
+            }
+            previous_paths = std::move(*previous_paths_res);
+            for (const auto& path : previous_paths) {
+                auto owner = db.get_file_owner(*package_txn, path);
+                if (!owner) {
+                    sage::util::log_error(
+                        "Failed to read ownership for '{}': {}", path, owner.error());
+                    return 1;
+                }
+                if (!*owner || **owner != *previous_owner) {
+                    sage::util::log_error(
+                        "Cannot migrate package '{}': file '{}' is owned by '{}' instead of '{}'",
+                        pkg.name, path, *owner ? **owner : "<none>", *previous_owner);
+                    return 1;
+                }
+            }
+        }
+
         auto conflict_res = db.check_file_conflicts(
-            *package_txn, pkg.name, inspected_it->second.data_files);
+            *package_txn,
+            previous_owner
+                ? std::optional<std::string_view>{*previous_owner}
+                : std::nullopt,
+            inspected_it->second.data_files);
         if (!conflict_res) {
             sage::util::log_error(
                 "Cannot install package '{}': {}", pkg.name, conflict_res.error());
@@ -515,22 +579,15 @@ int cmd_install(const CliOptions& opts) {
         // version of this package that are not part of the new version, so file
         // ownership can transition to other packages (e.g. split -dev/-libs
         // children claim headers/libs the old monolithic version used to own).
-        auto old_it = installed_by_name.find(pkg.name);
-        if (old_it != installed_by_name.end()
-            && sage::package::package_identity(old_it->second) != identity) {
+        if (*previous_package
+            && sage::package::package_identity(**previous_package) != identity) {
             std::unordered_set<std::string> new_paths;
             for (const auto& f : installed_pkg.files) {
                 new_paths.insert(sage::util::clean_rel_path(f.path));
             }
             std::vector<sage::package::FileEntry> stale;
-            std::string old_owner = std::format("{}:{}", pkg.name, old_it->second.channel);
-            auto old_paths = db.get_package_files(*package_txn, pkg.name);
-            if (!old_paths) {
-                sage::util::log_error(
-                    "Failed to read previous files for '{}': {}", pkg.name, old_paths.error());
-                return 1;
-            }
-            for (const auto& old_path : *old_paths) {
+            const auto& old_owner = *previous_owner;
+            for (const auto& old_path : previous_paths) {
                 if (new_paths.contains(old_path)) continue;
                 auto cur_owner = db.get_file_owner(*package_txn, old_path);
                 if (!cur_owner) {
@@ -579,7 +636,7 @@ int cmd_install(const CliOptions& opts) {
                     return 1;
                 }
                 sage::util::log_info("  ~ removed {} stale file(s) from previous {} {}", 
-                    stale.size(), pkg.name, old_it->second.version.to_string());
+                    stale.size(), pkg.name, (**previous_package).version.to_string());
             }
         }
 
@@ -588,7 +645,14 @@ int cmd_install(const CliOptions& opts) {
             sage::util::log_error("Failed to register package '{}' in DB: {}", installed_pkg.name, p_res.error());
             return 1;
         }
-        auto f_res = db.register_files(*package_txn, installed_pkg.name, installed_pkg.channel, installed_pkg.files);
+        auto f_res = db.register_files(
+            *package_txn,
+            installed_pkg.name,
+            installed_pkg.channel,
+            installed_pkg.files,
+            previous_owner
+                ? std::optional<std::string_view>{*previous_owner}
+                : std::nullopt);
         if (!f_res) {
             sage::util::log_error("Failed to register files for '{}': {}", installed_pkg.name, f_res.error());
             return 1;
@@ -1307,6 +1371,53 @@ int cmd_test_suite() {
         return 1;
     }
 
+    // Replacing a verified parent directory with an external symlink while the
+    // second archive pass is running must fail closed at the fd-relative sink.
+    auto parent_race_data = temp_dir / "parent-race-data";
+    auto parent_race_target = temp_dir / "parent-race-target";
+    auto parent_race_outside = temp_dir / "parent-race-outside";
+    std::filesystem::create_directories(parent_race_data / "z-parent");
+    std::filesystem::create_directories(parent_race_target / "z-parent");
+    std::filesystem::create_directories(parent_race_outside);
+    std::ofstream(parent_race_data / "a-marker") << "ready\n";
+    {
+        std::ofstream filler(parent_race_data / "b-filler", std::ios::binary);
+        std::array<char, 1024 * 1024> zeros{};
+        for (int i = 0; i < 16; ++i) filler.write(zeros.data(), zeros.size());
+    }
+    std::ofstream(parent_race_data / "z-parent/escaped") << "must stay inside\n";
+    sage::package::PackageManifest parent_race_manifest;
+    parent_race_manifest.name = "parent-race";
+    parent_race_manifest.version = sage::package::Version::parse("1.0.0-1");
+    auto parent_race_pkg = temp_dir / "parent-race-1.0.0-1-x86_64.pkg.tar.zst";
+    if (!sage::archive::create_package(
+            parent_race_manifest, parent_race_data, parent_race_pkg)) {
+        sage::util::log_error("Failed to create parent replacement race fixture");
+        return 1;
+    }
+    std::atomic<bool> parent_replaced{false};
+    std::jthread parent_attacker([&] {
+        while (!std::filesystem::exists(parent_race_target / "a-marker")) {
+            std::this_thread::yield();
+        }
+        std::error_code race_ec;
+        std::filesystem::remove_all(parent_race_target / "z-parent", race_ec);
+        if (!race_ec) {
+            std::filesystem::create_directory_symlink(
+                parent_race_outside, parent_race_target / "z-parent", race_ec);
+        }
+        parent_replaced.store(!race_ec, std::memory_order_release);
+    });
+    auto parent_race_result = sage::archive::extract_package(
+        parent_race_pkg, parent_race_target);
+    parent_attacker.join();
+    if (!parent_replaced.load(std::memory_order_acquire)
+        || parent_race_result
+        || std::filesystem::exists(parent_race_outside / "escaped")) {
+        sage::util::log_error("Archive extraction escaped through a replaced parent directory");
+        return 1;
+    }
+
     auto regular_parent_bytes = raw_tar_bytes;
     if (!rename_tar_entry(
             regular_parent_bytes, "data/usr/bin/link", "data/usr/bin/dummy/child")) {
@@ -1673,6 +1784,81 @@ install = [
         || db_res->get_file_owner(owned_file.path) != "database-owner:system"
         || db_res->get_file_owner(unowned_file.path)) {
         sage::util::log_error("Database file conflict registration was not atomic");
+        return 1;
+    }
+
+    // A package identity captured before the writer lock must be revalidated
+    // inside that write transaction, and same-name ownership is not sufficient.
+    auto migration_db = sage::db::Database::open(temp_dir / "migration-race-db");
+    sage::package::FileEntry migration_file;
+    migration_file.path = "usr/bin/migration-race";
+    sage::package::PackageManifest migration_old;
+    migration_old.name = "migration-race";
+    migration_old.version = sage::package::Version::parse("1.0.0-1");
+    migration_old.channel = "system";
+    migration_old.files = {migration_file};
+    if (!migration_db) {
+        sage::util::log_error("Failed to create migration race database");
+        return 1;
+    }
+    {
+        auto setup_txn = migration_db->begin_write_txn();
+        if (!setup_txn
+            || !migration_db->put_package(*setup_txn, migration_old)
+            || !migration_db->register_files(
+                *setup_txn, migration_old.name, migration_old.channel, migration_old.files)
+            || !setup_txn->commit()) {
+            sage::util::log_error("Failed to populate migration race database");
+            return 1;
+        }
+    }
+    const auto expected_migration_identity = std::optional{
+        sage::package::package_identity(migration_old)};
+    auto migration_new = migration_old;
+    migration_new.version = sage::package::Version::parse("2.0.0-1");
+    migration_new.channel = "runtime/python:3.12";
+    {
+        auto concurrent_txn = migration_db->begin_write_txn();
+        if (!concurrent_txn
+            || !migration_db->unregister_files(
+                *concurrent_txn, migration_old.files, "migration-race:system")
+            || !migration_db->put_package(*concurrent_txn, migration_new)
+            || !migration_db->register_files(
+                *concurrent_txn, migration_new.name, migration_new.channel, migration_new.files)
+            || !concurrent_txn->commit()) {
+            sage::util::log_error("Failed to simulate concurrent channel migration");
+            return 1;
+        }
+    }
+    {
+        auto install_txn = migration_db->begin_write_txn();
+        const std::string stale_owner = "migration-race:system";
+        auto stale_snapshot = install_txn
+            ? load_install_snapshot(
+                *migration_db,
+                *install_txn,
+                migration_old.name,
+                expected_migration_identity)
+            : std::expected<std::optional<sage::package::PackageManifest>, std::string>(
+                std::unexpected("transaction failed"));
+        auto stale_owner_check = install_txn
+            ? migration_db->check_file_conflicts(
+                *install_txn,
+                std::optional<std::string_view>{stale_owner},
+                migration_new.files)
+            : std::expected<void, std::string>(std::unexpected("transaction failed"));
+        if (stale_snapshot || stale_owner_check) {
+            sage::util::log_error("Concurrent same-name channel migration bypassed identity revalidation");
+            return 1;
+        }
+    }
+    auto preserved_migration = migration_db->get_package(migration_new.name);
+    if (!preserved_migration || !*preserved_migration
+        || sage::package::package_identity(**preserved_migration)
+            != sage::package::package_identity(migration_new)
+        || migration_db->get_file_owner(migration_file.path)
+            != "migration-race:runtime/python:3.12") {
+        sage::util::log_error("Rejected stale migration changed the concurrent package state");
         return 1;
     }
 

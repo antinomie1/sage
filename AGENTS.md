@@ -96,8 +96,8 @@ xmake
 # Run the compiled binary
 xmake run sage --help
 
-# Run all test suites
-xmake test
+# Run the integrated architecture and regression suite
+xmake run sage test-suite
 ```
 
 ---

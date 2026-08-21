@@ -214,10 +214,9 @@ public:
     // Register package files into LMDB with atomic conflict checking
     std::expected<void, std::string> check_file_conflicts(
         vendor::lmdb::MdbTxn& txn,
-        std::string_view pkg_name,
+        std::optional<std::string_view> allowed_owner,
         const std::vector<package::FileEntry>& files)
     {
-        const auto owner_prefix = std::string(pkg_name) + ":";
         for (const auto& f : files) {
             if (f.type == package::FileType::Directory) continue;
             auto cleaned = util::clean_rel_path(f.path);
@@ -228,9 +227,7 @@ public:
                 return std::unexpected(std::format(
                     "Failed to check ownership for '{}': {}", cleaned, existing.error()));
             }
-            if (*existing
-                && **existing != pkg_name
-                && !(**existing).starts_with(owner_prefix)) {
+            if (*existing && (!allowed_owner || **existing != *allowed_owner)) {
                 return std::unexpected(std::format(
                     "File conflict: '{}' is already owned by '{}'",
                     cleaned, **existing));
@@ -243,11 +240,12 @@ public:
         vendor::lmdb::MdbTxn& txn,
         std::string_view pkg_name,
         std::string_view channel,
-        const std::vector<package::FileEntry>& files) 
+        const std::vector<package::FileEntry>& files,
+        std::optional<std::string_view> allowed_owner = std::nullopt)
     {
         std::string owner_val = std::format("{}:{}", pkg_name, channel);
 
-        auto conflict_res = check_file_conflicts(txn, pkg_name, files);
+        auto conflict_res = check_file_conflicts(txn, allowed_owner, files);
         if (!conflict_res) return conflict_res;
 
         // Insert file records (new owner claims file)
