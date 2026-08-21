@@ -47,12 +47,6 @@ int main(int argc, char* argv[]) {
     if (opts.command == "toolchain") {
         return cmd_toolchain(opts);
     }
-    if (opts.command == "java") {
-        return cmd_java(opts);
-    }
-    if (opts.command == "rust") {
-        return cmd_rust(opts);
-    }
     if (opts.command == "shell") {
         return cmd_shell(opts);
     }

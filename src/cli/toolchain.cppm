@@ -37,68 +37,6 @@ export int cmd_toolchain(const CliOptions& opts) {
     return 1;
 }
 
-export int cmd_java(const CliOptions& opts) {
-    if (opts.args.empty() || opts.args[0] == "list") {
-        auto list = sage::channel::ProfileManager::list_installed_subchannels(opts.target_root);
-        std::println("Installed Java Environments in '{}':", opts.target_root.string());
-        size_t count = 0;
-        for (const auto& sc : list) {
-            if (sc.category == "java" || sc.category.starts_with("openjdk") || sc.category.starts_with("graalvm")) {
-                std::println("  • {:<15} slot: {:<10} path: {}", sc.category, sc.slot, sc.path.string());
-                count++;
-            }
-        }
-        if (count == 0) {
-            std::println("  (No Java sub-channels installed in /opt/channels/java)");
-        }
-        return 0;
-    }
-
-    if (opts.args[0] == "use" && opts.args.size() >= 2) {
-        std::string slot = opts.args[1];
-        auto res = sage::channel::ProfileManager::switch_active_toolchain(opts.target_root, "java", slot);
-        if (!res) {
-            sage::util::log_error("{}", res.error());
-            return 1;
-        }
-        return 0;
-    }
-
-    std::println("Usage: sage java [list|use <slot>]");
-    return 1;
-}
-
-export int cmd_rust(const CliOptions& opts) {
-    if (opts.args.empty() || opts.args[0] == "list") {
-        auto list = sage::channel::ProfileManager::list_installed_subchannels(opts.target_root);
-        std::println("Installed Rust Toolchains in '{}':", opts.target_root.string());
-        size_t count = 0;
-        for (const auto& sc : list) {
-            if (sc.category == "rust") {
-                std::println("  • {:<15} slot: {:<10} path: {}", sc.category, sc.slot, sc.path.string());
-                count++;
-            }
-        }
-        if (count == 0) {
-            std::println("  (No Rust sub-channels installed in /opt/channels/rust)");
-        }
-        return 0;
-    }
-
-    if (opts.args[0] == "use" && opts.args.size() >= 2) {
-        std::string slot = opts.args[1];
-        auto res = sage::channel::ProfileManager::switch_active_toolchain(opts.target_root, "rust", slot);
-        if (!res) {
-            sage::util::log_error("{}", res.error());
-            return 1;
-        }
-        return 0;
-    }
-
-    std::println("Usage: sage rust [list|use <slot>]");
-    return 1;
-}
-
 export int cmd_shell(const CliOptions& opts) {
     std::vector<sage::channel::SubChannelSpec> specs;
     for (size_t i = 0; i < opts.args.size(); ++i) {
@@ -115,7 +53,6 @@ export int cmd_shell(const CliOptions& opts) {
     auto env = sage::channel::ProfileManager::generate_shell_env(opts.target_root, specs);
     sage::util::log_info("Entering Ephemeral Sandboxed Shell with {} sub-channels...", specs.size());
 
-    // Export generated environment variables
     // Export generated environment variables
     for (const auto& [k, v] : env) {
         if (const char* old_val = sage::util::get_env(k)) {

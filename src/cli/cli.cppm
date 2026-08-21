@@ -37,9 +37,7 @@ Commands:
   install <PKG...>         Install packages into target root via PubGrub SAT solver
   remove <PKG...>          Remove installed package files and unregister state
   rebuild                  Declarative reconcile (/etc/sage/system.toml vs LMDB)
-  toolchain [list|use]     Manage multi-slot compiler toolchains (llvm, gcc, rust, java)
-  java [list|use <slot>]   Manage OpenJDK/GraalVM/Temurin versions and JAVA_HOME
-  rust [list|use <slot>]   Manage Rust stable/nightly versions and targets
+  toolchain [list|use]     Manage multi-slot toolchains (e.g. use java:21, rust:nightly)
   shell [--with <spec...>] Launch ephemeral sandboxed shell with custom toolchains
   channel [COMMAND]        Manage multi-layer channels (list, add, remove, sync)
   repo index <DIR> [NAME]  Generate index.toml for local repository directory
