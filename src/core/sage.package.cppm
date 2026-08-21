@@ -226,6 +226,29 @@ struct FileEntry {
     std::string link_target;
 };
 
+inline std::string escape_toml_basic_string(std::string_view value) {
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (unsigned char ch : value) {
+        switch (ch) {
+            case '"': escaped += "\\\""; break;
+            case '\\': escaped += "\\\\"; break;
+            case '\b': escaped += "\\b"; break;
+            case '\t': escaped += "\\t"; break;
+            case '\n': escaped += "\\n"; break;
+            case '\f': escaped += "\\f"; break;
+            case '\r': escaped += "\\r"; break;
+            default:
+                if (ch < 0x20 || ch == 0x7f) {
+                    escaped += std::format("\\u{:04X}", ch);
+                } else {
+                    escaped.push_back(static_cast<char>(ch));
+                }
+        }
+    }
+    return escaped;
+}
+
 inline std::string_view to_string(FileType t) noexcept {
     switch (t) {
         case FileType::Directory: return "dir";
@@ -387,36 +410,39 @@ inline std::expected<std::vector<Trigger>, std::string> parse_triggers_toml(std:
 }
 
 inline std::string serialize_triggers_toml(const std::vector<Trigger>& triggers) {
+    const auto quote = [](std::string_view value) {
+        return escape_toml_basic_string(value);
+    };
     std::ostringstream ss;
     ss << "schema_version = 1\n";
     for (const auto& t : triggers) {
         ss << "\n[[triggers]]\n";
-        ss << "name = \"" << t.name << "\"\n";
+        ss << "name = \"" << quote(t.name) << "\"\n";
         if (!t.on_paths.empty()) {
             ss << "on_paths = [";
             for (size_t i = 0; i < t.on_paths.size(); ++i) {
-                ss << (i ? ", " : "") << "\"" << t.on_paths[i] << "\"";
+                ss << (i ? ", " : "") << "\"" << quote(t.on_paths[i]) << "\"";
             }
             ss << "]\n";
         }
         if (!t.on_capability.empty()) {
             ss << "on_capability = [";
             for (size_t i = 0; i < t.on_capability.size(); ++i) {
-                ss << (i ? ", " : "") << "\"" << t.on_capability[i] << "\"";
+                ss << (i ? ", " : "") << "\"" << quote(t.on_capability[i]) << "\"";
             }
             ss << "]\n";
         }
         if (!t.run_capability.empty()) {
-            ss << "run_capability = \"" << t.run_capability << "\"\n";
+            ss << "run_capability = \"" << quote(t.run_capability) << "\"\n";
         }
         if (!t.exec.empty()) {
-            ss << "exec = \"" << t.exec << "\"\n";
+            ss << "exec = \"" << quote(t.exec) << "\"\n";
         }
         ss << "priority = " << t.priority << "\n";
         if (!t.args.empty()) {
             ss << "args = [";
             for (size_t i = 0; i < t.args.size(); ++i) {
-                ss << (i ? ", " : "") << "\"" << t.args[i] << "\"";
+                ss << (i ? ", " : "") << "\"" << quote(t.args[i]) << "\"";
             }
             ss << "]\n";
         }
@@ -470,7 +496,17 @@ struct PackageManifest {
             m.name = (*pkg)["name"].value_or("");
             std::string ver_str = std::string((*pkg)["version"].value_or(""));
             m.version = Version::parse(ver_str);
-            m.version.rel = std::string((*pkg)["release"].value_or("1"));
+            if (auto release = (*pkg)["release"].value<std::string_view>()) {
+                m.version.rel = std::string(*release);
+            }
+            if (auto epoch = (*pkg)["epoch"].value<long long>()) {
+                if (*epoch < 0
+                    || static_cast<unsigned long long>(*epoch)
+                        > std::numeric_limits<uint32_t>::max()) {
+                    return std::unexpected("Package epoch is outside the uint32 range");
+                }
+                m.version.epoch = static_cast<uint32_t>(*epoch);
+            }
             m.description = (*pkg)["description"].value_or("");
             m.license = (*pkg)["license"].value_or("");
             m.channel = (*pkg)["channel"].value_or("system");
@@ -567,67 +603,70 @@ struct PackageManifest {
     }
 
     [[nodiscard]] std::string serialize_toml() const {
+        const auto quote = [](std::string_view value) {
+            return escape_toml_basic_string(value);
+        };
         std::ostringstream ss;
         ss << "schema_version = " << schema_version << "\n\n";
         ss << "[package]\n";
-        ss << "name = \"" << name << "\"\n";
-        ss << "version = \"" << version.ver << "\"\n";
-        ss << "release = \"" << version.rel << "\"\n";
+        ss << "name = \"" << quote(name) << "\"\n";
+        ss << "version = \"" << quote(version.ver) << "\"\n";
+        ss << "release = \"" << quote(version.rel) << "\"\n";
         if (version.epoch > 0) ss << "epoch = " << version.epoch << "\n";
-        ss << "description = \"" << description << "\"\n";
-        ss << "license = \"" << license << "\"\n";
-        ss << "channel = \"" << channel << "\"\n";
-        ss << "arch = \"" << arch << "\"\n";
+        ss << "description = \"" << quote(description) << "\"\n";
+        ss << "license = \"" << quote(license) << "\"\n";
+        ss << "channel = \"" << quote(channel) << "\"\n";
+        ss << "arch = \"" << quote(arch) << "\"\n";
         ss << "installed_size = " << installed_size << "\n\n";
 
         ss << "dependencies = [\n";
         for (const auto& d : dependencies) {
-            ss << "    \"" << d.to_string() << "\",\n";
+            ss << "    \"" << quote(d.to_string()) << "\",\n";
         }
         ss << "]\n\n";
 
         ss << "provides = [\n";
         for (const auto& p : provides) {
-            ss << "    \"" << p << "\",\n";
+            ss << "    \"" << quote(p) << "\",\n";
         }
         ss << "]\n\n";
 
         ss << "conflicts = [\n";
         for (const auto& c : conflicts) {
-            ss << "    \"" << c.to_string() << "\",\n";
+            ss << "    \"" << quote(c.to_string()) << "\",\n";
         }
         ss << "]\n\n";
 
         for (const auto& h : capability_hooks) {
             ss << "[[capability_hooks]]\n";
-            ss << "capability = \"" << h.capability << "\"\n";
-            ss << "exec = \"" << h.exec << "\"\n";
+            ss << "capability = \"" << quote(h.capability) << "\"\n";
+            ss << "exec = \"" << quote(h.exec) << "\"\n";
             ss << "args = [";
             for (size_t i = 0; i < h.args.size(); ++i) {
-                ss << (i ? ", " : "") << "\"" << h.args[i] << "\"";
+                ss << (i ? ", " : "") << "\"" << quote(h.args[i]) << "\"";
             }
             ss << "]\n\n";
         }
 
         for (const auto& t : triggers) {
             ss << "[[triggers]]\n";
-            ss << "name = \"" << t.name << "\"\n";
+            ss << "name = \"" << quote(t.name) << "\"\n";
             ss << "on_paths = [";
             for (size_t i = 0; i < t.on_paths.size(); ++i) {
-                ss << (i ? ", " : "") << "\"" << t.on_paths[i] << "\"";
+                ss << (i ? ", " : "") << "\"" << quote(t.on_paths[i]) << "\"";
             }
             ss << "]\n";
             ss << "on_capability = [";
             for (size_t i = 0; i < t.on_capability.size(); ++i) {
-                ss << (i ? ", " : "") << "\"" << t.on_capability[i] << "\"";
+                ss << (i ? ", " : "") << "\"" << quote(t.on_capability[i]) << "\"";
             }
             ss << "]\n";
-            ss << "run_capability = \"" << t.run_capability << "\"\n";
-            ss << "exec = \"" << t.exec << "\"\n";
+            ss << "run_capability = \"" << quote(t.run_capability) << "\"\n";
+            ss << "exec = \"" << quote(t.exec) << "\"\n";
             ss << "priority = " << t.priority << "\n";
             ss << "args = [";
             for (size_t i = 0; i < t.args.size(); ++i) {
-                ss << (i ? ", " : "") << "\"" << t.args[i] << "\"";
+                ss << (i ? ", " : "") << "\"" << quote(t.args[i]) << "\"";
             }
             ss << "]\n\n";
         }
@@ -637,18 +676,36 @@ struct PackageManifest {
         // and this serialization is also the LMDB record.
         for (const auto& f : files) {
             ss << "[[files]]\n";
-            ss << "path = \"" << f.path << "\"\n";
+            ss << "path = \"" << quote(f.path) << "\"\n";
             ss << "type = \"" << to_string(f.type) << "\"\n";
             ss << "mode = " << f.mode << "\n";
             ss << "size = " << f.size << "\n";
-            if (!f.sha256.empty()) ss << "sha256 = \"" << f.sha256 << "\"\n";
-            if (!f.link_target.empty()) ss << "link_target = \"" << f.link_target << "\"\n";
+            if (!f.sha256.empty()) ss << "sha256 = \"" << quote(f.sha256) << "\"\n";
+            if (!f.link_target.empty()) ss << "link_target = \"" << quote(f.link_target) << "\"\n";
             ss << "\n";
         }
 
         return ss.str();
     }
 };
+
+struct PackageIdentity {
+    std::string name;
+    Version version;
+    std::string arch;
+    std::string channel;
+
+    auto operator<=>(const PackageIdentity&) const = default;
+};
+
+inline PackageIdentity package_identity(const PackageManifest& manifest) {
+    return PackageIdentity{
+        .name = manifest.name,
+        .version = manifest.version,
+        .arch = manifest.arch,
+        .channel = manifest.channel,
+    };
+}
 
 // ============================================================================
 // Recipe Model for Package Building (`recipe.toml`)

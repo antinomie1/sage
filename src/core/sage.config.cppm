@@ -114,6 +114,12 @@ struct SystemConfig {
         const auto& tbl = *tbl_res;
 
         SystemConfig cfg;
+        // Existing system.toml files predate [capabilities]. Preserve the
+        // historic single-provider semantics for the three core interfaces;
+        // explicit entries below may still override any of these to shared.
+        cfg.capabilities["virtual/init"] = CapabilityKind::Exclusive;
+        cfg.capabilities["virtual/udev"] = CapabilityKind::Exclusive;
+        cfg.capabilities["virtual/libc"] = CapabilityKind::Exclusive;
 
         if (auto* sys = tbl.get_as<vendor::toml::table>("system")) {
             cfg.root_dir = (*sys)["root_dir"].value_or("/");

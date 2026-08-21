@@ -19,10 +19,15 @@ struct ProviderSwap {
     std::string target_provider;
 };
 
+struct PlannedPackageRemoval {
+    std::string name;
+    std::optional<package::PackageIdentity> expected_identity;
+};
+
 struct ReconcilePlan {
     std::vector<ProviderSwap> swaps;
     std::vector<package::PackageManifest> packages_to_install;
-    std::vector<std::string> packages_to_remove;
+    std::vector<PlannedPackageRemoval> packages_to_remove;
     service::InitType target_init{service::InitType::OpenRC};
     bool has_changes{false};
 };
@@ -248,6 +253,10 @@ public:
     {
         ReconcilePlan plan;
         auto current_providers = db.get_all_system_providers();
+        if (!current_providers) {
+            return std::unexpected(
+                "Failed to read current system providers: " + current_providers.error());
+        }
 
         // 1. Calculate provider diffs.
         //
@@ -258,7 +267,7 @@ public:
         // call, not what is installed -- reconciling on it would uninstall a
         // perfectly valid coexisting provider.
         for (const auto& [iface, target_prov] : desired_config.exclusive_providers()) {
-            std::string cur = current_providers.contains(iface) ? current_providers.at(iface) : "";
+            std::string cur = current_providers->contains(iface) ? current_providers->at(iface) : "";
             if (cur != target_prov) {
                 plan.swaps.push_back(ProviderSwap{
                     .iface = iface,
@@ -287,7 +296,18 @@ public:
                 .version = {}
             });
             if (!swap.current_provider.empty() && swap.current_provider != swap.target_provider) {
-                plan.packages_to_remove.push_back(swap.current_provider);
+                auto current_package = db.get_package(swap.current_provider);
+                if (!current_package) {
+                    return std::unexpected(std::format(
+                        "Failed to read current provider package '{}': {}",
+                        swap.current_provider, current_package.error()));
+                }
+                plan.packages_to_remove.push_back(PlannedPackageRemoval{
+                    .name = swap.current_provider,
+                    .expected_identity = *current_package
+                        ? std::optional{package::package_identity(**current_package)}
+                        : std::nullopt,
+                });
             }
         }
 
@@ -330,6 +350,23 @@ public:
         auto wtxn = db.begin_write_txn();
         if (!wtxn) return std::unexpected("Failed to open database write transaction");
 
+        // The plan was computed before taking the writer lock. Validate every
+        // provider binding before changing any of them so a stale reconcile
+        // cannot overwrite a concurrently committed provider choice.
+        for (const auto& swap : plan.swaps) {
+            auto current = db.get_system_provider(*wtxn, swap.iface);
+            if (!current) {
+                return std::unexpected(std::format(
+                    "Failed to revalidate provider '{}': {}", swap.iface, current.error()));
+            }
+            const std::string current_name = *current ? **current : std::string{};
+            if (current_name != swap.current_provider) {
+                return std::unexpected(std::format(
+                    "System provider '{}' changed after the reconcile plan was created",
+                    swap.iface));
+            }
+        }
+
         // 1. Update system provider locks in LMDB
         for (const auto& swap : plan.swaps) {
             auto set_res = db.set_system_provider(*wtxn, swap.iface, swap.target_provider);
@@ -337,17 +374,34 @@ public:
         }
 
         // 2. Unregister and remove obsolete packages
-        for (const auto& pkg_name : plan.packages_to_remove) {
-            if (auto old_pkg = db.get_package(pkg_name)) {
-                (void)db.unregister_files(*wtxn, old_pkg->files);
-                (void)db.unregister_provides(*wtxn, old_pkg->provides);
-                (void)db.del_package(*wtxn, pkg_name);
+        for (const auto& removal : plan.packages_to_remove) {
+            auto old_pkg = db.get_package(*wtxn, removal.name);
+            if (!old_pkg) {
+                return std::unexpected(std::format(
+                    "Failed to read package '{}' in reconcile transaction: {}",
+                    removal.name, old_pkg.error()));
+            }
+            auto current_identity = *old_pkg
+                ? std::optional{package::package_identity(**old_pkg)}
+                : std::nullopt;
+            if (current_identity != removal.expected_identity) {
+                return std::unexpected(std::format(
+                    "Installed package '{}' changed after the reconcile plan was created",
+                    removal.name));
+            }
+            if (*old_pkg) {
+                auto file_res = db.unregister_files(*wtxn, (**old_pkg).files);
+                if (!file_res) return std::unexpected(file_res.error());
+                auto provide_res = db.unregister_provides(*wtxn, (**old_pkg).provides);
+                if (!provide_res) return std::unexpected(provide_res.error());
+                auto delete_res = db.del_package(*wtxn, removal.name);
+                if (!delete_res) return std::unexpected(delete_res.error());
                 // Remove legacy service scripts
-                service::remove_service(pkg_name, service::InitType::OpenRC, sysroot);
-                service::remove_service(pkg_name, service::InitType::Systemd, sysroot);
-                service::remove_service(pkg_name, service::InitType::Runit, sysroot);
-                service::remove_service(pkg_name, service::InitType::Dinit, sysroot);
-                service::remove_service(pkg_name, service::InitType::S6, sysroot);
+                service::remove_service(removal.name, service::InitType::OpenRC, sysroot);
+                service::remove_service(removal.name, service::InitType::Systemd, sysroot);
+                service::remove_service(removal.name, service::InitType::Runit, sysroot);
+                service::remove_service(removal.name, service::InitType::Dinit, sysroot);
+                service::remove_service(removal.name, service::InitType::S6, sysroot);
             }
         }
 
@@ -366,8 +420,11 @@ public:
 
         // 4. Automatically re-generate native service configurations for ALL installed daemons
         auto installed = db.list_installed_packages();
+        if (!installed) {
+            return std::unexpected("Installed package database is inconsistent after reconcile: " + installed.error());
+        }
         size_t gen_count = 0;
-        for (const auto& pkg : installed) {
+        for (const auto& pkg : *installed) {
             // Check if package has service definition in database or package files
             service::ServiceSpec spec;
             spec.name = pkg.name;
@@ -383,7 +440,7 @@ public:
         TriggerContext trig_ctx;
         trig_ctx.sysroot = sysroot;
         trig_ctx.transaction_packages = plan.packages_to_install;
-        trig_ctx.installed_packages = db.list_installed_packages();
+        trig_ctx.installed_packages = std::move(*installed);
         trig_ctx.providers = providers;
         for (const auto& pkg : plan.packages_to_install) {
             trig_ctx.touched_files.insert(trig_ctx.touched_files.end(), pkg.files.begin(), pkg.files.end());

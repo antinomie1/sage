@@ -31,7 +31,7 @@ graph TB
 
     subgraph SolverLayer["4. 依赖求解与重构层 (Solver & Reconcile Layer)"]
         PubGrub["<b>Native C++23 PubGrub / CDCL SAT Solver</b><br/>(Version Ranges, Virtual Providers, SONAMEs)"]
-        RebuildEngine["<b>Reconcile Engine (`sage rebuild`)</b><br/>(Diff system.toml vs LMDB -> Atomic Swap)"]
+        RebuildEngine["<b>Reconcile Engine (`sage rebuild`)</b><br/>(Diff system.toml vs LMDB -> Guarded State Transition)"]
     end
 
     subgraph ArchiveLayer["5. 归档与解包层 (Streaming Archive Layer)"]
@@ -74,6 +74,21 @@ pkgname-1.0.0-1-x86_64.pkg.tar.zst
 │   └── service.toml      # Universal daemon specification (optional)
 └── data/                 # Direct filesystem payload (usr/bin/..., etc/...)
 ```
+
+Extraction is fail-closed: package paths are normalized and preflighted before
+the payload is written, and every parent directory is then opened relative to a
+trusted target-root file descriptor with symlink following disabled. Temporary
+regular files and their final rename stay relative to that verified directory,
+which prevents archive-controlled symlink traversal and pathname replacement.
+This is not a filesystem transaction against a privileged process concurrently
+moving an already-open target directory.
+
+Install replacement, remove plans, and provider rebuilds revalidate the state
+they planned from inside the LMDB write transaction. Existing files may migrate
+only from the exact `pkg_name:channel_name` owner recorded by that transaction;
+a concurrent package or provider change aborts the stale operation. LMDB state
+updates are transactional, but filesystem extraction/removal is not journaled
+for rollback if a later step fails.
 
 ---
 

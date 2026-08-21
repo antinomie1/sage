@@ -109,6 +109,7 @@ public:
         std::vector<package::PackageManifest> solution;
         std::set<std::string> visited_symbols;
         std::set<std::string> visited_packages;
+        std::map<std::string, std::string> selected_for_symbol;
         std::vector<package::Dependency> queue = root_requests;
 
         // Diagnostic cause tree recorder
@@ -142,6 +143,7 @@ public:
             }
 
             visited_symbols.insert(req.name);
+            selected_for_symbol[req.name] = best_candidate->name;
             if (visited_packages.contains(best_candidate->name)) {
                 continue;
             }
@@ -154,8 +156,36 @@ public:
             }
         }
 
-        // Sort solution in topological dependency install order
-        return solution;
+        // The discovery queue records roots before their dependencies. Reorder
+        // the selected set so every dependency is installed before its user.
+        std::map<std::string, const package::PackageManifest*> selected_by_name;
+        for (const auto& pkg : solution) {
+            selected_by_name[pkg.name] = &pkg;
+        }
+
+        std::map<std::string, std::uint8_t> visit_state;
+        std::vector<package::PackageManifest> install_order;
+        auto visit = [&](this auto&& self, const package::PackageManifest& pkg) -> void {
+            auto& state = visit_state[pkg.name];
+            if (state == 2) return;
+            if (state == 1) return; // dependency cycle: retain deterministic DFS order
+            state = 1;
+            for (const auto& dep : pkg.dependencies) {
+                auto selected = selected_for_symbol.find(dep.name);
+                if (selected == selected_for_symbol.end()) continue;
+                auto dependency = selected_by_name.find(selected->second);
+                if (dependency != selected_by_name.end()) {
+                    self(*dependency->second);
+                }
+            }
+            state = 2;
+            install_order.push_back(pkg);
+        };
+
+        for (const auto& pkg : solution) {
+            visit(pkg);
+        }
+        return install_order;
     }
 
 private:

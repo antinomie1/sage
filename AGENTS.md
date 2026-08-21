@@ -11,7 +11,7 @@ Welcome to the **Sage** project! This document establishes the engineering rules
 ### Key Architectural Pillars:
 * **Universal Multi-Layer Channel System**: Manages system root (`/`), shared runtimes (`/usr/lib/runtimes`), toolchains (`/opt/channels`), and user-level packages (`~/.local`) with strict FHS compliance via profile symlink aggregation.
 * **Minimal Core Virtual Providers**: Strictly scopes virtual interfaces to fundamental, mutually exclusive system components: `virtual/init`, `virtual/udev`, `virtual/libc`. Kernels, shells, awks, and utilities are pure, independent, coexisting packages.
-* **Declarative Reconcile Engine (`sage rebuild`)**: Reads `/etc/sage/system.toml`, calculates state diffs in LMDB, performs atomic package swaps, and auto-regenerates native service scripts for the active init system.
+* **Declarative Reconcile Engine (`sage rebuild`)**: Reads `/etc/sage/system.toml`, calculates state diffs, commits guarded provider/package state transitions through LMDB transactions, and auto-regenerates native service scripts for the active init system. Filesystem changes are not journaled, and concurrent same-privilege mutation of the target root is outside the supported operation model.
 * **Universal Service Specification (`service.toml`)**: Decouples services from any single init daemon, auto-compiling into OpenRC, Runit, Systemd, Dinit, and s6 configurations.
 * **Zero-Copy ACID State Storage (LMDB)**: Ultra-fast memory-mapped B+ tree database with nanosecond reads and Copy-on-Write transaction safety.
 * **Native C++23 Streaming Archive Engine**: Self-contained streaming Tar reader/writer directly compressed with `libzstd` (no `libarchive` bloat).
@@ -74,7 +74,7 @@ sage/
 │   │   ├── sage.db.cppm          # LMDB package registry, file ownership & transaction engine
 │   │   ├── sage.archive.cppm     # Native C++23 streaming Tar + Zstd extractor & packager
 │   │   ├── sage.solver.cppm      # Native PubGrub / CDCL SAT dependency solver
-│   │   └── sage.rebuild.cppm     # System reconcile & atomic rebuild orchestration
+│   │   └── sage.rebuild.cppm     # System reconcile & guarded rebuild orchestration
 │   ├── sage.cppm                 # Primary root module aggregating and re-exporting all modules
 │   └── cli/
 │       └── main.cpp              # CLI entry point (pure `import sage;`)
@@ -96,8 +96,8 @@ xmake
 # Run the compiled binary
 xmake run sage --help
 
-# Run all test suites
-xmake test
+# Run the integrated architecture and regression suite
+xmake run sage test-suite
 ```
 
 ---

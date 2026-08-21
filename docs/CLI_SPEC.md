@@ -22,6 +22,7 @@ Global Options:
 
 ### `sage install <PKG...>`
 Resolves dependencies via PubGrub SAT solver, unpacks `*.pkg.tar.zst` streams to target channel scope, writes LMDB state records, and executes triggers.
+Archive writes are anchored to the target root without following parent symlinks. If the installed identity changes concurrently after dependency resolution, the command exits without applying the stale package migration.
 ```bash
 # Install packages into system channel (root)
 sage install ripgrep neovim
@@ -35,12 +36,13 @@ sage install --dry-run waybar
 
 ### `sage remove <PKG...>`
 Removes installed package files, unregisters LMDB records, and removes generated service scripts.
+The complete installed-package snapshot is checked again under the LMDB writer lock before any files are removed; a concurrent package change aborts the stale removal plan.
 ```bash
 sage remove nginx
 ```
 
 ### `sage rebuild`
-**Declarative System Reconcile**: Compares `/etc/sage/system.toml` against active LMDB state. Performs atomic swaps of core virtual providers (`virtual/init`, `virtual/udev`) and automatically re-generates all native daemon service scripts.
+**Declarative System Reconcile**: Compares `/etc/sage/system.toml` against active LMDB state. Performs guarded swaps of exclusive virtual providers (`virtual/init`, `virtual/udev`) and automatically re-generates all native daemon service scripts. Provider locks and packages scheduled for removal are revalidated inside the LMDB write transaction before the plan is applied.
 ```bash
 # Preview what rebuild would change
 sage rebuild --dry-run

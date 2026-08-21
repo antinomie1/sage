@@ -77,14 +77,35 @@ public:
     // Packages Table
     // ========================================================================
 
-    std::optional<package::PackageManifest> get_package(std::string_view name) {
+    std::expected<std::optional<package::PackageManifest>, std::string> get_package(
+        std::string_view name)
+    {
         auto txn = begin_read_txn();
-        if (!txn) return std::nullopt;
-        auto val = dbi_packages_.get(*txn, name);
-        if (!val) return std::nullopt;
-        auto parsed = package::PackageManifest::parse_toml(*val);
-        if (!parsed) return std::nullopt;
-        return *parsed;
+        if (!txn) {
+            return std::unexpected("Failed to open installed package read transaction: " + txn.error());
+        }
+        return get_package(*txn, name);
+    }
+
+    std::expected<std::optional<package::PackageManifest>, std::string> get_package(
+        vendor::lmdb::MdbTxn& txn,
+        std::string_view name)
+    {
+        auto val = dbi_packages_.get_checked(txn, name);
+        if (!val) {
+            return std::unexpected("Failed to read installed package metadata: " + val.error());
+        }
+        if (!*val) return std::optional<package::PackageManifest>{};
+        auto parsed = package::PackageManifest::parse_toml(**val);
+        if (!parsed) {
+            return std::unexpected(std::format(
+                "Failed to parse installed package '{}' metadata: {}", name, parsed.error()));
+        }
+        if (parsed->name != name) {
+            return std::unexpected(std::format(
+                "Installed package key '{}' contains metadata for '{}'", name, parsed->name));
+        }
+        return std::optional<package::PackageManifest>{std::move(*parsed)};
     }
 
     std::expected<void, std::string> put_package(
@@ -102,22 +123,41 @@ public:
         return dbi_packages_.del(txn, name);
     }
 
-    std::vector<package::PackageManifest> list_installed_packages() {
-        std::vector<package::PackageManifest> list;
+    std::expected<std::vector<package::PackageManifest>, std::string> list_installed_packages() {
         auto txn = begin_read_txn();
-        if (!txn) return list;
+        if (!txn) return std::unexpected("Failed to open installed package read transaction: " + txn.error());
+        return list_installed_packages(*txn);
+    }
 
-        auto cur_res = vendor::lmdb::MdbCursor::open(*txn, dbi_packages_);
-        if (!cur_res) return list;
+    std::expected<std::vector<package::PackageManifest>, std::string> list_installed_packages(
+        vendor::lmdb::MdbTxn& txn)
+    {
+        std::vector<package::PackageManifest> list;
+        auto cur_res = vendor::lmdb::MdbCursor::open(txn, dbi_packages_);
+        if (!cur_res) return std::unexpected("Failed to open installed package cursor: " + cur_res.error());
         auto& cursor = *cur_res;
 
         std::string_view k, v;
-        if (cursor.first(k, v)) {
-            do {
-                if (auto pkg = package::PackageManifest::parse_toml(v)) {
-                    list.push_back(std::move(*pkg));
-                }
-            } while (cursor.next(k, v));
+        auto entry = cursor.first(k, v);
+        if (!entry) {
+            return std::unexpected("Failed to read installed package cursor: " + entry.error());
+        }
+        while (*entry) {
+            auto pkg = package::PackageManifest::parse_toml(v);
+            if (!pkg) {
+                return std::unexpected(std::format(
+                    "Failed to parse installed package '{}' metadata: {}", k, pkg.error()));
+            }
+            if (pkg->name != k) {
+                return std::unexpected(std::format(
+                    "Installed package key '{}' contains metadata for '{}'", k, pkg->name));
+            }
+            list.push_back(std::move(*pkg));
+
+            entry = cursor.next(k, v);
+            if (!entry) {
+                return std::unexpected("Failed to advance installed package cursor: " + entry.error());
+            }
         }
         return list;
     }
@@ -126,41 +166,94 @@ public:
     // Files Table & Conflict Detection
     // ========================================================================
 
-    std::optional<std::string> get_file_owner(std::string_view rel_path) {
+    std::expected<std::optional<std::string>, std::string> get_file_owner(
+        std::string_view rel_path)
+    {
         auto txn = begin_read_txn();
-        if (!txn) return std::nullopt;
-        auto cleaned = util::clean_rel_path(rel_path);
-        auto val = dbi_files_.get(*txn, cleaned);
-        if (val) return std::string(*val);
-        return std::nullopt;
+        if (!txn) {
+            return std::unexpected("Failed to open file ownership read transaction: " + txn.error());
+        }
+        return get_file_owner(*txn, rel_path);
     }
 
-    std::vector<std::string> get_package_files(std::string_view package_name) {
-        std::vector<std::string> files;
+    std::expected<std::optional<std::string>, std::string> get_file_owner(
+        vendor::lmdb::MdbTxn& txn,
+        std::string_view rel_path)
+    {
+        auto cleaned = util::clean_rel_path(rel_path);
+        auto val = dbi_files_.get_checked(txn, cleaned);
+        if (!val) {
+            return std::unexpected("Failed to read file ownership: " + val.error());
+        }
+        if (!*val) return std::optional<std::string>{};
+        return std::optional<std::string>{std::string(**val)};
+    }
+
+    std::expected<std::vector<std::string>, std::string> get_package_files(
+        std::string_view package_name)
+    {
         auto txn = begin_read_txn();
-        if (!txn) return files;
-        auto cur_res = vendor::lmdb::MdbCursor::open(*txn, dbi_files_);
-        if (!cur_res) return files;
+        if (!txn) return std::unexpected("Failed to open file ownership read transaction: " + txn.error());
+        return get_package_files(*txn, package_name);
+    }
+
+    std::expected<std::vector<std::string>, std::string> get_package_files(
+        vendor::lmdb::MdbTxn& txn,
+        std::string_view package_name)
+    {
+        std::vector<std::string> files;
+        auto cur_res = vendor::lmdb::MdbCursor::open(txn, dbi_files_);
+        if (!cur_res) return std::unexpected("Failed to open file ownership cursor: " + cur_res.error());
         auto& cursor = *cur_res;
         std::string_view k, v;
-        if (cursor.first(k, v)) {
-            do {
-                if (v == package_name || v.starts_with(std::string(package_name) + ":")) {
-                    files.emplace_back(k);
-                }
-            } while (cursor.next(k, v));
+        auto entry = cursor.first(k, v);
+        if (!entry) return std::unexpected("Failed to read file ownership cursor: " + entry.error());
+        while (*entry) {
+            if (v == package_name || v.starts_with(std::string(package_name) + ":")) {
+                files.emplace_back(k);
+            }
+            entry = cursor.next(k, v);
+            if (!entry) return std::unexpected("Failed to advance file ownership cursor: " + entry.error());
         }
         return files;
     }
 
     // Register package files into LMDB with atomic conflict checking
+    std::expected<void, std::string> check_file_conflicts(
+        vendor::lmdb::MdbTxn& txn,
+        std::optional<std::string_view> allowed_owner,
+        const std::vector<package::FileEntry>& files)
+    {
+        for (const auto& f : files) {
+            if (f.type == package::FileType::Directory) continue;
+            auto cleaned = util::clean_rel_path(f.path);
+            if (cleaned == "usr/share/info/dir" || cleaned.ends_with("/info/dir")) continue;
+
+            auto existing = dbi_files_.get_checked(txn, cleaned);
+            if (!existing) {
+                return std::unexpected(std::format(
+                    "Failed to check ownership for '{}': {}", cleaned, existing.error()));
+            }
+            if (*existing && (!allowed_owner || **existing != *allowed_owner)) {
+                return std::unexpected(std::format(
+                    "File conflict: '{}' is already owned by '{}'",
+                    cleaned, **existing));
+            }
+        }
+        return {};
+    }
+
     std::expected<void, std::string> register_files(
         vendor::lmdb::MdbTxn& txn,
         std::string_view pkg_name,
         std::string_view channel,
-        const std::vector<package::FileEntry>& files) 
+        const std::vector<package::FileEntry>& files,
+        std::optional<std::string_view> allowed_owner = std::nullopt)
     {
         std::string owner_val = std::format("{}:{}", pkg_name, channel);
+
+        auto conflict_res = check_file_conflicts(txn, allowed_owner, files);
+        if (!conflict_res) return conflict_res;
 
         // Insert file records (new owner claims file)
         for (const auto& f : files) {
@@ -184,7 +277,12 @@ public:
             auto cleaned = util::clean_rel_path(f.path);
             if (cleaned == "usr/share/info/dir" || cleaned.ends_with("/info/dir")) continue;
             if (!expected_owner.empty()) {
-                if (auto existing = dbi_files_.get(txn, cleaned); existing && *existing != expected_owner) {
+                auto existing = dbi_files_.get_checked(txn, cleaned);
+                if (!existing) {
+                    return std::unexpected(std::format(
+                        "Failed to read ownership for '{}': {}", cleaned, existing.error()));
+                }
+                if (*existing && **existing != expected_owner) {
                     continue;
                 }
             }
@@ -199,27 +297,40 @@ public:
     // behind by upgrades/removes (e.g. when a previous version's manifest file
     // list was incomplete) would otherwise block other packages from claiming
     // the same paths. Returns the number of pruned entries.
-    std::size_t prune_orphaned_files(
-        vendor::lmdb::MdbTxn& txn,
-        const std::unordered_set<std::string>& installed_names)
+    std::expected<std::size_t, std::string> prune_orphaned_files(
+        vendor::lmdb::MdbTxn& txn)
     {
         std::vector<std::string> orphaned;
+        std::unordered_map<std::string, bool> package_exists;
         auto cur_res = vendor::lmdb::MdbCursor::open(txn, dbi_files_);
-        if (!cur_res) return 0;
+        if (!cur_res) return std::unexpected("Failed to open orphaned-file cursor: " + cur_res.error());
         auto& cursor = *cur_res;
         std::string_view k, v;
-        if (cursor.first(k, v)) {
-            do {
-                std::string_view owner = v;
-                auto colon = owner.find(':');
-                std::string_view pkg = colon == std::string_view::npos ? owner : owner.substr(0, colon);
-                if (!installed_names.contains(std::string(pkg))) {
-                    orphaned.emplace_back(k);
+        auto entry = cursor.first(k, v);
+        if (!entry) return std::unexpected("Failed to read orphaned-file cursor: " + entry.error());
+        while (*entry) {
+            std::string_view owner = v;
+            auto colon = owner.find(':');
+            std::string package_name(
+                colon == std::string_view::npos ? owner : owner.substr(0, colon));
+            auto known = package_exists.find(package_name);
+            if (known == package_exists.end()) {
+                auto package = dbi_packages_.get_checked(txn, package_name);
+                if (!package) {
+                    return std::unexpected(
+                        "Failed to check package while pruning ownership: " + package.error());
                 }
-            } while (cursor.next(k, v));
+                known = package_exists.emplace(package_name, package->has_value()).first;
+            }
+            if (!known->second) {
+                orphaned.emplace_back(k);
+            }
+            entry = cursor.next(k, v);
+            if (!entry) return std::unexpected("Failed to advance orphaned-file cursor: " + entry.error());
         }
         for (const auto& key : orphaned) {
-            (void)dbi_files_.del(txn, key);
+            auto deleted = dbi_files_.del(txn, key);
+            if (!deleted) return std::unexpected("Failed to prune orphaned file ownership: " + deleted.error());
         }
         return orphaned.size();
     }
@@ -263,12 +374,26 @@ public:
     // System Providers Table (virtual/init, virtual/udev, virtual/libc)
     // ========================================================================
 
-    std::optional<std::string> get_system_provider(std::string_view iface) {
+    std::expected<std::optional<std::string>, std::string> get_system_provider(
+        std::string_view iface)
+    {
         auto txn = begin_read_txn();
-        if (!txn) return std::nullopt;
-        auto val = dbi_system_.get(*txn, iface);
-        if (val) return std::string(*val);
-        return std::nullopt;
+        if (!txn) {
+            return std::unexpected("Failed to open system provider read transaction: " + txn.error());
+        }
+        return get_system_provider(*txn, iface);
+    }
+
+    std::expected<std::optional<std::string>, std::string> get_system_provider(
+        vendor::lmdb::MdbTxn& txn,
+        std::string_view iface)
+    {
+        auto val = dbi_system_.get_checked(txn, iface);
+        if (!val) {
+            return std::unexpected("Failed to read system provider: " + val.error());
+        }
+        if (!*val) return std::optional<std::string>{};
+        return std::optional<std::string>{std::string(**val)};
     }
 
     std::expected<void, std::string> set_system_provider(
@@ -279,20 +404,22 @@ public:
         return dbi_system_.put(txn, iface, provider);
     }
 
-    std::map<std::string, std::string> get_all_system_providers() {
+    std::expected<std::map<std::string, std::string>, std::string> get_all_system_providers() {
         std::map<std::string, std::string> res;
         auto txn = begin_read_txn();
-        if (!txn) return res;
+        if (!txn) return std::unexpected("Failed to open system provider read transaction: " + txn.error());
 
         auto cur_res = vendor::lmdb::MdbCursor::open(*txn, dbi_system_);
-        if (!cur_res) return res;
+        if (!cur_res) return std::unexpected("Failed to open system provider cursor: " + cur_res.error());
         auto& cursor = *cur_res;
 
         std::string_view k, v;
-        if (cursor.first(k, v)) {
-            do {
-                res[std::string(k)] = std::string(v);
-            } while (cursor.next(k, v));
+        auto entry = cursor.first(k, v);
+        if (!entry) return std::unexpected("Failed to read system provider cursor: " + entry.error());
+        while (*entry) {
+            res[std::string(k)] = std::string(v);
+            entry = cursor.next(k, v);
+            if (!entry) return std::unexpected("Failed to advance system provider cursor: " + entry.error());
         }
         return res;
     }
