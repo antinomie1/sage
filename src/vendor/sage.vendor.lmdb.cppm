@@ -271,8 +271,12 @@ public:
         }
     }
 
-    bool get(MDB_cursor_op op, std::string_view& key, std::string_view& val) noexcept {
-        if (!cursor_) return false;
+    std::expected<bool, std::string> get(
+        MDB_cursor_op op,
+        std::string_view& key,
+        std::string_view& val) noexcept
+    {
+        if (!cursor_) return std::unexpected("Invalid cursor");
         MDB_val k = to_val(key);
         MDB_val v = to_val(val);
         int rc = mdb_cursor_get(cursor_, &k, &v, op);
@@ -281,22 +285,35 @@ public:
             val = from_val(v);
             return true;
         }
-        return false;
+        if (rc == MDB_NOTFOUND) return false;
+        return std::unexpected(mdb_strerror(rc));
     }
 
-    bool first(std::string_view& key, std::string_view& val) noexcept {
+    std::expected<bool, std::string> first(
+        std::string_view& key,
+        std::string_view& val) noexcept
+    {
         return get(MDB_FIRST, key, val);
     }
 
-    bool next(std::string_view& key, std::string_view& val) noexcept {
+    std::expected<bool, std::string> next(
+        std::string_view& key,
+        std::string_view& val) noexcept
+    {
         return get(MDB_NEXT, key, val);
     }
 
-    bool seek(std::string_view& key, std::string_view& val) noexcept {
+    std::expected<bool, std::string> seek(
+        std::string_view& key,
+        std::string_view& val) noexcept
+    {
         return get(MDB_SET, key, val);
     }
 
-    bool seek_range(std::string_view& key, std::string_view& val) noexcept {
+    std::expected<bool, std::string> seek_range(
+        std::string_view& key,
+        std::string_view& val) noexcept
+    {
         return get(MDB_SET_RANGE, key, val);
     }
 

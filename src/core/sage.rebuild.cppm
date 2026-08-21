@@ -19,10 +19,15 @@ struct ProviderSwap {
     std::string target_provider;
 };
 
+struct PlannedPackageRemoval {
+    std::string name;
+    std::optional<package::PackageIdentity> expected_identity;
+};
+
 struct ReconcilePlan {
     std::vector<ProviderSwap> swaps;
     std::vector<package::PackageManifest> packages_to_install;
-    std::vector<std::string> packages_to_remove;
+    std::vector<PlannedPackageRemoval> packages_to_remove;
     service::InitType target_init{service::InitType::OpenRC};
     bool has_changes{false};
 };
@@ -91,10 +96,14 @@ public:
     {
         ReconcilePlan plan;
         auto current_providers = db.get_all_system_providers();
+        if (!current_providers) {
+            return std::unexpected(
+                "Failed to read current system providers: " + current_providers.error());
+        }
 
         // 1. Calculate provider diffs (virtual/init, virtual/udev, virtual/libc)
         for (const auto& [iface, target_prov] : desired_config.providers) {
-            std::string cur = current_providers.contains(iface) ? current_providers.at(iface) : "";
+            std::string cur = current_providers->contains(iface) ? current_providers->at(iface) : "";
             if (cur != target_prov) {
                 plan.swaps.push_back(ProviderSwap{
                     .iface = iface,
@@ -123,7 +132,18 @@ public:
                 .version = {}
             });
             if (!swap.current_provider.empty() && swap.current_provider != swap.target_provider) {
-                plan.packages_to_remove.push_back(swap.current_provider);
+                auto current_package = db.get_package(swap.current_provider);
+                if (!current_package) {
+                    return std::unexpected(std::format(
+                        "Failed to read current provider package '{}': {}",
+                        swap.current_provider, current_package.error()));
+                }
+                plan.packages_to_remove.push_back(PlannedPackageRemoval{
+                    .name = swap.current_provider,
+                    .expected_identity = *current_package
+                        ? std::optional{package::package_identity(**current_package)}
+                        : std::nullopt,
+                });
             }
         }
 
@@ -143,11 +163,6 @@ public:
         const std::filesystem::path& sysroot = "/",
         bool dry_run = false) 
     {
-        auto installed_before = db.list_installed_packages();
-        if (!installed_before) {
-            return std::unexpected("Installed package database is inconsistent: " + installed_before.error());
-        }
-
         if (!plan.has_changes) {
             util::log_info("System state matches desired configuration. No reconcile needed.");
             return {};
@@ -177,19 +192,34 @@ public:
         }
 
         // 2. Unregister and remove obsolete packages
-        for (const auto& pkg_name : plan.packages_to_remove) {
-            auto old_pkg = std::ranges::find(
-                *installed_before, pkg_name, &package::PackageManifest::name);
-            if (old_pkg != installed_before->end()) {
-                (void)db.unregister_files(*wtxn, old_pkg->files);
-                (void)db.unregister_provides(*wtxn, old_pkg->provides);
-                (void)db.del_package(*wtxn, pkg_name);
+        for (const auto& removal : plan.packages_to_remove) {
+            auto old_pkg = db.get_package(*wtxn, removal.name);
+            if (!old_pkg) {
+                return std::unexpected(std::format(
+                    "Failed to read package '{}' in reconcile transaction: {}",
+                    removal.name, old_pkg.error()));
+            }
+            auto current_identity = *old_pkg
+                ? std::optional{package::package_identity(**old_pkg)}
+                : std::nullopt;
+            if (current_identity != removal.expected_identity) {
+                return std::unexpected(std::format(
+                    "Installed package '{}' changed after the reconcile plan was created",
+                    removal.name));
+            }
+            if (*old_pkg) {
+                auto file_res = db.unregister_files(*wtxn, (**old_pkg).files);
+                if (!file_res) return std::unexpected(file_res.error());
+                auto provide_res = db.unregister_provides(*wtxn, (**old_pkg).provides);
+                if (!provide_res) return std::unexpected(provide_res.error());
+                auto delete_res = db.del_package(*wtxn, removal.name);
+                if (!delete_res) return std::unexpected(delete_res.error());
                 // Remove legacy service scripts
-                service::remove_service(pkg_name, service::InitType::OpenRC, sysroot);
-                service::remove_service(pkg_name, service::InitType::Systemd, sysroot);
-                service::remove_service(pkg_name, service::InitType::Runit, sysroot);
-                service::remove_service(pkg_name, service::InitType::Dinit, sysroot);
-                service::remove_service(pkg_name, service::InitType::S6, sysroot);
+                service::remove_service(removal.name, service::InitType::OpenRC, sysroot);
+                service::remove_service(removal.name, service::InitType::Systemd, sysroot);
+                service::remove_service(removal.name, service::InitType::Runit, sysroot);
+                service::remove_service(removal.name, service::InitType::Dinit, sysroot);
+                service::remove_service(removal.name, service::InitType::S6, sysroot);
             }
         }
 

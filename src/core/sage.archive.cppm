@@ -4,6 +4,7 @@ module;
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <stdio.h>
 #include <cerrno>
 #include <cstring>
 #include <zstd.h>
@@ -152,14 +153,10 @@ struct ArchiveEntryView {
 
 template <typename Handler>
 inline std::expected<void, std::string> walk_archive_entries(
-    const std::filesystem::path& archive_path,
+    std::istream& file,
+    std::string_view archive_name,
     Handler&& handler)
 {
-    std::ifstream file(archive_path, std::ios::binary);
-    if (!file.is_open()) {
-        return std::unexpected("Cannot open package archive: " + archive_path.string());
-    }
-
     vendor::zstd::ZstdDecompressStream zstd_stream;
     if (!zstd_stream) {
         return std::unexpected("Failed to initialize ZSTD decompressor");
@@ -254,13 +251,13 @@ inline std::expected<void, std::string> walk_archive_entries(
     }
 
     if (file.bad()) {
-        return std::unexpected("Failed while reading package archive: " + archive_path.string());
+        return std::unexpected("Failed while reading package archive: " + std::string(archive_name));
     }
     if (!frame_finished) {
-        return std::unexpected("Truncated ZSTD package archive: " + archive_path.string());
+        return std::unexpected("Truncated ZSTD package archive: " + std::string(archive_name));
     }
     if (!ring.empty()) {
-        return std::unexpected("Truncated tar block in package archive: " + archive_path.string());
+        return std::unexpected("Truncated tar block in package archive: " + std::string(archive_name));
     }
     if (end_zero_blocks < 2) {
         return std::unexpected("Tar archive is missing its end marker");
@@ -269,10 +266,147 @@ inline std::expected<void, std::string> walk_archive_entries(
     return {};
 }
 
+template <typename Handler>
+inline std::expected<void, std::string> walk_archive_entries(
+    const std::filesystem::path& archive_path,
+    Handler&& handler)
+{
+    std::ifstream file(archive_path, std::ios::binary);
+    if (!file.is_open()) {
+        return std::unexpected("Cannot open package archive: " + archive_path.string());
+    }
+    return walk_archive_entries(file, archive_path.string(), std::forward<Handler>(handler));
+}
+
 struct PackageDataEntry {
     std::string path;
     char typeflag{'0'};
+    std::string link_target;
 };
+
+class UniqueTempFile {
+public:
+    UniqueTempFile(const UniqueTempFile&) = delete;
+    UniqueTempFile& operator=(const UniqueTempFile&) = delete;
+
+    UniqueTempFile(UniqueTempFile&& other) noexcept
+        : directory_fd_(std::exchange(other.directory_fd_, -1)),
+          fd_(std::exchange(other.fd_, -1)),
+          name_(std::exchange(other.name_, {})) {}
+
+    UniqueTempFile& operator=(UniqueTempFile&& other) noexcept {
+        if (this != &other) {
+            cleanup();
+            directory_fd_ = std::exchange(other.directory_fd_, -1);
+            fd_ = std::exchange(other.fd_, -1);
+            name_ = std::exchange(other.name_, {});
+        }
+        return *this;
+    }
+
+    ~UniqueTempFile() noexcept { cleanup(); }
+
+    static std::expected<UniqueTempFile, std::string> create(
+        const std::filesystem::path& directory)
+    {
+        int directory_flags = O_RDONLY | O_DIRECTORY;
+#ifdef O_CLOEXEC
+        directory_flags |= O_CLOEXEC;
+#endif
+        int directory_fd = ::open(directory.c_str(), directory_flags);
+        if (directory_fd < 0) {
+            return std::unexpected(std::format(
+                "Cannot open temporary-file directory: {}", std::strerror(errno)));
+        }
+
+        static std::atomic<uint64_t> sequence{0};
+        for (size_t attempt = 0; attempt < 128; ++attempt) {
+            auto name = std::format(
+                ".sage-tmp-{:x}-{:x}-{:x}",
+                static_cast<uint64_t>(::getpid()),
+                sequence.fetch_add(1, std::memory_order_relaxed),
+                static_cast<uint64_t>(std::random_device{}()));
+            int flags = O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW;
+#ifdef O_CLOEXEC
+            flags |= O_CLOEXEC;
+#endif
+            int fd = ::openat(directory_fd, name.c_str(), flags, 0600);
+            if (fd >= 0) {
+                return UniqueTempFile(directory_fd, fd, std::move(name));
+            }
+            if (errno != EEXIST) {
+                auto message = std::string(std::strerror(errno));
+                ::close(directory_fd);
+                return std::unexpected(std::format(
+                    "Cannot create temporary file: {}", message));
+            }
+        }
+        ::close(directory_fd);
+        return std::unexpected("Cannot create a unique temporary file after repeated collisions");
+    }
+
+    std::expected<void, std::string> write_all(std::span<const uint8_t> payload) {
+        size_t written = 0;
+        while (written < payload.size()) {
+            ssize_t count = ::write(fd_, payload.data() + written, payload.size() - written);
+            if (count < 0 && errno == EINTR) continue;
+            if (count <= 0) {
+                return std::unexpected(std::strerror(errno));
+            }
+            written += static_cast<size_t>(count);
+        }
+        return {};
+    }
+
+    std::expected<void, std::string> install(
+        const std::filesystem::path& destination,
+        uint32_t mode)
+    {
+        if (::fchmod(fd_, mode ? mode : 0644) != 0) {
+            return std::unexpected(std::format(
+                "Cannot set mode: {}", std::strerror(errno)));
+        }
+        if (::close(fd_) != 0) {
+            auto message = std::string(std::strerror(errno));
+            fd_ = -1;
+            return std::unexpected("Cannot close temporary file: " + message);
+        }
+        fd_ = -1;
+        auto destination_name = destination.filename().string();
+        if (::renameat(
+                directory_fd_, name_.c_str(), directory_fd_, destination_name.c_str()) != 0) {
+            return std::unexpected(
+                "Cannot atomically install temporary file: " + std::string(std::strerror(errno)));
+        }
+        name_.clear();
+        return {};
+    }
+
+private:
+    UniqueTempFile(int directory_fd, int fd, std::string name)
+        : directory_fd_(directory_fd), fd_(fd), name_(std::move(name)) {}
+
+    void cleanup() noexcept {
+        if (fd_ >= 0) {
+            ::close(fd_);
+            fd_ = -1;
+        }
+        if (directory_fd_ >= 0 && !name_.empty()) {
+            (void)::unlinkat(directory_fd_, name_.c_str(), 0);
+            name_.clear();
+        }
+        if (directory_fd_ >= 0) {
+            ::close(directory_fd_);
+            directory_fd_ = -1;
+        }
+    }
+
+    int directory_fd_{-1};
+    int fd_{-1};
+    std::string name_;
+};
+
+inline constexpr std::string_view temp_file_prefix = ".sage-tmp-";
 
 inline std::expected<std::string, std::string> normalize_data_path(std::string_view raw_path) {
     std::filesystem::path path(raw_path);
@@ -378,8 +512,9 @@ inline std::expected<void, std::string> validate_target_path(
     return {};
 }
 
-inline std::expected<InspectedPackage, std::string> inspect_package_impl(
-    const std::filesystem::path& archive_path,
+inline std::expected<InspectedPackage, std::string> inspect_package_stream(
+    std::istream& archive_file,
+    std::string_view archive_name,
     const std::filesystem::path* target_root)
 {
     std::string manifest_content;
@@ -388,9 +523,9 @@ inline std::expected<InspectedPackage, std::string> inspect_package_impl(
     bool service_seen = false;
     std::vector<PackageDataEntry> data_entries;
     std::unordered_set<std::string> data_paths;
-    std::unordered_set<std::string> archive_symlinks;
+    std::unordered_map<std::string, char> archive_entry_types;
 
-    auto walk_res = walk_archive_entries(archive_path, [&](const ArchiveEntryView& entry)
+    auto walk_res = walk_archive_entries(archive_file, archive_name, [&](const ArchiveEntryView& entry)
         -> std::expected<void, std::string> {
         if (entry.name == ".METADATA/manifest.toml") {
             if (manifest_seen) return std::unexpected("Package archive contains multiple manifests");
@@ -416,11 +551,21 @@ inline std::expected<InspectedPackage, std::string> inspect_package_impl(
         }
         auto path_res = normalize_data_path(std::string_view(entry.name).substr(5));
         if (!path_res) return std::unexpected(path_res.error());
+        for (const auto& component : std::filesystem::path(*path_res)) {
+            if (component.string().starts_with(temp_file_prefix)) {
+                return std::unexpected(
+                    "Package data path uses reserved temporary-file namespace: " + *path_res);
+            }
+        }
         if (!data_paths.insert(*path_res).second) {
             return std::unexpected("Package archive contains duplicate data path: " + *path_res);
         }
-        data_entries.push_back(PackageDataEntry{*path_res, entry.typeflag});
-        if (entry.typeflag == '2') archive_symlinks.insert(*path_res);
+        data_entries.push_back(PackageDataEntry{
+            .path = *path_res,
+            .typeflag = entry.typeflag,
+            .link_target = entry.typeflag == '2' ? std::string(entry.linkname) : std::string{},
+        });
+        archive_entry_types.emplace(*path_res, entry.typeflag);
         return {};
     });
     if (!walk_res) return std::unexpected(walk_res.error());
@@ -435,6 +580,33 @@ inline std::expected<InspectedPackage, std::string> inspect_package_impl(
 
     InspectedPackage result;
     result.manifest = std::move(*manifest_res);
+
+    constexpr std::array<std::pair<std::string_view, std::string_view>, 4> usr_merge_aliases{
+        std::pair{"bin", "usr/bin"},
+        std::pair{"sbin", "usr/sbin"},
+        std::pair{"lib", "usr/lib"},
+        std::pair{"lib64", "usr/lib64"},
+    };
+    for (const auto& entry : data_entries) {
+        auto top = std::string_view(entry.path);
+        if (auto slash = top.find('/'); slash != std::string_view::npos) {
+            top = top.substr(0, slash);
+        }
+        auto alias = std::ranges::find_if(
+            usr_merge_aliases, [&](const auto& candidate) { return candidate.first == top; });
+        if (alias == usr_merge_aliases.end()) continue;
+
+        const bool is_base_merge_link = result.manifest.name == "base-files"
+            && entry.path == top
+            && entry.typeflag == '2'
+            && entry.link_target == alias->second;
+        if (!is_base_merge_link) {
+            return std::unexpected(std::format(
+                "Package '{}' must use canonical usr/ paths instead of '{}'",
+                result.manifest.name, entry.path));
+        }
+    }
+
     if (service_seen) {
         auto service_res = service::ServiceSpec::parse_toml(service_content);
         if (!service_res) {
@@ -458,9 +630,10 @@ inline std::expected<InspectedPackage, std::string> inspect_package_impl(
         for (auto parent = std::filesystem::path(entry.path).parent_path();
              !parent.empty() && parent != ".";
              parent = parent.parent_path()) {
-            if (archive_symlinks.contains(parent.generic_string())) {
+            auto parent_entry = archive_entry_types.find(parent.generic_string());
+            if (parent_entry != archive_entry_types.end() && parent_entry->second != '5') {
                 return std::unexpected(std::format(
-                    "Package data path '{}' traverses archive symlink '{}'",
+                    "Package data path '{}' traverses non-directory archive entry '{}'",
                     entry.path, parent.generic_string()));
             }
         }
@@ -485,6 +658,17 @@ inline std::expected<InspectedPackage, std::string> inspect_package_impl(
     return result;
 }
 
+inline std::expected<InspectedPackage, std::string> inspect_package_impl(
+    const std::filesystem::path& archive_path,
+    const std::filesystem::path* target_root)
+{
+    std::ifstream archive_file(archive_path, std::ios::binary);
+    if (!archive_file.is_open()) {
+        return std::unexpected("Cannot open package archive: " + archive_path.string());
+    }
+    return inspect_package_stream(archive_file, archive_path.string(), target_root);
+}
+
 inline std::expected<InspectedPackage, std::string> inspect_package(
     const std::filesystem::path& archive_path)
 {
@@ -507,7 +691,12 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
     const std::filesystem::path& target_root,
     const package::PackageManifest* expected_manifest = nullptr)
 {
-    auto inspect_res = inspect_package(archive_path, target_root);
+    std::ifstream archive_file(archive_path, std::ios::binary);
+    if (!archive_file.is_open()) {
+        return std::unexpected("Cannot open package archive: " + archive_path.string());
+    }
+    const auto archive_name = archive_path.string();
+    auto inspect_res = inspect_package_stream(archive_file, archive_name, &target_root);
     if (!inspect_res) return std::unexpected(inspect_res.error());
     if (expected_manifest
         && package::package_identity(inspect_res->manifest)
@@ -524,7 +713,12 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
     result.manifest = std::move(inspect_res->manifest);
     result.service = std::move(inspect_res->service);
 
-    auto extract_res = walk_archive_entries(archive_path, [&](const ArchiveEntryView& archive_entry)
+    archive_file.clear();
+    archive_file.seekg(0);
+    if (!archive_file) {
+        return std::unexpected("Cannot rewind package archive: " + archive_name);
+    }
+    auto extract_res = walk_archive_entries(archive_file, archive_name, [&](const ArchiveEntryView& archive_entry)
         -> std::expected<void, std::string> {
         if (!archive_entry.name.starts_with("data/")) return {};
 
@@ -569,45 +763,20 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
             }
         } else {
             entry.type = package::FileType::Regular;
-            std::string tmp_file = dest_file.string() + ".sage_tmp";
-            int fd = ::open(tmp_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC,
-                            archive_entry.mode ? archive_entry.mode : 0644);
-            if (fd < 0) {
+            auto temp_res = UniqueTempFile::create(dest_file.parent_path());
+            if (!temp_res) {
                 return std::unexpected(std::format(
-                    "Cannot create temporary file for '{}': {}", rel_path, std::strerror(errno)));
+                    "Cannot create temporary file for '{}': {}", rel_path, temp_res.error()));
             }
-            size_t written = 0;
-            while (written < archive_entry.size) {
-                ssize_t count = ::write(fd, archive_entry.payload.data() + written,
-                                        archive_entry.size - written);
-                if (count < 0 && errno == EINTR) continue;
-                if (count <= 0) {
-                    auto message = std::string(std::strerror(errno));
-                    ::close(fd);
-                    std::filesystem::remove(tmp_file);
-                    return std::unexpected(std::format(
-                        "Cannot write '{}': {}", rel_path, message));
-                }
-                written += static_cast<size_t>(count);
-            }
-            if (::close(fd) != 0) {
-                auto message = std::string(std::strerror(errno));
-                std::filesystem::remove(tmp_file);
+            auto write_res = temp_res->write_all(archive_entry.payload);
+            if (!write_res) {
                 return std::unexpected(std::format(
-                    "Cannot close '{}': {}", rel_path, message));
+                    "Cannot write '{}': {}", rel_path, write_res.error()));
             }
-            if (::chmod(tmp_file.c_str(), archive_entry.mode ? archive_entry.mode : 0644) != 0) {
-                auto message = std::string(std::strerror(errno));
-                std::filesystem::remove(tmp_file);
+            auto install_res = temp_res->install(dest_file, archive_entry.mode);
+            if (!install_res) {
                 return std::unexpected(std::format(
-                    "Cannot set mode on '{}': {}", rel_path, message));
-            }
-            std::error_code ren_ec;
-            std::filesystem::rename(tmp_file, dest_file, ren_ec);
-            if (ren_ec) {
-                std::filesystem::remove(tmp_file);
-                return std::unexpected(std::format(
-                    "Cannot install '{}': {}", rel_path, ren_ec.message()));
+                    "Cannot install '{}': {}", rel_path, install_res.error()));
             }
 
             util::Sha256 hasher;
@@ -826,6 +995,7 @@ inline std::expected<void, std::string> generate_repo_index(
             ss << "name = \"" << quote(m.name) << "\"\n";
             ss << "version = \"" << quote(m.version.ver) << "\"\n";
             ss << "release = \"" << quote(m.version.rel) << "\"\n";
+            if (m.version.epoch > 0) ss << "epoch = " << m.version.epoch << "\n";
             ss << "description = \"" << quote(m.description) << "\"\n";
             ss << "license = \"" << quote(m.license) << "\"\n";
             ss << "channel = \"" << quote(m.channel) << "\"\n";

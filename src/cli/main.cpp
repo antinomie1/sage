@@ -237,12 +237,16 @@ int cmd_install(const CliOptions& opts) {
     std::vector<sage::package::PackageManifest> pool;
     std::map<sage::package::PackageIdentity, std::filesystem::path> package_archive_map;
 
-    for (const auto& ch_cfg : cfg.channels) {
+    auto channel_configs = cfg.channels;
+    std::ranges::stable_sort(channel_configs, std::greater{},
+        &sage::config::ChannelConfig::priority);
+    for (const auto& ch_cfg : channel_configs) {
         if (!ch_cfg.enabled) continue;
         sage::channel::Channel ch;
         ch.name = ch_cfg.name;
         ch.url = ch_cfg.url;
         ch.scope = sage::channel::parse_scope(ch_cfg.scope);
+        ch.priority = ch_cfg.priority;
 
         // Fetch channel index
         auto idx_res = sage::channel::ProfileManager::sync_channel(ch, cfg.cache_dir);
@@ -266,7 +270,11 @@ int cmd_install(const CliOptions& opts) {
                 if (!std::filesystem::exists(local_p)) {
                     local_p = dir_base / std::format("{}-{}.pkg.tar.zst", pkg.name, pkg.version.ver);
                 }
-                package_archive_map[sage::package::package_identity(pkg)] = local_p;
+                // Equal-version solver ties keep the first candidate. Preserve
+                // the same priority-ordered source here so metadata and payload
+                // always come from one repository.
+                package_archive_map.try_emplace(
+                    sage::package::package_identity(pkg), std::move(local_p));
             }
         }
     }
@@ -338,8 +346,19 @@ int cmd_install(const CliOptions& opts) {
     std::vector<sage::package::PackageManifest> to_install;
     for (auto& pkg : unique_to_install) {
         auto it = installed_by_name.find(pkg.name);
-        if (it != installed_by_name.end() && it->second.version >= pkg.version) {
-            auto db_files = it->second.files.empty() ? db.get_package_files(pkg.name) : std::vector<std::string>{};
+        const bool exact_direct_request = direct_package_names.contains(pkg.name);
+        if (!exact_direct_request
+            && it != installed_by_name.end() && it->second.version >= pkg.version) {
+            std::vector<std::string> db_files;
+            if (it->second.files.empty()) {
+                auto db_files_res = db.get_package_files(pkg.name);
+                if (!db_files_res) {
+                    sage::util::log_error(
+                        "Failed to read files owned by '{}': {}", pkg.name, db_files_res.error());
+                    return 1;
+                }
+                db_files = std::move(*db_files_res);
+            }
             bool files_present = true;
             if (!it->second.files.empty()) {
                 for (const auto& f : it->second.files) {
@@ -418,13 +437,17 @@ int cmd_install(const CliOptions& opts) {
         return 1;
     }
     auto pruned = db.prune_orphaned_files(*prune_txn, installed_names);
+    if (!pruned) {
+        sage::util::log_error("Failed to prune orphaned file registrations: {}", pruned.error());
+        return 1;
+    }
     auto prune_commit = prune_txn->commit();
     if (!prune_commit) {
         sage::util::log_error("Failed to commit orphan-pruning transaction: {}", prune_commit.error());
         return 1;
     }
-    if (pruned > 0) {
-        sage::util::log_info("  ~ pruned {} orphaned file registration(s)", pruned);
+    if (*pruned > 0) {
+        sage::util::log_info("  ~ pruned {} orphaned file registration(s)", *pruned);
     }
 
     std::vector<sage::channel::Channel> active_channels;
@@ -435,22 +458,18 @@ int cmd_install(const CliOptions& opts) {
         ch.enabled = ch_cfg.enabled;
         active_channels.push_back(std::move(ch));
     }
-    std::set<std::pair<std::string, std::string>> activated_toolchains;
     std::vector<sage::package::FileEntry> all_installed_files;
 
     auto run_package_postprocessing = [&](const sage::package::PackageManifest& installed_pkg) {
         auto spec = sage::channel::SubChannelSpec::parse(installed_pkg.channel);
         if (spec.scope == sage::channel::ChannelScope::Toolchain
             && !spec.category.empty() && !spec.slot.empty()) {
-            auto key = std::make_pair(spec.category, spec.slot);
-            if (activated_toolchains.insert(key).second) {
-                auto act_res = sage::channel::ProfileManager::switch_active_toolchain(
-                    opts.target_root, spec.category, spec.slot);
-                if (!act_res) {
-                    sage::util::log_warn(
-                        "Failed to activate toolchain '{}:{}': {}",
-                        spec.category, spec.slot, act_res.error());
-                }
+            auto act_res = sage::channel::ProfileManager::switch_active_toolchain(
+                opts.target_root, spec.category, spec.slot);
+            if (!act_res) {
+                sage::util::log_warn(
+                    "Failed to activate toolchain '{}:{}': {}",
+                    spec.category, spec.slot, act_res.error());
             }
         }
 
@@ -497,29 +516,68 @@ int cmd_install(const CliOptions& opts) {
         // ownership can transition to other packages (e.g. split -dev/-libs
         // children claim headers/libs the old monolithic version used to own).
         auto old_it = installed_by_name.find(pkg.name);
-        if (old_it != installed_by_name.end() && old_it->second.version != pkg.version) {
+        if (old_it != installed_by_name.end()
+            && sage::package::package_identity(old_it->second) != identity) {
             std::unordered_set<std::string> new_paths;
             for (const auto& f : installed_pkg.files) {
                 new_paths.insert(sage::util::clean_rel_path(f.path));
             }
             std::vector<sage::package::FileEntry> stale;
-            std::string my_owner = std::format("{}:{}", pkg.name, pkg.channel);
-            for (const auto& old_path : db.get_package_files(pkg.name)) {
+            std::string old_owner = std::format("{}:{}", pkg.name, old_it->second.channel);
+            auto old_paths = db.get_package_files(*package_txn, pkg.name);
+            if (!old_paths) {
+                sage::util::log_error(
+                    "Failed to read previous files for '{}': {}", pkg.name, old_paths.error());
+                return 1;
+            }
+            for (const auto& old_path : *old_paths) {
                 if (new_paths.contains(old_path)) continue;
-                if (auto cur_owner = db.get_file_owner(old_path); cur_owner && *cur_owner != my_owner) {
+                auto cur_owner = db.get_file_owner(*package_txn, old_path);
+                if (!cur_owner) {
+                    sage::util::log_error(
+                        "Failed to read ownership for '{}': {}", old_path, cur_owner.error());
+                    return 1;
+                }
+                if (*cur_owner && **cur_owner != old_owner) {
                     continue;
                 }
                 std::filesystem::path disk_p = opts.target_root / old_path;
                 std::error_code ec;
-                if (!std::filesystem::is_directory(disk_p, ec)) {
+                auto status = std::filesystem::symlink_status(disk_p, ec);
+                if (ec == std::errc::no_such_file_or_directory
+                    || status.type() == std::filesystem::file_type::not_found) {
+                    ec.clear();
+                } else if (ec) {
+                    sage::util::log_error(
+                        "Failed to inspect stale file '{}' for '{}': {}",
+                        disk_p.string(), pkg.name, ec.message());
+                    return 1;
+                } else if (std::filesystem::is_directory(status)) {
+                    sage::util::log_error(
+                        "Cannot remove stale file '{}' for '{}': path is a directory",
+                        disk_p.string(), pkg.name);
+                    return 1;
+                } else {
                     std::filesystem::remove(disk_p, ec);
+                    if (ec) {
+                        sage::util::log_error(
+                            "Failed to remove stale file '{}' for '{}': {}",
+                            disk_p.string(), pkg.name, ec.message());
+                        return 1;
+                    }
                 }
                 sage::package::FileEntry fe;
                 fe.path = old_path;
                 stale.push_back(std::move(fe));
             }
             if (!stale.empty()) {
-                (void)db.unregister_files(*package_txn, stale, my_owner);
+                auto unregister_res = db.unregister_files(*package_txn, stale, old_owner);
+                if (!unregister_res) {
+                    sage::util::log_error(
+                        "Failed to unregister stale files for '{}': {}",
+                        pkg.name, unregister_res.error());
+                    return 1;
+                }
                 sage::util::log_info("  ~ removed {} stale file(s) from previous {} {}", 
                     stale.size(), pkg.name, old_it->second.version.to_string());
             }
@@ -800,13 +858,6 @@ int cmd_remove(const CliOptions& opts) {
             sage::util::log_info("Auto-removing orphaned dependency '{}' (version {})...", pkg_name, pkg.version.to_string());
         }
 
-        sage::channel::Channel ch;
-        auto spec = sage::channel::SubChannelSpec::parse(pkg.channel);
-        ch.scope = spec.scope;
-        ch.category = spec.category;
-        ch.slot = spec.slot;
-        auto dest_root = ch.resolve_target_root(opts.target_root);
-
         // Delete physical files. The LMDB files table is the authoritative owner
         // registry: merge the installed manifest's file list with all files still
         // registered to this package (a previous version's leftovers may not be
@@ -816,30 +867,107 @@ int cmd_remove(const CliOptions& opts) {
         for (const auto& f : files_to_delete) {
             seen_paths.insert(sage::util::clean_rel_path(f.path));
         }
-        for (const auto& fp : db.get_package_files(pkg_name)) {
+        auto registered_files = db.get_package_files(*wtxn, pkg_name);
+        if (!registered_files) {
+            sage::util::log_error(
+                "Failed to read files owned by '{}': {}", pkg_name, registered_files.error());
+            return 1;
+        }
+        for (const auto& fp : *registered_files) {
             if (seen_paths.insert(fp).second) {
                 sage::package::FileEntry fe;
                 fe.path = fp;
                 files_to_delete.push_back(std::move(fe));
             }
         }
+        auto path_depth = [](std::string_view path) {
+            const auto relative = std::filesystem::path(sage::util::clean_rel_path(path));
+            return static_cast<size_t>(std::distance(relative.begin(), relative.end()));
+        };
+        std::ranges::stable_sort(files_to_delete, [&](const auto& lhs, const auto& rhs) {
+            return path_depth(lhs.path) > path_depth(rhs.path);
+        });
 
         std::string my_owner = std::format("{}:{}", pkg_name, pkg.channel);
         for (const auto& file_entry : files_to_delete) {
-            if (auto cur_owner = db.get_file_owner(file_entry.path); cur_owner && *cur_owner != my_owner) {
+            auto cur_owner = db.get_file_owner(*wtxn, file_entry.path);
+            if (!cur_owner) {
+                sage::util::log_error(
+                    "Failed to read ownership for '{}': {}",
+                    file_entry.path, cur_owner.error());
+                return 1;
+            }
+            if (*cur_owner && **cur_owner != my_owner) {
                 continue;
             }
-            std::filesystem::path p = dest_root / file_entry.path;
-            std::error_code ec;
-            if (!std::filesystem::is_directory(p, ec)) {
-                std::filesystem::remove(p, ec);
+
+            auto relative_path = std::filesystem::path(
+                sage::util::clean_rel_path(file_entry.path)).lexically_normal();
+            bool escapes_root = relative_path.empty() || relative_path == "."
+                || relative_path.is_absolute() || relative_path.has_root_name()
+                || relative_path.has_root_directory();
+            for (const auto& component : relative_path) {
+                if (component == "..") {
+                    escapes_root = true;
+                    break;
+                }
             }
-            removed_files.push_back(file_entry);
+            if (escapes_root) {
+                sage::util::log_error(
+                    "Refusing to remove invalid package path '{}' for '{}'",
+                    file_entry.path, pkg_name);
+                return 1;
+            }
+
+            std::filesystem::path p = opts.target_root / relative_path;
+            std::error_code ec;
+            auto status = std::filesystem::symlink_status(p, ec);
+            if (ec == std::errc::no_such_file_or_directory
+                || status.type() == std::filesystem::file_type::not_found) {
+                ec.clear();
+            } else if (ec) {
+                sage::util::log_error(
+                    "Failed to inspect '{}' while removing '{}': {}",
+                    p.string(), pkg_name, ec.message());
+                return 1;
+            } else {
+                std::filesystem::remove(p, ec);
+                const bool shared_nonempty_directory =
+                    std::filesystem::is_directory(status) && !*cur_owner
+                    && ec == std::errc::directory_not_empty;
+                if (ec && !shared_nonempty_directory) {
+                    sage::util::log_error(
+                        "Failed to remove '{}' from package '{}': {}",
+                        p.string(), pkg_name, ec.message());
+                    return 1;
+                }
+            }
+
+            auto removed_entry = file_entry;
+            removed_entry.path = relative_path.generic_string();
+            removed_files.push_back(std::move(removed_entry));
         }
 
-        (void)db.unregister_files(*wtxn, files_to_delete, my_owner);
-        (void)db.unregister_provides(*wtxn, pkg.provides);
-        (void)db.del_package(*wtxn, pkg_name);
+        auto unregister_files = db.unregister_files(*wtxn, files_to_delete, my_owner);
+        if (!unregister_files) {
+            sage::util::log_error(
+                "Failed to unregister files for '{}': {}", pkg_name, unregister_files.error());
+            return 1;
+        }
+        auto unregister_provides = db.unregister_provides(*wtxn, pkg.provides);
+        if (!unregister_provides) {
+            sage::util::log_error(
+                "Failed to unregister provides for '{}': {}",
+                pkg_name, unregister_provides.error());
+            return 1;
+        }
+        auto delete_package = db.del_package(*wtxn, pkg_name);
+        if (!delete_package) {
+            sage::util::log_error(
+                "Failed to delete package record for '{}': {}",
+                pkg_name, delete_package.error());
+            return 1;
+        }
     }
 
     auto commit_res = wtxn->commit();
@@ -1133,6 +1261,138 @@ int cmd_test_suite() {
         return 1;
     }
 
+    auto read_archive_test_file = [](const std::filesystem::path& path) {
+        std::ifstream input(path, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(input), {});
+    };
+
+    // A pre-created legacy fixed-name temporary symlink must be ignored: the
+    // extractor uses its own unique O_EXCL/O_NOFOLLOW temporary leaf.
+    auto temp_symlink_root = temp_dir / "temp-symlink-root";
+    auto temp_symlink_outside = temp_dir / "temp-symlink-outside";
+    std::filesystem::create_directories(temp_symlink_root / "usr/bin");
+    std::ofstream(temp_symlink_outside) << "must survive\n";
+    std::filesystem::create_symlink(
+        temp_symlink_outside, temp_symlink_root / "usr/bin/dummy.sage_tmp");
+    auto temp_symlink_result = sage::archive::extract_package(pkg_path, temp_symlink_root);
+    if (!temp_symlink_result
+        || read_archive_test_file(temp_symlink_outside) != "must survive\n"
+        || read_archive_test_file(temp_symlink_root / "usr/bin/dummy")
+            != "#!/bin/sh\necho 'hello sage'\n"
+        || !std::filesystem::is_symlink(temp_symlink_root / "usr/bin/dummy.sage_tmp")) {
+        sage::util::log_error("Archive extraction followed a fixed temporary-file symlink");
+        return 1;
+    }
+
+    auto reserved_temp_bytes = raw_tar_bytes;
+    if (!rename_tar_entry(
+            reserved_temp_bytes,
+            "data/usr/bin/link",
+            "data/usr/bin/.sage-tmp-controlled")) {
+        sage::util::log_error("Failed to create reserved temporary-name fixture");
+        return 1;
+    }
+    auto reserved_temp_pkg = write_mutated_package(
+        reserved_temp_bytes, "reserved-temp-name");
+    auto reserved_temp_root = temp_dir / "reserved-temp-root";
+    auto reserved_temp_result = reserved_temp_pkg
+        ? sage::archive::extract_package(*reserved_temp_pkg, reserved_temp_root)
+        : std::expected<sage::archive::ExtractedPackage, std::string>(
+            std::unexpected("fixture failed"));
+    if (reserved_temp_result
+        || reserved_temp_result.error().find("reserved temporary-file namespace")
+            == std::string::npos
+        || std::filesystem::exists(reserved_temp_root / "usr/bin/dummy")) {
+        sage::util::log_error("Archive accepted the internal temporary-file namespace");
+        return 1;
+    }
+
+    auto regular_parent_bytes = raw_tar_bytes;
+    if (!rename_tar_entry(
+            regular_parent_bytes, "data/usr/bin/link", "data/usr/bin/dummy/child")) {
+        sage::util::log_error("Failed to create non-directory archive ancestor fixture");
+        return 1;
+    }
+    auto regular_parent_pkg = write_mutated_package(
+        regular_parent_bytes, "regular-file-parent");
+    auto regular_parent_root = temp_dir / "regular-file-parent-root";
+    auto regular_parent_result = regular_parent_pkg
+        ? sage::archive::extract_package(*regular_parent_pkg, regular_parent_root)
+        : std::expected<sage::archive::ExtractedPackage, std::string>(
+            std::unexpected("fixture failed"));
+    if (regular_parent_result
+        || std::filesystem::exists(regular_parent_root / "usr/bin/dummy")
+        || std::filesystem::exists(regular_parent_root / long_rel)) {
+        sage::util::log_error("Non-directory archive ancestor was rejected only after extraction");
+        return 1;
+    }
+
+    // Raw archives cannot bypass usr-merge ownership by omitting the data/bin
+    // directory entry: non-base packages must use canonical usr/bin paths.
+    auto usr_merge_bytes = raw_tar_bytes;
+    if (!rename_tar_entry(
+            usr_merge_bytes, "data/usr/bin/dummy", "data/bin/dummy")) {
+        sage::util::log_error("Failed to create usr-merge alias fixture");
+        return 1;
+    }
+    auto usr_merge_pkg = write_mutated_package(usr_merge_bytes, "usr-merge-alias");
+    auto usr_merge_root = temp_dir / "usr-merge-root";
+    std::filesystem::create_directories(usr_merge_root / "usr/bin");
+    std::filesystem::create_symlink("usr/bin", usr_merge_root / "bin");
+    auto usr_merge_result = usr_merge_pkg
+        ? sage::archive::extract_package(*usr_merge_pkg, usr_merge_root)
+        : std::expected<sage::archive::ExtractedPackage, std::string>(
+            std::unexpected("fixture failed"));
+    if (usr_merge_result
+        || usr_merge_result.error().find("must use canonical usr/ paths")
+            == std::string::npos
+        || std::filesystem::exists(usr_merge_root / "usr/bin/dummy")
+        || std::filesystem::exists(usr_merge_root / long_rel)) {
+        sage::util::log_error("Usr-merge alias payload bypassed canonical package paths");
+        return 1;
+    }
+
+    auto base_files_data = temp_dir / "base-files-data";
+    std::filesystem::create_directories(base_files_data);
+    std::filesystem::create_symlink("usr/bin", base_files_data / "bin");
+    sage::package::PackageManifest base_files_manifest;
+    base_files_manifest.name = "base-files";
+    base_files_manifest.version = sage::package::Version::parse("1.0.0-1");
+    auto base_files_pkg = temp_dir / "base-files-1.0.0-1-x86_64.pkg.tar.zst";
+    auto base_files_root = temp_dir / "base-files-root";
+    auto base_files_pack = sage::archive::create_package(
+        base_files_manifest, base_files_data, base_files_pkg);
+    auto base_files_extract = base_files_pack
+        ? sage::archive::extract_package(base_files_pkg, base_files_root)
+        : std::expected<sage::archive::ExtractedPackage, std::string>(
+            std::unexpected(base_files_pack.error()));
+    if (!base_files_extract
+        || !std::filesystem::is_symlink(base_files_root / "bin")
+        || std::filesystem::read_symlink(base_files_root / "bin") != "usr/bin") {
+        sage::util::log_error("Base-files could not create the canonical usr-merge alias");
+        return 1;
+    }
+
+    auto invalid_base_files_data = temp_dir / "invalid-base-files-data";
+    std::filesystem::create_directories(invalid_base_files_data);
+    std::filesystem::create_symlink("opt/bin", invalid_base_files_data / "bin");
+    auto invalid_base_files_pkg = malformed_archive_dir / "base-files-invalid.pkg.tar.zst";
+    if (!sage::archive::create_package(
+            base_files_manifest, invalid_base_files_data, invalid_base_files_pkg)) {
+        sage::util::log_error("Failed to create invalid base-files fixture");
+        return 1;
+    }
+    auto invalid_base_files_root = temp_dir / "invalid-base-files-root";
+    auto invalid_base_files_extract = sage::archive::extract_package(
+        invalid_base_files_pkg, invalid_base_files_root);
+    if (invalid_base_files_extract
+        || invalid_base_files_extract.error().find("must use canonical usr/ paths")
+            == std::string::npos
+        || std::filesystem::exists(invalid_base_files_root / "bin")) {
+        sage::util::log_error("Base-files accepted a non-canonical usr-merge target");
+        return 1;
+    }
+
     auto verify_tar_reader = [&](std::string_view reader, const std::filesystem::path& root) {
         std::filesystem::create_directories(root);
         auto command = std::format("{} -xf \"{}\" -C \"{}\"", reader, pkg_path.string(), root.string());
@@ -1370,13 +1630,14 @@ install = [
 
     sage::package::PackageManifest escaped_manifest;
     escaped_manifest.name = "escaped-metadata";
-    escaped_manifest.version = sage::package::Version::parse("1.0.0-1");
+    escaped_manifest.version = sage::package::Version::parse("7:1.0.0-1");
     escaped_manifest.description = "quoted \"value\" with \\ slash\nnext line";
     sage::package::FileEntry escaped_file;
     escaped_file.path = R"(usr/lib/systemd/system/system-systemd\x2dmute.slice)";
     escaped_manifest.files.push_back(std::move(escaped_file));
     auto escaped_round_trip = sage::package::PackageManifest::parse_toml(escaped_manifest.serialize_toml());
     if (!escaped_round_trip
+        || escaped_round_trip->version != escaped_manifest.version
         || escaped_round_trip->description != escaped_manifest.description
         || escaped_round_trip->files.size() != 1
         || escaped_round_trip->files.front().path != escaped_manifest.files.front().path) {
@@ -1433,6 +1694,8 @@ install = [
         auto raw_files = sage::vendor::lmdb::MdbDbi::open(
             *raw_txn, "files", sage::vendor::lmdb::flag_create);
         if (!raw_packages || !raw_files
+            || !raw_packages->put(
+                *raw_txn, "aaa-mismatch", "[package]\nname = \"different-name\"\nversion = \"1.0.0\"\n")
             || !raw_packages->put(*raw_txn, "broken", "[package]\nname = \"broken\n")
             || !raw_files->put(*raw_txn, "usr/bin/broken", "broken:system")) {
             sage::util::log_error("Failed to populate corrupt database fixture");
@@ -1457,9 +1720,14 @@ install = [
         ? corrupt_db->get_package("broken")
         : std::expected<std::optional<sage::package::PackageManifest>, std::string>(
             std::unexpected("database open failed"));
+    auto mismatched_package = corrupt_db
+        ? corrupt_db->get_package("aaa-mismatch")
+        : std::expected<std::optional<sage::package::PackageManifest>, std::string>(
+            std::unexpected("database open failed"));
     if (!corrupt_db
         || corrupt_db->list_installed_packages()
         || corrupt_package
+        || mismatched_package
         || corrupt_db->get_file_owner("usr/bin/broken") != "broken:system") {
         sage::util::log_error("Corrupt manifest failure changed existing file ownership");
         return 1;
@@ -1475,6 +1743,52 @@ install = [
     auto exec_res = sage::rebuild::ReconcileEngine::execute(*db_res, *plan_res, extract_root, false);
     if (!exec_res) {
         sage::util::log_error("Reconcile execute failed: {}", exec_res.error());
+        return 1;
+    }
+
+    // A reconcile plan must not remove a same-name package that changed before
+    // its write transaction began. Preserve both the newer package and the old
+    // provider lock so the caller can recalculate from a fresh snapshot.
+    auto reconcile_race_db = sage::db::Database::open(temp_dir / "reconcile-race-db");
+    sage::package::PackageManifest old_init;
+    old_init.name = "old-init";
+    old_init.version = sage::package::Version::parse("1.0.0-1");
+    old_init.provides = {"old-init", "virtual/init"};
+    if (!reconcile_race_db) {
+        sage::util::log_error("Failed to create reconcile snapshot fixture");
+        return 1;
+    }
+    {
+        auto setup_txn = reconcile_race_db->begin_write_txn();
+        if (!setup_txn
+            || !reconcile_race_db->put_package(*setup_txn, old_init)
+            || !reconcile_race_db->set_system_provider(*setup_txn, "virtual/init", old_init.name)
+            || !setup_txn->commit()) {
+            sage::util::log_error("Failed to populate reconcile snapshot fixture");
+            return 1;
+        }
+    }
+    auto stale_plan = sage::rebuild::ReconcileEngine::calculate_diff(
+        *reconcile_race_db, sys_cfg, repo_pool);
+    auto replacement_init = old_init;
+    replacement_init.version = sage::package::Version::parse("2.0.0-1");
+    {
+        auto update_txn = reconcile_race_db->begin_write_txn();
+        if (!stale_plan || !update_txn
+            || !reconcile_race_db->put_package(*update_txn, replacement_init)
+            || !update_txn->commit()) {
+            sage::util::log_error("Failed to update reconcile snapshot fixture");
+            return 1;
+        }
+    }
+    auto stale_execute = sage::rebuild::ReconcileEngine::execute(
+        *reconcile_race_db, *stale_plan, extract_root, false);
+    auto preserved_init = reconcile_race_db->get_package(old_init.name);
+    if (stale_execute
+        || !preserved_init || !*preserved_init
+        || (**preserved_init).version != replacement_init.version
+        || reconcile_race_db->get_system_provider("virtual/init") != old_init.name) {
+        sage::util::log_error("Reconcile executed against a stale package snapshot");
         return 1;
     }
     sage::util::log_success("5. Declarative System Reconcile & Triggers Engine (sage rebuild) OK");
@@ -1627,6 +1941,55 @@ install = [
         return 1;
     }
 
+    // Equal identities from multiple sources must keep solver metadata and the
+    // extracted archive bound to the same highest-priority source.
+    auto high_priority_repo = temp_dir / "source-high";
+    auto low_priority_repo = temp_dir / "source-low";
+    auto high_priority_data = temp_dir / "source-high-data";
+    auto low_priority_data = temp_dir / "source-low-data";
+    std::filesystem::create_directories(high_priority_repo);
+    std::filesystem::create_directories(low_priority_repo);
+    std::filesystem::create_directories(high_priority_data / "usr/bin");
+    std::filesystem::create_directories(low_priority_data / "usr/bin");
+    std::ofstream(high_priority_data / "usr/bin/source-bound") << "high priority\n";
+    std::ofstream(low_priority_data / "usr/bin/source-bound") << "low priority\n";
+    sage::package::PackageManifest source_bound;
+    source_bound.name = "source-bound";
+    source_bound.version = sage::package::Version::parse("1.0.0-1");
+    auto high_priority_archive =
+        high_priority_repo / "source-bound-1.0.0-1-x86_64.pkg.tar.zst";
+    auto low_priority_archive =
+        low_priority_repo / "source-bound-1.0.0-1-x86_64.pkg.tar.zst";
+    if (!sage::archive::create_package(
+            source_bound, high_priority_data, high_priority_archive)
+        || !sage::archive::create_package(
+            source_bound, low_priority_data, low_priority_archive)
+        || !sage::archive::generate_repo_index(high_priority_repo, "high")
+        || !sage::archive::generate_repo_index(low_priority_repo, "low")) {
+        sage::util::log_error("Failed to create multi-source identity fixtures");
+        return 1;
+    }
+    auto source_target = temp_dir / "source-target";
+    std::filesystem::create_directories(source_target / "etc/sage");
+    std::ofstream source_channels(source_target / "etc/sage/channels.toml");
+    source_channels
+        << "schema_version = 1\n\n"
+        << "[[channels]]\nname = \"low\"\nurl = \"file://"
+        << low_priority_repo.string()
+        << "\"\nscope = \"system\"\npriority = 10\nenabled = true\n\n"
+        << "[[channels]]\nname = \"high\"\nurl = \"file://"
+        << high_priority_repo.string()
+        << "\"\nscope = \"system\"\npriority = 100\nenabled = true\n";
+    source_channels.close();
+    CliOptions source_install;
+    source_install.target_root = source_target;
+    source_install.args = {source_bound.name};
+    if (cmd_install(source_install) != 0
+        || read_test_file(source_target / "usr/bin/source-bound") != "high priority\n") {
+        sage::util::log_error("Solver metadata and archive source were not bound together");
+        return 1;
+    }
+
     auto direct_target = temp_dir / "direct-version-target";
     if (!write_test_channel(direct_target, version_repo)) {
         sage::util::log_error("Failed to write direct archive test channel");
@@ -1671,6 +2034,65 @@ install = [
     if (!upgraded_version || !*upgraded_version
         || (**upgraded_version).version != version_2.version) {
         sage::util::log_error("Same-package upgrade did not record the extracted version");
+        return 1;
+    }
+
+    // An explicit archive remains exact even when a newer same-name package is
+    // installed. This is the local-package downgrade path used for rollback.
+    direct_install.args = {version_1_pkg.string()};
+    if (cmd_install(direct_install) != 0
+        || read_test_file(direct_target / "usr/bin/versioned") != "version 1\n") {
+        sage::util::log_error("Direct archive downgrade was silently skipped");
+        return 1;
+    }
+    auto downgraded_db = sage::db::Database::open(
+        direct_target / "var/lib/sage/data.mdb", true);
+    auto downgraded_version = downgraded_db
+        ? downgraded_db->get_package("versioned-package")
+        : std::expected<std::optional<sage::package::PackageManifest>, std::string>(
+            std::unexpected("database open failed"));
+    if (!downgraded_version || !*downgraded_version
+        || (**downgraded_version).version != version_1.version) {
+        sage::util::log_error("Direct archive downgrade did not update installed metadata");
+        return 1;
+    }
+
+    // The same version from a different architecture/channel is also a distinct
+    // direct archive identity, and must replace stale files owned by the old one.
+    auto alternate_data = temp_dir / "alternate-identity-data";
+    auto alternate_binary = alternate_data / "opt/channels/llvm/42/bin/versioned";
+    std::filesystem::create_directories(alternate_binary.parent_path());
+    std::ofstream(alternate_binary) << "alternate identity\n";
+    sage::package::PackageManifest alternate_identity = version_1;
+    alternate_identity.arch = "any";
+    alternate_identity.channel = "toolchain/llvm:42";
+    auto alternate_archive = temp_dir / "versioned-package-alternate.pkg.tar.zst";
+    if (!sage::archive::create_package(
+            alternate_identity, alternate_data, alternate_archive)) {
+        sage::util::log_error("Failed to create alternate direct archive identity fixture");
+        return 1;
+    }
+    direct_install.args = {alternate_archive.string()};
+    if (cmd_install(direct_install) != 0
+        || std::filesystem::exists(direct_target / "usr/bin/versioned")
+        || read_test_file(direct_target / "opt/channels/llvm/42/bin/versioned")
+            != "alternate identity\n") {
+        sage::util::log_error("Direct archive identity replacement was silently skipped");
+        return 1;
+    }
+    auto alternate_db = sage::db::Database::open(
+        direct_target / "var/lib/sage/data.mdb", true);
+    auto alternate_record = alternate_db
+        ? alternate_db->get_package("versioned-package")
+        : std::expected<std::optional<sage::package::PackageManifest>, std::string>(
+            std::unexpected("database open failed"));
+    if (!alternate_record || !*alternate_record
+        || sage::package::package_identity(**alternate_record)
+            != sage::package::package_identity(alternate_identity)
+        || alternate_db->get_file_owner("opt/channels/llvm/42/bin/versioned")
+            != "versioned-package:toolchain/llvm:42"
+        || alternate_db->get_file_owner("usr/bin/versioned")) {
+        sage::util::log_error("Alternate direct archive identity was not recorded");
         return 1;
     }
 
@@ -1830,6 +2252,137 @@ install = [
         || !std::filesystem::exists(transaction_target / "etc/profile.d/sage-channels.sh")) {
         sage::util::log_error(
             "A later package failure desynchronized an earlier committed package or skipped its post-processing");
+        return 1;
+    }
+
+    // Split packages in one toolchain slot must refresh activation as each
+    // package commits. The dependency installs libraries first; the compiler
+    // package that follows is what makes the cc alias possible.
+    auto split_repo = temp_dir / "split-toolchain-repo";
+    auto split_libs_data = temp_dir / "split-toolchain-libs-data";
+    auto split_compiler_data = temp_dir / "split-toolchain-compiler-data";
+    auto split_library = split_libs_data / "opt/channels/llvm/77/lib/libsplit.so";
+    auto split_clang = split_compiler_data / "opt/channels/llvm/77/bin/clang";
+    std::filesystem::create_directories(split_repo);
+    std::filesystem::create_directories(split_library.parent_path());
+    std::filesystem::create_directories(split_clang.parent_path());
+    std::ofstream(split_library) << "split toolchain library\n";
+    std::ofstream(split_clang) << "#!/bin/sh\nexit 0\n";
+    std::filesystem::permissions(
+        split_clang,
+        std::filesystem::perms::owner_all
+            | std::filesystem::perms::group_read
+            | std::filesystem::perms::group_exec
+            | std::filesystem::perms::others_read
+            | std::filesystem::perms::others_exec);
+
+    sage::package::PackageManifest split_libs;
+    split_libs.name = "split-toolchain-libs";
+    split_libs.version = sage::package::Version::parse("1.0.0-1");
+    split_libs.channel = "toolchain/llvm:77";
+    sage::package::PackageManifest split_compiler;
+    split_compiler.name = "split-toolchain-compiler";
+    split_compiler.version = sage::package::Version::parse("1.0.0-1");
+    split_compiler.channel = "toolchain/llvm:77";
+    split_compiler.dependencies.push_back(
+        sage::package::Dependency::parse("split-toolchain-libs"));
+
+    auto split_libs_archive =
+        split_repo / "split-toolchain-libs-1.0.0-1-x86_64.pkg.tar.zst";
+    auto split_compiler_archive =
+        split_repo / "split-toolchain-compiler-1.0.0-1-x86_64.pkg.tar.zst";
+    if (!sage::archive::create_package(split_libs, split_libs_data, split_libs_archive)
+        || !sage::archive::create_package(
+            split_compiler, split_compiler_data, split_compiler_archive)
+        || !sage::archive::generate_repo_index(split_repo, "core")) {
+        sage::util::log_error("Failed to create split toolchain fixtures");
+        return 1;
+    }
+
+    auto split_target = temp_dir / "split-toolchain-target";
+    if (!write_test_channel(split_target, split_repo)) {
+        sage::util::log_error("Failed to write split toolchain test channel");
+        return 1;
+    }
+    CliOptions split_install;
+    split_install.target_root = split_target;
+    split_install.args = {"split-toolchain-compiler"};
+    if (cmd_install(split_install) != 0) {
+        sage::util::log_error("Failed to install split toolchain packages");
+        return 1;
+    }
+    auto split_cc_link = split_target / "etc/sage/profiles/default/bin/cc";
+    std::error_code split_cc_ec;
+    if (!std::filesystem::is_symlink(split_cc_link, split_cc_ec)
+        || std::filesystem::read_symlink(split_cc_link, split_cc_ec)
+            != "/opt/channels/llvm/77/bin/clang") {
+        sage::util::log_error("Later split toolchain package did not refresh activation");
+        return 1;
+    }
+
+    auto split_owner_db = sage::db::Database::open(
+        split_target / "var/lib/sage/data.mdb", true);
+    if (!split_owner_db
+        || split_owner_db->get_file_owner("opt/channels/llvm/77/bin/clang")
+            != "split-toolchain-compiler:toolchain/llvm:77") {
+        sage::util::log_error("Split toolchain removal fixture has no registered file owner");
+        return 1;
+    }
+
+    // Replacing an owned regular file with a non-empty directory forces a real
+    // filesystem removal error. The command must fail and keep both DB records.
+    auto installed_split_clang = split_target / "opt/channels/llvm/77/bin/clang";
+    std::filesystem::remove(installed_split_clang);
+    std::filesystem::create_directories(installed_split_clang);
+    std::ofstream(installed_split_clang / "keep") << "block removal\n";
+    CliOptions split_remove;
+    split_remove.target_root = split_target;
+    split_remove.args = {"split-toolchain-compiler"};
+    if (cmd_remove(split_remove) == 0) {
+        sage::util::log_error("Package removal ignored a real filesystem error");
+        return 1;
+    }
+    {
+        auto split_db = sage::db::Database::open(
+            split_target / "var/lib/sage/data.mdb", true);
+        auto split_compiler_record = split_db
+            ? split_db->get_package("split-toolchain-compiler")
+            : std::expected<std::optional<sage::package::PackageManifest>, std::string>(
+                std::unexpected("database open failed"));
+        auto split_libs_record = split_db
+            ? split_db->get_package("split-toolchain-libs")
+            : std::expected<std::optional<sage::package::PackageManifest>, std::string>(
+                std::unexpected("database open failed"));
+        if (!split_compiler_record || !*split_compiler_record
+            || !split_libs_record || !*split_libs_record) {
+            sage::util::log_error("Failed split removal discarded installed database records");
+            return 1;
+        }
+    }
+
+    // Restore the owned file and verify removal uses the sysroot-relative paths
+    // stored in the manifest instead of prepending the toolchain root twice.
+    std::error_code restore_ec;
+    std::filesystem::remove_all(installed_split_clang, restore_ec);
+    if (restore_ec) {
+        sage::util::log_error("Failed to restore split toolchain fixture: {}", restore_ec.message());
+        return 1;
+    }
+    std::ofstream(installed_split_clang) << "#!/bin/sh\nexit 0\n";
+    if (cmd_remove(split_remove) != 0
+        || std::filesystem::exists(split_target / "opt/channels/llvm/77/bin/clang")
+        || std::filesystem::exists(split_target / "opt/channels/llvm/77/lib/libsplit.so")) {
+        sage::util::log_error("Toolchain removal did not delete sysroot-relative package paths");
+        return 1;
+    }
+    auto removed_split_db = sage::db::Database::open(
+        split_target / "var/lib/sage/data.mdb", true);
+    auto removed_split_packages = removed_split_db
+        ? removed_split_db->list_installed_packages()
+        : std::expected<std::vector<sage::package::PackageManifest>, std::string>(
+            std::unexpected("database open failed"));
+    if (!removed_split_packages || !removed_split_packages->empty()) {
+        sage::util::log_error("Split toolchain database was not cleared after removal");
         return 1;
     }
     sage::util::log_success("9. End-to-End `sage install` & `sage remove` to Target Root OK");
