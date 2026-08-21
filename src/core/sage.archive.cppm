@@ -414,7 +414,8 @@ public:
     }
 
     static std::expected<PrivateArchiveSnapshot, std::string> create(
-        const std::filesystem::path& source_path)
+        const std::filesystem::path& source_path,
+        const std::filesystem::path& snapshot_root)
     {
         int source_flags = O_RDONLY;
 #ifdef O_CLOEXEC
@@ -435,7 +436,15 @@ public:
             return std::unexpected("Package archive is not a regular file");
         }
 
-        std::string directory_template = "/tmp/sage-archive-XXXXXX";
+        std::error_code directory_ec;
+        std::filesystem::create_directories(snapshot_root, directory_ec);
+        if (directory_ec) {
+            return std::unexpected(
+                "Cannot create private archive root: " + directory_ec.message());
+        }
+
+        std::string directory_template =
+            (snapshot_root / "archive-XXXXXX").string();
         std::vector<char> mutable_template(
             directory_template.begin(), directory_template.end());
         mutable_template.push_back('\0');
@@ -492,11 +501,6 @@ public:
             remaining -= static_cast<uint64_t>(count);
         }
 
-        if (::fsync(destination.get()) != 0) {
-            return std::unexpected(
-                "Cannot sync private archive snapshot: "
-                + std::string(std::strerror(errno)));
-        }
         return snapshot;
     }
 
@@ -1074,7 +1078,8 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
     const package::PackageManifest* expected_manifest = nullptr,
     const InspectedPackage* expected_inspection = nullptr)
 {
-    auto snapshot_res = PrivateArchiveSnapshot::create(archive_path);
+    auto snapshot_res = PrivateArchiveSnapshot::create(
+        archive_path, target_root / "var/lib/sage/tmp");
     if (!snapshot_res) return std::unexpected(snapshot_res.error());
     auto snapshot = std::move(*snapshot_res);
 
