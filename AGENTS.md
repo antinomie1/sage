@@ -61,25 +61,45 @@ sage/
 │   ├── MODULES.md                # Module reference and dependency DAG
 │   └── CLI_SPEC.md               # Complete CLI command-line reference
 ├── src/
-│   ├── vendor/                   # 3rd-party library RAII bridge modules
-│   │   ├── sage.vendor.lmdb.cppm # LMDB RAII wrapper (zero-copy B+ tree)
-│   │   ├── sage.vendor.zstd.cppm # Zstandard streaming RAII wrapper
-│   │   └── sage.vendor.toml.cppm # tomlplusplus C++23 module bridge
-│   ├── core/                     # Core domain logic modules
-│   │   ├── sage.util.cppm        # Common utilities, ELF SONAME scanner, paths, formatting
-│   │   ├── sage.config.cppm      # /etc/sage/system.toml & provider configuration
-│   │   ├── sage.package.cppm     # Package domain model, recipe.toml, manifest.toml, triggers
-│   │   ├── sage.channel.cppm     # Multi-layer Channel runtime & FHS Profile aggregator
-│   │   ├── sage.service.cppm     # Universal service generator (OpenRC/Runit/Systemd/Dinit/s6)
-│   │   ├── sage.db.cppm          # LMDB package registry, file ownership & transaction engine
-│   │   ├── sage.archive.cppm     # Native C++23 streaming Tar + Zstd extractor & packager
-│   │   ├── sage.solver.cppm      # Native PubGrub / CDCL SAT dependency solver
-│   │   └── sage.rebuild.cppm     # System reconcile & guarded rebuild orchestration
-│   ├── sage.cppm                 # Primary root module aggregating and re-exporting all modules
-│   └── cli/
-│       └── main.cpp              # CLI entry point (pure `import sage;`)
-└── tests/                        # Unit tests and end-to-end integration tests
+│   ├── main.cpp                  # Entry point: global option dispatch only
+│   ├── sage.cppm                 # Root module aggregating and re-exporting the engine
+│   ├── vendor/                   # Layer 0: 3rd-party library RAII bridges
+│   │   ├── lmdb.cppm             # sage.vendor.lmdb -- zero-copy B+ tree bridge
+│   │   ├── zstd.cppm             # sage.vendor.zstd -- streaming Zstandard bridge
+│   │   ├── toml.cppm             # sage.vendor.toml -- tomlplusplus bridge
+│   │   └── curl.cppm             # sage.vendor.curl -- libcurl session & downloads
+│   ├── domain/                   # Layers 1-2: pure domain models & configuration
+│   │   ├── util.cppm             # sage.util -- paths, ELF scanner, SHA256, formatting
+│   │   ├── package.cppm          # sage.package -- package model, recipes, manifests, triggers
+│   │   ├── config.cppm           # sage.config -- system.toml & provider configuration
+│   │   └── service.cppm          # sage.service -- universal init script generator
+│   ├── engine/                   # Layers 3-4: stateful subsystem engines
+│   │   ├── channel.cppm          # sage.channel -- multi-layer channels & FHS profile
+│   │   ├── db.cppm               # sage.db -- LMDB registry, file ownership & transactions
+│   │   ├── solver.cppm           # sage.solver -- PubGrub / CDCL dependency solver
+│   │   ├── rebuild.cppm          # sage.rebuild -- declarative reconcile orchestration
+│   │   └── archive/              # sage.archive, split into module partitions
+│   │       ├── archive.cppm      # facade (export import of the partitions below)
+│   │       ├── detail.cppm       # :detail (internal) RAII handles & anchored path safety
+│   │       ├── tape.cppm         # :tape USTAR format, streaming walker, inspection
+│   │       ├── extract.cppm      # :extract anchored cleanup & streaming extraction
+│   │       └── pack.cppm         # :pack package creation & repository indexing
+│   └── cli/                      # Layer 5: command layer (sage.cli.* modules)
+│       ├── cli.cppm              # sage.cli -- CliOptions, help text, argument parsing
+│       ├── pkg.cppm              # sage.cli.pkg -- install / remove / rebuild
+│       ├── build.cppm            # sage.cli.build -- build / repo index
+│       ├── query.cppm            # sage.cli.query -- query / list / count / verify / status
+│       ├── toolchain.cppm        # sage.cli.toolchain -- channel / toolchains / shell / service
+│       └── test.cppm             # sage.cli.test -- integration test suite
 ```
+
+**Layout rules.** A directory corresponds to a dependency layer of Rule 5; a file
+corresponds to exactly one module or partition. File names drop the redundant
+`sage.*` prefix — the module name is found in the first line of the file. When a
+unit grows past roughly 500 lines or takes on a second responsibility, split it
+into a partition (within a module) or a sibling module (within the CLI layer).
+The CLI is pure `import` — no `#include` may appear in business logic or the CLI.
+
 
 ---
 

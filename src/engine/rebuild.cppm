@@ -5,7 +5,6 @@ import sage.config;
 import sage.package;
 import sage.service;
 import sage.db;
-import sage.archive;
 import sage.solver;
 import sage.util;
 

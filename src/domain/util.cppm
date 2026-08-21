@@ -1,6 +1,7 @@
 module;
 
 #include <elf.h>
+#include <stdlib.h>
 
 export module sage.util;
 
@@ -165,6 +166,16 @@ inline std::string clean_rel_path(std::string_view path) {
         else break;
     }
     return std::string(path);
+}
+
+// Process environment. The CLI layer stays pure `import sage;`, so the one
+// POSIX call it needs (setenv, absent from std) lives here.
+inline bool set_env(std::string_view key, std::string_view value) {
+    return ::setenv(std::string(key).c_str(), std::string(value).c_str(), 1) == 0;
+}
+
+inline const char* get_env(std::string_view key) {
+    return std::getenv(std::string(key).c_str());
 }
 
 // ============================================================================
