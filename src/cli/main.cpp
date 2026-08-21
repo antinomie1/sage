@@ -333,6 +333,8 @@ load_install_snapshot(
     return current;
 }
 
+// Self-tests may execute trigger commands on the host while package payloads
+// remain isolated under their temporary target root.
 int cmd_install(
     const CliOptions& opts,
     std::optional<std::filesystem::path> trigger_sysroot = std::nullopt)
