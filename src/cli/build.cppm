@@ -236,6 +236,7 @@ export int cmd_build(const CliOptions& opts) {
     manifest.channel = r.channel;
     manifest.dependencies = r.host_deps;
     manifest.provides = r.provides;
+    manifest.conffiles = r.conffiles;
     manifest.arch = r.arch;
     manifest.capability_hooks = r.capability_hooks;
     manifest.triggers = r.triggers;

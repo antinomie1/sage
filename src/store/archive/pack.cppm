@@ -314,7 +314,13 @@ inline std::expected<void, std::string> generate_repo_index(
         ss << "]\n";
         ss << "provides = [\n";
         for (const auto& p : m.provides) ss << "    \"" << quote(p) << "\",\n";
-        ss << "]\n\n";
+        ss << "]\n";
+        if (!m.conffiles.empty()) {
+            ss << "conffiles = [\n";
+            for (const auto& c : m.conffiles) ss << "    \"" << quote(c) << "\",\n";
+            ss << "]\n";
+        }
+        ss << "\n";
     }
 
     std::ofstream out(repo_dir / "index.toml");

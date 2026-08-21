@@ -2341,6 +2341,112 @@ install = [
         sage::util::log_success("13. Build Config Injection, Recipe Override & Compiler Fallback OK");
     }
 
+    // 14. Conffile Protection: reinstall keeps locally modified configuration
+    {
+        auto temp_dir = std::filesystem::temp_directory_path() / "sage_conffile_test";
+        std::filesystem::remove_all(temp_dir);
+        auto conf_dir = temp_dir / "confpkg";
+        std::filesystem::create_directories(conf_dir);
+        auto read_text = [](const std::filesystem::path& p) {
+            std::ifstream f(p);
+            std::stringstream ss;
+            ss << f.rdbuf();
+            return ss.str();
+        };
+        {
+            std::ofstream recipe(conf_dir / "recipe.toml");
+            recipe << R"(schema_version = 1
+[package]
+name = "confpkg"
+version = "3.0.0"
+release = "1"
+description = "conffile protection canary"
+license = "MIT"
+channel = "system"
+conffiles = ["/etc/myapp.conf", "/etc/plain.conf"]
+install = [
+    'mkdir -p "$DESTDIR/etc"',
+    'printf "v1\n" > "$DESTDIR/etc/myapp.conf"',
+    'printf "v1\n" > "$DESTDIR/etc/plain.conf"',
+]
+)";
+        }
+
+        // Build once; the archive manifest must carry the declaration.
+        CliOptions build_opts;
+        build_opts.args = {conf_dir.string()};
+        build_opts.target_root = temp_dir;
+        if (cmd_build(build_opts) != 0) {
+            sage::util::log_error("Failed to build confpkg");
+            return 1;
+        }
+        std::ifstream conf_archive(conf_dir / "confpkg-3.0.0-1-x86_64.pkg.tar.zst", std::ios::binary);
+        auto conf_inspect = sage::archive::inspect_package_stream(
+            conf_archive, "confpkg-3.0.0-1-x86_64.pkg.tar.zst", nullptr);
+        const std::vector<std::string> expected_conffiles{"/etc/myapp.conf", "/etc/plain.conf"};
+        if (!conf_inspect || conf_inspect->manifest.conffiles != expected_conffiles) {
+            sage::util::log_error("Built archive manifest does not carry the conffiles declaration");
+            return 1;
+        }
+        conf_archive.close();
+
+        // Fresh install through a local channel: both files land normally.
+        auto repo_dir = temp_dir / "repo";
+        std::filesystem::create_directories(repo_dir);
+        std::filesystem::copy_file(
+            conf_dir / "confpkg-3.0.0-1-x86_64.pkg.tar.zst",
+            repo_dir / "confpkg-3.0.0-1-x86_64.pkg.tar.zst",
+            std::filesystem::copy_options::overwrite_existing);
+        if (!sage::archive::generate_repo_index(repo_dir, "core")) {
+            sage::util::log_error("Failed to index conffile test repo");
+            return 1;
+        }
+        auto conf_root = temp_dir / "target";
+        std::filesystem::create_directories(conf_root / "etc/sage");
+        {
+            std::ofstream chan(conf_root / "etc/sage/channels.toml");
+            chan << "schema_version = 1\n\n[[channels]]\nname = \"core\"\nurl = \"file://"
+                 << repo_dir.string() << "\"\nscope = \"system\"\npriority = 100\nenabled = true\n";
+        }
+        CliOptions install_opts;
+        install_opts.target_root = conf_root;
+        // Reinstall goes through the archive argument so it bypasses the
+        // same-version no-op filter: a plain name request for an already
+        // satisfied version resolves to nothing by design.
+        const auto conf_archive_path = repo_dir / "confpkg-3.0.0-1-x86_64.pkg.tar.zst";
+        install_opts.args = {conf_archive_path.string()};
+        if (cmd_install(install_opts) != 0) {
+            sage::util::log_error("Fresh confpkg install failed");
+            return 1;
+        }
+        if (read_text(conf_root / "etc/myapp.conf") != "v1\n"
+            || read_text(conf_root / "etc/plain.conf") != "v1\n") {
+            sage::util::log_error("Conffiles missing after fresh install");
+            return 1;
+        }
+
+        // The admin edits one of them, then the same version is reinstalled.
+        { std::ofstream f(conf_root / "etc/myapp.conf"); f << "admin-edited"; }
+        if (cmd_install(install_opts) != 0) {
+            sage::util::log_error("Reinstall over modified config failed");
+            return 1;
+        }
+        if (read_text(conf_root / "etc/myapp.conf") != "admin-edited"
+            || read_text(conf_root / "etc/myapp.conf.new") != "v1\n") {
+            sage::util::log_error("Modified conffile was not protected across reinstall");
+            return 1;
+        }
+        // The untouched conffile is overwritten in place -- no stray .new.
+        if (read_text(conf_root / "etc/plain.conf") != "v1\n"
+            || std::filesystem::exists(conf_root / "etc/plain.conf.new")) {
+            sage::util::log_error("Unmodified conffile was not cleanly replaced");
+            return 1;
+        }
+
+        std::filesystem::remove_all(temp_dir);
+        sage::util::log_success("14. Conffile Protection on Reinstall OK");
+    }
+
     std::filesystem::remove_all(temp_dir);
     sage::util::log_success("🎉 All Sage Master Architecture & Subsystem Integration Tests Passed Successfully!");
     return 0;

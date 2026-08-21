@@ -478,6 +478,10 @@ struct PackageManifest {
 
     std::vector<Dependency> dependencies;
     std::vector<std::string> provides; // e.g. "virtual/init", "so:libz.so.1"
+    // Configuration files the package ships but does not own outright: on
+    // upgrade, a locally modified conffile is kept and the new payload lands
+    // beside it as "<path>.new".
+    std::vector<std::string> conffiles;
     std::vector<Dependency> conflicts;
     std::vector<FileEntry> files;
     std::vector<CapabilityHook> capability_hooks;
@@ -567,6 +571,15 @@ struct PackageManifest {
         }
         if (auto* src = tbl.get_as<vendor::toml::table>("source")) {
             parse_strings(*src, "provides", m.provides);
+        }
+
+        // Parse conffiles
+        parse_strings(tbl, "conffiles", m.conffiles);
+        if (auto* pkg = tbl.get_as<vendor::toml::table>("package")) {
+            parse_strings(*pkg, "conffiles", m.conffiles);
+        }
+        if (auto* src = tbl.get_as<vendor::toml::table>("source")) {
+            parse_strings(*src, "conffiles", m.conffiles);
         }
 
         // Parse conflicts
@@ -660,6 +673,16 @@ struct PackageManifest {
         }
         ss << "]\n\n";
 
+        // Omitted entirely when empty so manifests of packages that declare
+        // no conffiles stay byte-identical to their pre-conffile output.
+        if (!conffiles.empty()) {
+            ss << "conffiles = [\n";
+            for (const auto& c : conffiles) {
+                ss << "    \"" << quote(c) << "\",\n";
+            }
+            ss << "]\n\n";
+        }
+
         for (const auto& h : capability_hooks) {
             ss << "[[capability_hooks]]\n";
             ss << "capability = \"" << quote(h.capability) << "\"\n";
@@ -750,6 +773,9 @@ struct Recipe {
     std::vector<std::string> build_deps;
     std::vector<Dependency> host_deps;
     std::vector<std::string> provides;
+    // Absolute paths of shipped files protected from clobbering on reinstall;
+    // copied verbatim onto the built manifest.
+    std::vector<std::string> conffiles;
     std::vector<std::string> prepare_cmds;
     std::vector<std::string> build_cmds;
     std::vector<std::string> install_cmds;
@@ -811,17 +837,20 @@ struct Recipe {
         parse_deps(tbl, "dependencies", r.host_deps);
         parse_strings(tbl, "build_dependencies", r.build_deps);
         parse_strings(tbl, "provides", r.provides);
+        parse_strings(tbl, "conffiles", r.conffiles);
 
         if (auto* pkg = tbl.get_as<vendor::toml::table>("package")) {
             parse_deps(*pkg, "dependencies", r.host_deps);
             parse_strings(*pkg, "build_dependencies", r.build_deps);
             parse_strings(*pkg, "provides", r.provides);
+            parse_strings(*pkg, "conffiles", r.conffiles);
         }
 
         if (auto* src = tbl.get_as<vendor::toml::table>("source")) {
             parse_deps(*src, "dependencies", r.host_deps);
             parse_strings(*src, "build_dependencies", r.build_deps);
             parse_strings(*src, "provides", r.provides);
+            parse_strings(*src, "conffiles", r.conffiles);
         }
 
         auto extract_cmds = [&](const char* key, std::vector<std::string>& dest) {

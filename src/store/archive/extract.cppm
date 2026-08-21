@@ -80,11 +80,43 @@ inline std::expected<void, std::string> remove_path_anchored(
 // Streaming Tar + Zstd Extractor (Extracts directly to target root)
 // ============================================================================
 
+// A declared conffile whose on-disk contents no longer match what the
+// previous package generation recorded must not be overwritten: the admin
+// edited it. True when `rel_path` exists under `target_root`, is declared by
+// `conffiles`, and differs from the previous record's hash -- or when the file
+// is on disk but was never recorded (foreign content wins, we stand aside).
+inline bool conffile_modified(
+    const std::filesystem::path& target_root,
+    std::string_view rel_path,
+    const std::vector<std::string>& conffiles,
+    const package::PackageManifest* previous)
+{
+    if (!previous) return false;
+    const auto key = util::clean_rel_path(rel_path);
+    const auto declared = std::ranges::find_if(conffiles, [&](const auto& c) {
+        return util::clean_rel_path(c) == key;
+    });
+    if (declared == conffiles.end()) return false;
+
+    const auto disk_path = target_root / key;
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(disk_path, ec)) return false;
+    auto disk_hash = util::compute_file_sha256(disk_path);
+    if (!disk_hash) return true; // unreadable -> assume local changes
+
+    for (const auto& f : previous->files) {
+        if (util::clean_rel_path(f.path) != key) continue;
+        return f.sha256 != *disk_hash;
+    }
+    return true;
+}
+
 inline std::expected<ExtractedPackage, std::string> extract_package(
     const std::filesystem::path& archive_path,
     const std::filesystem::path& target_root,
     const package::PackageManifest* expected_manifest = nullptr,
-    const InspectedPackage* expected_inspection = nullptr)
+    const InspectedPackage* expected_inspection = nullptr,
+    const package::PackageManifest* previous_manifest = nullptr)
 {
     auto snapshot_res = PrivateArchiveSnapshot::create(
         archive_path, target_root / "var/lib/sage/tmp");
@@ -188,6 +220,17 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
             }
         } else {
             entry.type = package::FileType::Regular;
+            bool redirected_config = false;
+            // Conffile protection compares against the archive's own manifest
+            // declaration, not any solver-side copy: the archive is ground
+            // truth for what this payload considers configuration.
+            if (previous_manifest && !result.manifest.conffiles.empty()
+                && conffile_modified(target_root, rel_path, result.manifest.conffiles, previous_manifest)) {
+                redirected_config = true;
+                destination->leaf += ".new";
+                util::log_warn("Protecting modified config '{}': new version saved as '{}'",
+                    rel_path, destination->leaf);
+            }
             const auto destination_name = destination->leaf;
             auto temp_res = UniqueTempFile::create(std::move(destination->directory));
             if (!temp_res) {
@@ -210,6 +253,10 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
                 hasher.update(archive_entry.payload.data(), archive_entry.payload.size());
             }
             entry.sha256 = hasher.finalize();
+
+            // A protected conffile was redirected: ownership records must name
+            // the path we actually wrote, so removal and verify stay honest.
+            if (redirected_config) entry.path = rel_path + ".new";
         }
 
         result.extracted_files.push_back(std::move(entry));

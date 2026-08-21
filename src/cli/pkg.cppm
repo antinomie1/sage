@@ -401,7 +401,8 @@ export int cmd_install(
         // opt/channels/gcc/15/bin/gcc), so always extract to the target root directly.
         sage::util::log_info("Unpacking {} -> {}...", pkg.name, opts.target_root.string());
         auto ext_res = sage::archive::extract_package(
-            archive_it->second, opts.target_root, &pkg, &inspected_it->second);
+            archive_it->second, opts.target_root, &pkg, &inspected_it->second,
+            *previous_package ? &**previous_package : nullptr);
         if (!ext_res) {
             sage::util::log_error("Failed to extract package '{}': {}", pkg.name, ext_res.error());
             return 1;
@@ -418,6 +419,10 @@ export int cmd_install(
         // very trigger that has to run it.
         installed_pkg.capability_hooks = ext_res->manifest.capability_hooks;
         installed_pkg.triggers = ext_res->manifest.triggers;
+        // Conffile declarations likewise ride in the archive manifest, so the
+        // stale-claim cleanup below can honor them even if the channel index
+        // predates the declaration.
+        installed_pkg.conffiles = ext_res->manifest.conffiles;
         auto package_touched_files = installed_pkg.files;
 
         // Reinstall/upgrade cleanup: release ownership of paths the new payload
@@ -458,6 +463,13 @@ export int cmd_install(
                     sage::util::log_info(
                         "  ~ released shared directory '{}' ({} owner(s) remain)",
                         old_path, owners->size() - 1);
+                } else if (!installed_pkg.conffiles.empty()
+                    && sage::archive::conffile_modified(
+                        opts.target_root, old_path, installed_pkg.conffiles,
+                        &**previous_package)) {
+                    // The payload dropped this path, but it is a conffile the
+                    // admin has since edited: release the claim, keep the file.
+                    sage::util::log_info("  ~ keeping locally modified config '{}'", old_path);
                 } else {
                     auto remove_res = sage::archive::remove_path_anchored(
                         opts.target_root, old_path, declared_directory);
