@@ -484,10 +484,20 @@ int cmd_install(const CliOptions& opts) {
     }
     (void)sage::channel::ProfileManager::regenerate_fhs_profile(opts.target_root, active_channels);
 
-    // 6. Post-Transaction File Triggers (ldconfig, ca-certificates, mime).
+    // 6. Post-transaction triggers.
     // Runs AFTER toolchain activation so freshly written
-    // /etc/ld.so.conf.d/sage-*.conf entries are picked up by ldconfig.
-    sage::rebuild::TriggerEngine::run_post_transaction_triggers(opts.target_root, all_installed_files);
+    // /etc/ld.so.conf.d/sage-*.conf entries are picked up by ldconfig, and
+    // after the DB commit so a capability installed in this very transaction
+    // (mkinitcpio arriving alongside the kernel that needs it) is already
+    // visible when the initramfs trigger looks for its provider.
+    sage::rebuild::TriggerContext trig_ctx;
+    trig_ctx.sysroot = opts.target_root;
+    trig_ctx.touched_files = all_installed_files;
+    trig_ctx.transaction_packages = unique_to_install;
+    trig_ctx.installed_packages = db.list_installed_packages();
+    trig_ctx.providers = cfg.providers;
+    trig_ctx.dry_run = opts.dry_run;
+    sage::rebuild::TriggerEngine::run(trig_ctx);
 
     sage::util::log_success("Successfully installed {} packages into {}", unique_to_install.size(), opts.target_root.string());
     return 0;
@@ -770,7 +780,20 @@ int cmd_remove(const CliOptions& opts) {
     auto commit_res = wtxn->commit();
     if (!commit_res) return 1;
 
-    sage::rebuild::TriggerEngine::run_post_transaction_triggers(opts.target_root, removed_files);
+    // Removing a kernel is as much a reason to regenerate the initramfs and
+    // the bootloader entries as installing one, so removal runs the same
+    // triggers -- with the removed packages as the transaction set, since it
+    // is their capabilities that make the kernel triggers fire.
+    sage::rebuild::TriggerContext trig_ctx;
+    trig_ctx.sysroot = opts.target_root;
+    trig_ctx.touched_files = removed_files;
+    trig_ctx.installed_packages = db.list_installed_packages();
+    trig_ctx.providers = cfg.providers;
+    trig_ctx.dry_run = opts.dry_run;
+    for (const auto& [name, pkg] : installed_map) {
+        if (to_remove_set.contains(name)) trig_ctx.transaction_packages.push_back(pkg);
+    }
+    sage::rebuild::TriggerEngine::run(trig_ctx);
     std::vector<sage::channel::Channel> active_channels;
     for (const auto& ch_cfg : cfg.channels) {
         sage::channel::Channel ch;
@@ -1665,7 +1688,7 @@ int cmd_rebuild(const CliOptions& opts) {
         return 1;
     }
 
-    auto exec_res = sage::rebuild::ReconcileEngine::execute(*db_res, *plan_res, opts.target_root, opts.dry_run);
+    auto exec_res = sage::rebuild::ReconcileEngine::execute(*db_res, *plan_res, opts.target_root, opts.dry_run, cfg_res->providers);
     if (!exec_res) {
         sage::util::log_error("Reconcile execution failed: {}", exec_res.error());
         return 1;

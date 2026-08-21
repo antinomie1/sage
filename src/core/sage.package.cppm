@@ -286,6 +286,10 @@ struct Trigger {
     std::string exec;                 // absolute path inside the target root
     std::vector<std::string> args;
     std::string run_capability;       // resolved via the provider's hook
+    // Lower runs first. Ordering is not cosmetic: the initramfs must exist
+    // before the bootloader is asked to reference it, and ldconfig must have
+    // run before anything that dlopen()s.
+    int priority{50};
 
     [[nodiscard]] bool matches_path(std::string_view rel_path) const {
         for (const auto& prefix : on_paths) {
@@ -351,6 +355,7 @@ inline std::expected<void, std::string> parse_triggers(const vendor::toml::table
             tr.name = (*t)["name"].value_or("");
             tr.exec = (*t)["exec"].value_or("");
             tr.run_capability = (*t)["run_capability"].value_or("");
+            tr.priority = static_cast<int>((*t)["priority"].value_or(50LL));
             read_strings(*t, "on_paths", tr.on_paths);
             read_strings(*t, "on_capability", tr.on_capability);
             read_strings(*t, "args", tr.args);
@@ -407,6 +412,7 @@ inline std::string serialize_triggers_toml(const std::vector<Trigger>& triggers)
         if (!t.exec.empty()) {
             ss << "exec = \"" << t.exec << "\"\n";
         }
+        ss << "priority = " << t.priority << "\n";
         if (!t.args.empty()) {
             ss << "args = [";
             for (size_t i = 0; i < t.args.size(); ++i) {
@@ -617,6 +623,7 @@ struct PackageManifest {
             ss << "]\n";
             ss << "run_capability = \"" << t.run_capability << "\"\n";
             ss << "exec = \"" << t.exec << "\"\n";
+            ss << "priority = " << t.priority << "\n";
             ss << "args = [";
             for (size_t i = 0; i < t.args.size(); ++i) {
                 ss << (i ? ", " : "") << "\"" << t.args[i] << "\"";
