@@ -136,6 +136,9 @@ struct SystemConfig {
         cfg.providers["virtual/init"] = "openrc";
         cfg.providers["virtual/udev"] = "eudev";
         cfg.providers["virtual/libc"] = "glibc";
+        // Core userland is exclusive like libc: every implementation claims
+        // /usr/bin/ls, so exactly one may own the system at a time.
+        cfg.providers["virtual/coreutils"] = "coreutils";
         // The initramfs builder is a *default*, not a lock: dracut and
         // mkinitcpio can sit on disk together, and an admin who wants the
         // other one only has to retarget this one line.
@@ -144,6 +147,7 @@ struct SystemConfig {
         cfg.capabilities["virtual/init"] = CapabilityKind::Exclusive;
         cfg.capabilities["virtual/udev"] = CapabilityKind::Exclusive;
         cfg.capabilities["virtual/libc"] = CapabilityKind::Exclusive;
+        cfg.capabilities["virtual/coreutils"] = CapabilityKind::Exclusive;
 
         ChannelConfig core;
         core.name = "core";
@@ -163,11 +167,12 @@ struct SystemConfig {
 
         SystemConfig cfg;
         // Existing system.toml files predate [capabilities]. Preserve the
-        // historic single-provider semantics for the three core interfaces;
+        // historic single-provider semantics for the core interfaces;
         // explicit entries below may still override any of these to shared.
         cfg.capabilities["virtual/init"] = CapabilityKind::Exclusive;
         cfg.capabilities["virtual/udev"] = CapabilityKind::Exclusive;
         cfg.capabilities["virtual/libc"] = CapabilityKind::Exclusive;
+        cfg.capabilities["virtual/coreutils"] = CapabilityKind::Exclusive;
 
         if (auto* sys = tbl.get_as<vendor::toml::table>("system")) {
             cfg.root_dir = (*sys)["root_dir"].value_or("/");
