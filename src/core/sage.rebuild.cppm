@@ -112,7 +112,10 @@ public:
         return t;
     }
 
-    static void run(const TriggerContext& ctx) {
+    static size_t run(
+        const TriggerContext& ctx,
+        std::set<std::string>& already_run)
+    {
         // Capabilities brought in by this transaction, for on_capability.
         std::set<std::string> txn_capabilities;
         for (const auto& pkg : ctx.transaction_packages) {
@@ -128,9 +131,7 @@ public:
 
         std::ranges::stable_sort(candidates, {}, &package::Trigger::priority);
 
-        // One resolved command runs at most once per transaction, however many
-        // triggers and however many touched files ask for it.
-        std::set<std::string> already_run;
+        size_t executed_count = 0;
 
         for (const auto& trig : candidates) {
             if (!fires(trig, ctx, txn_capabilities)) continue;
@@ -138,9 +139,18 @@ public:
             auto cmd = resolve_command(trig, ctx);
             if (!cmd) continue;
 
-            if (!already_run.insert(*cmd).second) continue;
-            execute(*cmd, trig.name, ctx);
+            if (already_run.contains(*cmd)) continue;
+            if (execute(*cmd, trig.name, ctx)) {
+                already_run.insert(*cmd);
+                ++executed_count;
+            }
         }
+        return executed_count;
+    }
+
+    static size_t run(const TriggerContext& ctx) {
+        std::set<std::string> already_run;
+        return run(ctx, already_run);
     }
 
 private:
@@ -221,10 +231,14 @@ private:
     // chroot: host-side they would rebuild the HOST's caches and leave the
     // sysroot's untouched, and the host loader may not even match the target's
     // glibc. Every path here is therefore relative to the target root.
-    static void execute(const std::string& cmd, std::string_view trigger_name, const TriggerContext& ctx) {
+    static bool execute(
+        const std::string& cmd,
+        std::string_view trigger_name,
+        const TriggerContext& ctx)
+    {
         std::string exec_path = cmd.substr(0, cmd.find(' '));
         if (!std::filesystem::exists(ctx.sysroot / std::filesystem::path(exec_path).relative_path())) {
-            return;
+            return false;
         }
 
         std::string full = (ctx.sysroot == "/")
@@ -233,7 +247,7 @@ private:
 
         if (ctx.dry_run) {
             util::log_info("Would run trigger '{}': {}", trigger_name, full);
-            return;
+            return true;
         }
 
         util::log_info("Running trigger '{}': {}", trigger_name, full);
@@ -241,6 +255,7 @@ private:
         if (ret != 0) {
             util::log_warn("Trigger '{}' failed (exit {}): {}", trigger_name, ret, full);
         }
+        return true;
     }
 };
 

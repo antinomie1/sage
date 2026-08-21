@@ -630,6 +630,7 @@ int cmd_install(const CliOptions& opts) {
         active_channels.push_back(std::move(ch));
     }
     std::vector<sage::package::FileEntry> all_installed_files;
+    std::set<std::string> completed_trigger_commands;
 
     auto run_package_postprocessing = [&](const sage::package::PackageManifest& installed_pkg) {
         auto spec = sage::channel::SubChannelSpec::parse(installed_pkg.channel);
@@ -659,7 +660,8 @@ int cmd_install(const CliOptions& opts) {
         trigger_context.transaction_packages = {installed_pkg};
         trigger_context.installed_packages = std::move(*current_packages);
         trigger_context.providers = cfg.providers;
-        sage::rebuild::TriggerEngine::run(trigger_context);
+        sage::rebuild::TriggerEngine::run(
+            trigger_context, completed_trigger_commands);
     };
 
     // 3. Streaming Unpack & LMDB State Registration
@@ -850,7 +852,7 @@ int cmd_install(const CliOptions& opts) {
     }
     trig_ctx.providers = cfg.providers;
     trig_ctx.dry_run = opts.dry_run;
-    sage::rebuild::TriggerEngine::run(trig_ctx);
+    sage::rebuild::TriggerEngine::run(trig_ctx, completed_trigger_commands);
 
     sage::util::log_success("Successfully installed {} packages into {}", unique_to_install.size(), opts.target_root.string());
     return 0;
@@ -2033,6 +2035,46 @@ version = "1:2.0-3"
         || embedded_epoch_index->available_packages.front().version.epoch != 1
         || embedded_epoch_index->available_packages.front().version.rel != "3") {
         sage::util::log_error("Embedded version epoch/release was not preserved");
+        return 1;
+    }
+
+    // Per-package and aggregate trigger passes share completion state. A
+    // command that is not available yet remains retryable, while a command
+    // that already ran is not executed again in the aggregate pass.
+    auto trigger_state_root = temp_dir / "trigger-state-root";
+    sage::package::PackageManifest trigger_package;
+    trigger_package.name = "trigger-state-test";
+    sage::package::Trigger trigger;
+    trigger.name = "trigger-state-counter";
+    trigger.on_paths = {"usr/share/trigger-input"};
+    trigger.exec = "/usr/bin/trigger-counter";
+    trigger_package.triggers = {trigger};
+    sage::package::FileEntry trigger_input;
+    trigger_input.path = "usr/share/trigger-input/file";
+    sage::rebuild::TriggerContext trigger_context;
+    trigger_context.sysroot = trigger_state_root;
+    trigger_context.touched_files = {trigger_input};
+    trigger_context.transaction_packages = {trigger_package};
+    trigger_context.installed_packages = {trigger_package};
+    trigger_context.dry_run = true;
+    std::set<std::string> completed_trigger_commands;
+    if (sage::rebuild::TriggerEngine::run(
+            trigger_context, completed_trigger_commands) != 0
+        || !completed_trigger_commands.empty()) {
+        sage::util::log_error("Unavailable trigger command was marked as completed");
+        return 1;
+    }
+    std::filesystem::create_directories(trigger_state_root / "usr/bin");
+    std::ofstream(trigger_state_root / "usr/bin/trigger-counter") << "fixture\n";
+    auto first_trigger_pass = sage::rebuild::TriggerEngine::run(
+        trigger_context, completed_trigger_commands);
+    auto aggregate_trigger_pass = sage::rebuild::TriggerEngine::run(
+        trigger_context, completed_trigger_commands);
+    if (first_trigger_pass != 1
+        || aggregate_trigger_pass != 0
+        || completed_trigger_commands
+            != std::set<std::string>{"/usr/bin/trigger-counter"}) {
+        sage::util::log_error("Trigger command ran more than once across install passes");
         return 1;
     }
 
