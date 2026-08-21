@@ -168,16 +168,13 @@ int cmd_build(const CliOptions& opts) {
     manifest.arch = r.arch;
 
     if (std::filesystem::exists(pkg_dir)) {
-        std::vector<std::filesystem::directory_entry> entries;
+        std::map<std::string, std::filesystem::directory_entry> entries;
         for (const auto& entry : std::filesystem::recursive_directory_iterator(pkg_dir, std::filesystem::directory_options::skip_permission_denied)) {
-            entries.push_back(entry);
+            entries.emplace(entry.path().lexically_relative(pkg_dir).generic_string(), entry);
         }
-        std::sort(entries.begin(), entries.end(), [&](const auto& lhs, const auto& rhs) {
-            return lhs.path().lexically_relative(pkg_dir).generic_string()
-                < rhs.path().lexically_relative(pkg_dir).generic_string();
-        });
 
-        for (const auto& entry : entries) {
+        for (const auto& item : entries) {
+            const auto& entry = item.second;
             if (entry.is_symlink()) continue;
             if (entry.is_regular_file()) {
                 auto elf_res = sage::util::scan_elf(entry.path());

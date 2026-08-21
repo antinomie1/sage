@@ -392,17 +392,13 @@ inline std::expected<void, std::string> create_package(
 
     // 3. Append data/... filesystem payload
     if (std::filesystem::exists(data_dir)) {
-        std::vector<std::filesystem::directory_entry> entries;
+        std::map<std::string, std::filesystem::directory_entry> entries;
         for (const auto& entry : std::filesystem::recursive_directory_iterator(data_dir, std::filesystem::directory_options::none)) {
-            entries.push_back(entry);
-        }
-        std::sort(entries.begin(), entries.end(), [&](const auto& lhs, const auto& rhs) {
-            return lhs.path().lexically_relative(data_dir).generic_string()
-                < rhs.path().lexically_relative(data_dir).generic_string();
-        });
-
-        for (const auto& entry : entries) {
             auto rel = entry.path().lexically_relative(data_dir).generic_string();
+            entries.emplace(rel, entry);
+        }
+
+        for (const auto& [rel, entry] : entries) {
             std::string tar_name = "data/" + rel;
 
             if (entry.is_symlink()) {
