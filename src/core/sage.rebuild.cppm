@@ -178,7 +178,9 @@ public:
 
         // 2. Unregister and remove obsolete packages
         for (const auto& pkg_name : plan.packages_to_remove) {
-            if (auto old_pkg = db.get_package(pkg_name)) {
+            auto old_pkg = std::ranges::find(
+                *installed_before, pkg_name, &package::PackageManifest::name);
+            if (old_pkg != installed_before->end()) {
                 (void)db.unregister_files(*wtxn, old_pkg->files);
                 (void)db.unregister_provides(*wtxn, old_pkg->provides);
                 (void)db.del_package(*wtxn, pkg_name);

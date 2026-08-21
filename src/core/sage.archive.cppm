@@ -135,6 +135,11 @@ struct ExtractedPackage {
     std::vector<package::FileEntry> extracted_files;
 };
 
+struct InspectedPackage {
+    package::PackageManifest manifest;
+    std::optional<service::ServiceSpec> service;
+};
+
 struct ArchiveEntryView {
     std::string name;
     uint64_t size{0};
@@ -167,6 +172,8 @@ inline std::expected<void, std::string> walk_archive_entries(
 
     std::vector<uint8_t> ring;
     ring.reserve(256 * 1024);
+    size_t end_zero_blocks = 0;
+    bool frame_finished = false;
 
     auto process_decompressed_bytes = [&](std::span<const uint8_t> chunk) -> std::expected<void, std::string> {
         ring.insert(ring.end(), chunk.begin(), chunk.end());
@@ -180,8 +187,12 @@ inline std::expected<void, std::string> walk_archive_entries(
                 if (ring[i] != 0) { all_zero = false; break; }
             }
             if (all_zero) {
+                ++end_zero_blocks;
                 ring.erase(ring.begin(), ring.begin() + 512);
                 continue;
+            }
+            if (end_zero_blocks > 0) {
+                return std::unexpected("Tar archive contains data after its end marker");
             }
 
             // Verify checksum
@@ -232,6 +243,7 @@ inline std::expected<void, std::string> walk_archive_entries(
             ZSTD_outBuffer out = { out_buffer.data(), out_buffer.size(), 0 };
             auto dec_res = zstd_stream.decompress_stream(in, out);
             if (!dec_res) return std::unexpected(dec_res.error());
+            frame_finished = *dec_res == 0;
 
             if (out.pos > 0) {
                 auto proc_res = process_decompressed_bytes(std::span<const uint8_t>(out_buffer.data(), out.pos));
@@ -240,60 +252,238 @@ inline std::expected<void, std::string> walk_archive_entries(
         }
     }
 
+    if (file.bad()) {
+        return std::unexpected("Failed while reading package archive: " + archive_path.string());
+    }
+    if (!frame_finished) {
+        return std::unexpected("Truncated ZSTD package archive: " + archive_path.string());
+    }
+    if (!ring.empty()) {
+        return std::unexpected("Truncated tar block in package archive: " + archive_path.string());
+    }
+    if (end_zero_blocks < 2) {
+        return std::unexpected("Tar archive is missing its end marker");
+    }
+
     return {};
 }
 
-inline std::expected<void, std::string> preflight_extract_paths(
+struct PackageDataEntry {
+    std::string path;
+    char typeflag{'0'};
+};
+
+inline std::expected<std::string, std::string> normalize_data_path(std::string_view raw_path) {
+    std::filesystem::path path(raw_path);
+    if (path.is_absolute() || path.has_root_name() || path.has_root_directory()) {
+        return std::unexpected("Package data path must be relative: " + std::string(raw_path));
+    }
+    for (const auto& component : path) {
+        if (component == "..") {
+            return std::unexpected("Package data path escapes the target root: " + std::string(raw_path));
+        }
+    }
+
+    auto normalized = path.lexically_normal();
+    if (normalized.empty() || normalized == ".") {
+        return std::unexpected("Package data path is empty");
+    }
+    return normalized.generic_string();
+}
+
+inline bool path_is_within(
+    const std::filesystem::path& root,
+    const std::filesystem::path& candidate)
+{
+    auto root_it = root.begin();
+    auto candidate_it = candidate.begin();
+    for (; root_it != root.end(); ++root_it, ++candidate_it) {
+        if (candidate_it == candidate.end() || *candidate_it != *root_it) return false;
+    }
+    return true;
+}
+
+inline std::expected<void, std::string> validate_target_path(
+    const PackageDataEntry& entry,
+    const std::filesystem::path& target_root,
+    const std::filesystem::path& resolved_root)
+{
+    const auto relative = std::filesystem::path(entry.path);
+    auto current = resolved_root;
+    for (const auto& component : relative.parent_path()) {
+        if (component == ".") continue;
+        current /= component;
+
+        std::error_code status_ec;
+        auto status = std::filesystem::symlink_status(current, status_ec);
+        if (status_ec == std::errc::no_such_file_or_directory) {
+            status_ec.clear();
+            continue;
+        }
+        if (status_ec) {
+            return std::unexpected(std::format(
+                "Cannot inspect parent directory for '{}': {}", entry.path, status_ec.message()));
+        }
+        if (std::filesystem::is_symlink(status)) {
+            std::error_code link_ec;
+            auto link_target = std::filesystem::read_symlink(current, link_ec);
+            if (link_ec) {
+                return std::unexpected(std::format(
+                    "Cannot inspect parent symlink for '{}': {}", entry.path, link_ec.message()));
+            }
+            auto resolved = link_target.is_absolute()
+                ? link_target
+                : current.parent_path() / link_target;
+            resolved = std::filesystem::weakly_canonical(resolved, link_ec);
+            if (link_ec) {
+                return std::unexpected(std::format(
+                    "Cannot resolve parent symlink for '{}': {}", entry.path, link_ec.message()));
+            }
+            if (!path_is_within(resolved_root, resolved)) {
+                return std::unexpected(std::format(
+                    "Parent symlink for '{}' escapes target root", entry.path));
+            }
+            current = std::move(resolved);
+        } else if (!std::filesystem::is_directory(status)) {
+            return std::unexpected(std::format(
+                "Parent path for '{}' is not a directory", entry.path));
+        }
+    }
+
+    const auto destination = target_root / relative;
+    std::error_code status_ec;
+    auto status = std::filesystem::symlink_status(destination, status_ec);
+    if (status_ec == std::errc::no_such_file_or_directory) return {};
+    if (status_ec) {
+        return std::unexpected(std::format(
+            "Cannot inspect '{}': {}", entry.path, status_ec.message()));
+    }
+
+    if (entry.typeflag == '5') {
+        if (!std::filesystem::is_directory(status)) {
+            return std::unexpected(std::format(
+                "Cannot replace '{}' with directory", entry.path));
+        }
+    } else if (entry.typeflag == '2' && std::filesystem::is_directory(status)) {
+        std::error_code empty_ec;
+        if (!std::filesystem::is_empty(destination, empty_ec) || empty_ec) {
+            return std::unexpected(std::format(
+                "Cannot replace non-empty directory '{}' with symlink", entry.path));
+        }
+    } else if (entry.typeflag != '2' && std::filesystem::is_directory(status)) {
+        return std::unexpected(std::format(
+            "Cannot replace directory '{}' with regular file", entry.path));
+    }
+    return {};
+}
+
+inline std::expected<InspectedPackage, std::string> inspect_package_impl(
+    const std::filesystem::path& archive_path,
+    const std::filesystem::path* target_root)
+{
+    std::string manifest_content;
+    std::string service_content;
+    bool manifest_seen = false;
+    bool service_seen = false;
+    std::vector<PackageDataEntry> data_entries;
+    std::unordered_set<std::string> data_paths;
+    std::unordered_set<std::string> archive_symlinks;
+
+    auto walk_res = walk_archive_entries(archive_path, [&](const ArchiveEntryView& entry)
+        -> std::expected<void, std::string> {
+        if (entry.name == ".METADATA/manifest.toml") {
+            if (manifest_seen) return std::unexpected("Package archive contains multiple manifests");
+            if (entry.typeflag != '0') return std::unexpected("Package manifest must be a regular file");
+            manifest_seen = true;
+            manifest_content.assign(
+                reinterpret_cast<const char*>(entry.payload.data()), entry.payload.size());
+            return {};
+        }
+        if (entry.name == ".METADATA/service.toml") {
+            if (service_seen) return std::unexpected("Package archive contains multiple service manifests");
+            if (entry.typeflag != '0') return std::unexpected("Package service manifest must be a regular file");
+            service_seen = true;
+            service_content.assign(
+                reinterpret_cast<const char*>(entry.payload.data()), entry.payload.size());
+            return {};
+        }
+        if (!entry.name.starts_with("data/")) return {};
+        if (entry.name.size() == 5) return {};
+        if (entry.typeflag != '0' && entry.typeflag != '5' && entry.typeflag != '2') {
+            return std::unexpected(std::format(
+                "Unsupported tar entry type '{}' for '{}'", entry.typeflag, entry.name));
+        }
+        auto path_res = normalize_data_path(std::string_view(entry.name).substr(5));
+        if (!path_res) return std::unexpected(path_res.error());
+        if (!data_paths.insert(*path_res).second) {
+            return std::unexpected("Package archive contains duplicate data path: " + *path_res);
+        }
+        data_entries.push_back(PackageDataEntry{*path_res, entry.typeflag});
+        if (entry.typeflag == '2') archive_symlinks.insert(*path_res);
+        return {};
+    });
+    if (!walk_res) return std::unexpected(walk_res.error());
+
+    if (!manifest_seen) {
+        return std::unexpected("Package archive is missing .METADATA/manifest.toml");
+    }
+    auto manifest_res = package::PackageManifest::parse_toml(manifest_content);
+    if (!manifest_res) {
+        return std::unexpected("Failed to parse manifest.toml: " + manifest_res.error());
+    }
+
+    InspectedPackage result;
+    result.manifest = std::move(*manifest_res);
+    if (service_seen) {
+        auto service_res = service::ServiceSpec::parse_toml(service_content);
+        if (!service_res) {
+            return std::unexpected("Failed to parse service.toml: " + service_res.error());
+        }
+        result.service = std::move(*service_res);
+    }
+
+    for (const auto& entry : data_entries) {
+        for (auto parent = std::filesystem::path(entry.path).parent_path();
+             !parent.empty() && parent != ".";
+             parent = parent.parent_path()) {
+            if (archive_symlinks.contains(parent.generic_string())) {
+                return std::unexpected(std::format(
+                    "Package data path '{}' traverses archive symlink '{}'",
+                    entry.path, parent.generic_string()));
+            }
+        }
+    }
+
+    if (target_root) {
+        std::error_code root_ec;
+        auto absolute_root = std::filesystem::absolute(*target_root, root_ec).lexically_normal();
+        if (root_ec) {
+            return std::unexpected("Cannot resolve target root: " + root_ec.message());
+        }
+        auto resolved_root = std::filesystem::weakly_canonical(absolute_root, root_ec);
+        if (root_ec) {
+            return std::unexpected("Cannot resolve target root: " + root_ec.message());
+        }
+        for (const auto& entry : data_entries) {
+            auto path_res = validate_target_path(entry, *target_root, resolved_root);
+            if (!path_res) return std::unexpected(path_res.error());
+        }
+    }
+
+    return result;
+}
+
+inline std::expected<InspectedPackage, std::string> inspect_package(
+    const std::filesystem::path& archive_path)
+{
+    return inspect_package_impl(archive_path, nullptr);
+}
+
+inline std::expected<InspectedPackage, std::string> inspect_package(
     const std::filesystem::path& archive_path,
     const std::filesystem::path& target_root)
 {
-    return walk_archive_entries(archive_path, [&](const ArchiveEntryView& entry)
-        -> std::expected<void, std::string> {
-        if (!entry.name.starts_with("data/")) return {};
-        std::string rel_path = entry.name.substr(5);
-        if (rel_path.empty()) return {};
-
-        const auto destination = target_root / rel_path;
-        for (auto parent = destination.parent_path(); parent != target_root; parent = parent.parent_path()) {
-            std::error_code parent_ec;
-            auto status = std::filesystem::status(parent, parent_ec);
-            if (parent_ec && parent_ec != std::errc::no_such_file_or_directory) {
-                return std::unexpected(std::format(
-                    "Cannot inspect parent directory for '{}': {}", rel_path, parent_ec.message()));
-            }
-            if (!parent_ec && std::filesystem::exists(status) && !std::filesystem::is_directory(status)) {
-                return std::unexpected(std::format(
-                    "Parent path for '{}' is not a directory", rel_path));
-            }
-            if (parent.empty() || parent == parent.root_path()) break;
-        }
-
-        std::error_code status_ec;
-        auto status = std::filesystem::symlink_status(destination, status_ec);
-        if (status_ec && status_ec != std::errc::no_such_file_or_directory) {
-            return std::unexpected(std::format(
-                "Cannot inspect '{}': {}", rel_path, status_ec.message()));
-        }
-        if (status_ec || !std::filesystem::exists(status)) return {};
-
-        if (entry.typeflag == '5') {
-            std::error_code directory_ec;
-            if (!std::filesystem::is_directory(destination, directory_ec) || directory_ec) {
-                return std::unexpected(std::format(
-                    "Cannot replace '{}' with directory", rel_path));
-            }
-        } else if (entry.typeflag == '2' && std::filesystem::is_directory(status)) {
-            std::error_code empty_ec;
-            if (!std::filesystem::is_empty(destination, empty_ec) || empty_ec) {
-                return std::unexpected(std::format(
-                    "Cannot replace non-empty directory '{}' with symlink", rel_path));
-            }
-        } else if (entry.typeflag != '2' && std::filesystem::is_directory(status)) {
-            return std::unexpected(std::format(
-                "Cannot replace directory '{}' with regular file", rel_path));
-        }
-        return {};
-    });
+    return inspect_package_impl(archive_path, &target_root);
 }
 
 // ============================================================================
@@ -304,29 +494,21 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
     const std::filesystem::path& archive_path,
     const std::filesystem::path& target_root)
 {
-    auto preflight_res = preflight_extract_paths(archive_path, target_root);
-    if (!preflight_res) return std::unexpected(preflight_res.error());
+    auto inspect_res = inspect_package(archive_path, target_root);
+    if (!inspect_res) return std::unexpected(inspect_res.error());
 
     ExtractedPackage result;
-    std::string manifest_content;
-    std::string service_content;
+    result.manifest = std::move(inspect_res->manifest);
+    result.service = std::move(inspect_res->service);
 
     auto extract_res = walk_archive_entries(archive_path, [&](const ArchiveEntryView& archive_entry)
         -> std::expected<void, std::string> {
-        if (archive_entry.name == ".METADATA/manifest.toml") {
-            manifest_content.assign(
-                reinterpret_cast<const char*>(archive_entry.payload.data()), archive_entry.size);
-            return {};
-        }
-        if (archive_entry.name == ".METADATA/service.toml") {
-            service_content.assign(
-                reinterpret_cast<const char*>(archive_entry.payload.data()), archive_entry.size);
-            return {};
-        }
         if (!archive_entry.name.starts_with("data/")) return {};
 
-        std::string rel_path = archive_entry.name.substr(5);
-        if (rel_path.empty()) return {};
+        if (archive_entry.name.size() == 5) return {};
+        auto path_res = normalize_data_path(std::string_view(archive_entry.name).substr(5));
+        if (!path_res) return std::unexpected(path_res.error());
+        std::string rel_path = std::move(*path_res);
         std::filesystem::path dest_file = target_root / rel_path;
         std::error_code parent_ec;
         std::filesystem::create_directories(dest_file.parent_path(), parent_ec);
@@ -417,21 +599,7 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
     });
     if (!extract_res) return std::unexpected(extract_res.error());
 
-    if (manifest_content.empty()) {
-        return std::unexpected("Package archive is missing .METADATA/manifest.toml");
-    }
-
-    auto manifest_res = package::PackageManifest::parse_toml(manifest_content);
-    if (!manifest_res) return std::unexpected("Failed to parse manifest.toml: " + manifest_res.error());
-    result.manifest = std::move(*manifest_res);
     result.manifest.files = result.extracted_files;
-
-    if (!service_content.empty()) {
-        auto svc_res = service::ServiceSpec::parse_toml(service_content);
-        if (svc_res) {
-            result.service = std::move(*svc_res);
-        }
-    }
 
     return result;
 }
@@ -623,32 +791,29 @@ inline std::expected<void, std::string> generate_repo_index(
     ss << "name = \"" << quote(channel_name) << "\"\n";
     ss << "updated_at = \"" << "2026-08-20T00:00:00Z" << "\"\n\n";
 
-    size_t count = 0;
     for (const auto& entry : std::filesystem::directory_iterator(repo_dir)) {
         if (entry.is_regular_file() && entry.path().string().ends_with(".pkg.tar.zst")) {
-            auto temp_sysroot = std::filesystem::temp_directory_path() / ("sage_idx_" + std::to_string(count));
-            std::filesystem::remove_all(temp_sysroot);
-            auto ext_res = extract_package(entry.path(), temp_sysroot);
-            std::filesystem::remove_all(temp_sysroot);
-            if (ext_res) {
-                const auto& m = ext_res->manifest;
-                ss << "[[packages]]\n";
-                ss << "name = \"" << quote(m.name) << "\"\n";
-                ss << "version = \"" << quote(m.version.ver) << "\"\n";
-                ss << "release = \"" << quote(m.version.rel) << "\"\n";
-                ss << "description = \"" << quote(m.description) << "\"\n";
-                ss << "license = \"" << quote(m.license) << "\"\n";
-                ss << "channel = \"" << quote(m.channel) << "\"\n";
-                ss << "arch = \"" << quote(m.arch) << "\"\n";
-                ss << "installed_size = " << m.installed_size << "\n";
-                ss << "dependencies = [\n";
-                for (const auto& d : m.dependencies) ss << "    \"" << quote(d.to_string()) << "\",\n";
-                ss << "]\n";
-                ss << "provides = [\n";
-                for (const auto& p : m.provides) ss << "    \"" << quote(p) << "\",\n";
-                ss << "]\n\n";
-                count++;
+            auto inspect_res = inspect_package(entry.path());
+            if (!inspect_res) {
+                return std::unexpected(std::format(
+                    "Cannot index package '{}': {}", entry.path().filename().string(), inspect_res.error()));
             }
+            const auto& m = inspect_res->manifest;
+            ss << "[[packages]]\n";
+            ss << "name = \"" << quote(m.name) << "\"\n";
+            ss << "version = \"" << quote(m.version.ver) << "\"\n";
+            ss << "release = \"" << quote(m.version.rel) << "\"\n";
+            ss << "description = \"" << quote(m.description) << "\"\n";
+            ss << "license = \"" << quote(m.license) << "\"\n";
+            ss << "channel = \"" << quote(m.channel) << "\"\n";
+            ss << "arch = \"" << quote(m.arch) << "\"\n";
+            ss << "installed_size = " << m.installed_size << "\n";
+            ss << "dependencies = [\n";
+            for (const auto& d : m.dependencies) ss << "    \"" << quote(d.to_string()) << "\",\n";
+            ss << "]\n";
+            ss << "provides = [\n";
+            for (const auto& p : m.provides) ss << "    \"" << quote(p) << "\",\n";
+            ss << "]\n\n";
         }
     }
 

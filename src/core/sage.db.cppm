@@ -77,14 +77,21 @@ public:
     // Packages Table
     // ========================================================================
 
-    std::optional<package::PackageManifest> get_package(std::string_view name) {
+    std::expected<std::optional<package::PackageManifest>, std::string> get_package(
+        std::string_view name)
+    {
         auto txn = begin_read_txn();
-        if (!txn) return std::nullopt;
+        if (!txn) {
+            return std::unexpected("Failed to open installed package read transaction: " + txn.error());
+        }
         auto val = dbi_packages_.get(*txn, name);
-        if (!val) return std::nullopt;
+        if (!val) return std::optional<package::PackageManifest>{};
         auto parsed = package::PackageManifest::parse_toml(*val);
-        if (!parsed) return std::nullopt;
-        return *parsed;
+        if (!parsed) {
+            return std::unexpected(std::format(
+                "Failed to parse installed package '{}' metadata: {}", name, parsed.error()));
+        }
+        return std::optional<package::PackageManifest>{std::move(*parsed)};
     }
 
     std::expected<void, std::string> put_package(

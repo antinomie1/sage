@@ -283,13 +283,14 @@ int cmd_install(const CliOptions& opts) {
     std::vector<sage::package::Dependency> root_reqs;
     for (const auto& arg : opts.args) {
         if (arg.ends_with(".pkg.tar.zst") && std::filesystem::exists(arg)) {
-            auto ext_res = sage::archive::extract_package(arg, std::filesystem::temp_directory_path() / "sage_probe");
-            std::filesystem::remove_all(std::filesystem::temp_directory_path() / "sage_probe");
-            if (ext_res) {
-                pool.push_back(ext_res->manifest);
-                package_archive_map[ext_res->manifest.name] = std::filesystem::absolute(arg);
-                root_reqs.push_back(sage::package::Dependency::parse(ext_res->manifest.name));
+            auto inspect_res = sage::archive::inspect_package(arg);
+            if (!inspect_res) {
+                sage::util::log_error("Invalid package archive '{}': {}", arg, inspect_res.error());
+                return 1;
             }
+            pool.push_back(inspect_res->manifest);
+            package_archive_map[inspect_res->manifest.name] = std::filesystem::absolute(arg);
+            root_reqs.push_back(sage::package::Dependency::parse(inspect_res->manifest.name));
         } else {
             root_reqs.push_back(sage::package::Dependency::parse(arg));
         }
@@ -365,10 +366,13 @@ int cmd_install(const CliOptions& opts) {
         return 0;
     }
 
-    auto wtxn = db.begin_write_txn();
-    if (!wtxn) {
-        sage::util::log_error("Failed to open database write transaction: {}", wtxn.error());
-        return 1;
+    for (const auto& pkg : unique_to_install) {
+        auto archive_it = package_archive_map.find(pkg.name);
+        if (archive_it == package_archive_map.end() || !std::filesystem::exists(archive_it->second)) {
+            sage::util::log_error("Package archive for '{}' not found at {}", pkg.name,
+                (archive_it != package_archive_map.end()) ? archive_it->second.string() : "<unknown>");
+            return 1;
+        }
     }
 
     // Self-heal: prune file registrations owned by packages that are no longer
@@ -378,7 +382,17 @@ int cmd_install(const CliOptions& opts) {
     for (const auto& [name, _] : installed_by_name) {
         installed_names.insert(name);
     }
-    auto pruned = db.prune_orphaned_files(*wtxn, installed_names);
+    auto prune_txn = db.begin_write_txn();
+    if (!prune_txn) {
+        sage::util::log_error("Failed to open orphan-pruning transaction: {}", prune_txn.error());
+        return 1;
+    }
+    auto pruned = db.prune_orphaned_files(*prune_txn, installed_names);
+    auto prune_commit = prune_txn->commit();
+    if (!prune_commit) {
+        sage::util::log_error("Failed to commit orphan-pruning transaction: {}", prune_commit.error());
+        return 1;
+    }
     if (pruned > 0) {
         sage::util::log_info("  ~ pruned {} orphaned file registration(s)", pruned);
     }
@@ -388,9 +402,9 @@ int cmd_install(const CliOptions& opts) {
     // 3. Streaming Unpack & LMDB State Registration
     for (const auto& pkg : unique_to_install) {
         auto archive_it = package_archive_map.find(pkg.name);
-        if (archive_it == package_archive_map.end() || !std::filesystem::exists(archive_it->second)) {
-            sage::util::log_error("Package archive for '{}' not found at {}", pkg.name, 
-                (archive_it != package_archive_map.end()) ? archive_it->second.string() : "<unknown>");
+        auto package_txn = db.begin_write_txn();
+        if (!package_txn) {
+            sage::util::log_error("Failed to open database transaction for '{}': {}", pkg.name, package_txn.error());
             return 1;
         }
 
@@ -433,35 +447,35 @@ int cmd_install(const CliOptions& opts) {
                 stale.push_back(std::move(fe));
             }
             if (!stale.empty()) {
-                (void)db.unregister_files(*wtxn, stale, my_owner);
+                (void)db.unregister_files(*package_txn, stale, my_owner);
                 sage::util::log_info("  ~ removed {} stale file(s) from previous {} {}", 
                     stale.size(), pkg.name, old_it->second.version.to_string());
             }
         }
 
-        auto p_res = db.put_package(*wtxn, installed_pkg);
+        auto p_res = db.put_package(*package_txn, installed_pkg);
         if (!p_res) {
             sage::util::log_error("Failed to register package '{}' in DB: {}", installed_pkg.name, p_res.error());
             return 1;
         }
-        auto f_res = db.register_files(*wtxn, installed_pkg.name, installed_pkg.channel, installed_pkg.files);
+        auto f_res = db.register_files(*package_txn, installed_pkg.name, installed_pkg.channel, installed_pkg.files);
         if (!f_res) {
             sage::util::log_error("Failed to register files for '{}': {}", installed_pkg.name, f_res.error());
             return 1;
         }
-        auto prov_res = db.register_provides(*wtxn, installed_pkg.name, installed_pkg.provides);
+        auto prov_res = db.register_provides(*package_txn, installed_pkg.name, installed_pkg.provides);
         if (!prov_res) {
             sage::util::log_error("Failed to register provides for '{}': {}", installed_pkg.name, prov_res.error());
             return 1;
         }
 
-        all_installed_files.insert(all_installed_files.end(), installed_pkg.files.begin(), installed_pkg.files.end());
-    }
+        auto package_commit = package_txn->commit();
+        if (!package_commit) {
+            sage::util::log_error("Failed to commit package '{}': {}", installed_pkg.name, package_commit.error());
+            return 1;
+        }
 
-    auto commit_res = wtxn->commit();
-    if (!commit_res) {
-        sage::util::log_error("Failed to commit database transaction: {}", commit_res.error());
-        return 1;
+        all_installed_files.insert(all_installed_files.end(), installed_pkg.files.begin(), installed_pkg.files.end());
     }
 
     // 4. Auto-activate installed toolchain channels
@@ -800,6 +814,8 @@ int cmd_remove(const CliOptions& opts) {
 // Other Commands & Test Suite
 // ============================================================================
 
+int cmd_query(const CliOptions& opts);
+
 int cmd_test_suite() {
     sage::util::log_info("Running Sage Master Architecture & Subsystem Integration Test Suite...");
 
@@ -894,11 +910,13 @@ int cmd_test_suite() {
         return 1;
     }
 
+    auto malformed_archive_dir = temp_dir / "malformed-archives";
+    std::filesystem::create_directories(malformed_archive_dir);
     auto unrepresentable_root = temp_dir / "unrepresentable-path";
     std::filesystem::create_directories(unrepresentable_root);
     std::ofstream(unrepresentable_root / std::string(101, 'c')) << "must fail\n";
     auto unrepresentable_res = sage::archive::create_package(
-        manifest, unrepresentable_root, temp_dir / "unrepresentable-path.pkg.tar.zst");
+        manifest, unrepresentable_root, malformed_archive_dir / "unrepresentable-path.pkg.tar.zst");
     if (unrepresentable_res || unrepresentable_res.error().find("Path cannot be represented") == std::string::npos) {
         sage::util::log_error("Unrepresentable USTAR path was silently accepted");
         return 1;
@@ -913,7 +931,7 @@ int cmd_test_suite() {
         return 1;
     }
     auto long_link_res = sage::archive::create_package(
-        manifest, long_link_root, temp_dir / "long-link-target.pkg.tar.zst");
+        manifest, long_link_root, malformed_archive_dir / "long-link-target.pkg.tar.zst");
     if (long_link_res || long_link_res.error().find("Link target cannot be represented") == std::string::npos) {
         sage::util::log_error("Unrepresentable USTAR link target was silently accepted");
         return 1;
@@ -939,6 +957,128 @@ int cmd_test_suite() {
         || std::filesystem::exists(conflict_root / "usr/bin/dummy")
         || std::filesystem::exists(conflict_root / long_rel)) {
         sage::util::log_error("Archive path-type conflict was not reported safely");
+        return 1;
+    }
+
+    std::ifstream raw_tar_bytes_in(raw_tar_path, std::ios::binary);
+    std::vector<std::uint8_t> raw_tar_bytes(
+        std::istreambuf_iterator<char>(raw_tar_bytes_in), {});
+    auto find_tar_header = [&](const std::vector<std::uint8_t>& bytes, std::string_view wanted)
+        -> std::optional<size_t> {
+        size_t offset = 0;
+        while (offset + sizeof(sage::archive::TarHeader) <= bytes.size()) {
+            sage::archive::TarHeader header{};
+            std::memcpy(&header, bytes.data() + offset, sizeof(header));
+            bool all_zero = std::ranges::all_of(
+                std::span(bytes.data() + offset, sizeof(header)),
+                [](std::uint8_t byte) { return byte == 0; });
+            if (all_zero) break;
+
+            const auto bounded_string = [](const char* data, size_t size) {
+                return std::string(data, std::find(data, data + size, '\0'));
+            };
+            std::string name;
+            if (header.prefix[0] != '\0') {
+                name = bounded_string(header.prefix, sizeof(header.prefix)) + "/";
+            }
+            name += bounded_string(header.name, sizeof(header.name));
+            if (name == wanted) return offset;
+
+            auto size = sage::archive::parse_octal(header.size, sizeof(header.size));
+            offset += sizeof(header) + static_cast<size_t>(((size + 511) / 512) * 512);
+        }
+        return std::nullopt;
+    };
+    auto write_mutated_package = [&](const std::vector<std::uint8_t>& bytes, std::string_view stem)
+        -> std::optional<std::filesystem::path> {
+        auto tar_path = malformed_archive_dir / (std::string(stem) + ".tar");
+        auto archive_path = malformed_archive_dir / (std::string(stem) + ".pkg.tar.zst");
+        std::ofstream tar_out(tar_path, std::ios::binary);
+        tar_out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        tar_out.close();
+        auto command = std::format("zstd -q -f \"{}\" -o \"{}\"", tar_path.string(), archive_path.string());
+        if (std::system(command.c_str()) != 0) return std::nullopt;
+        return archive_path;
+    };
+    auto rename_tar_entry = [&](std::vector<std::uint8_t>& bytes,
+                                std::string_view old_name,
+                                std::string_view new_name) -> bool {
+        auto offset = find_tar_header(bytes, old_name);
+        if (!offset || new_name.size() > 100) return false;
+        sage::archive::TarHeader header{};
+        std::memcpy(&header, bytes.data() + *offset, sizeof(header));
+        std::memset(header.name, 0, sizeof(header.name));
+        std::memset(header.prefix, 0, sizeof(header.prefix));
+        std::memcpy(header.name, new_name.data(), new_name.size());
+        sage::archive::write_tar_checksum(
+            header.chksum, sage::archive::compute_tar_checksum(header));
+        std::memcpy(bytes.data() + *offset, &header, sizeof(header));
+        return true;
+    };
+
+    auto invalid_manifest_bytes = raw_tar_bytes;
+    auto manifest_header = find_tar_header(invalid_manifest_bytes, ".METADATA/manifest.toml");
+    if (!manifest_header) {
+        sage::util::log_error("Failed to locate manifest test fixture");
+        return 1;
+    }
+    invalid_manifest_bytes[*manifest_header + sizeof(sage::archive::TarHeader)] = '@';
+    auto invalid_manifest_pkg = write_mutated_package(invalid_manifest_bytes, "invalid-manifest");
+    auto invalid_manifest_root = temp_dir / "invalid-manifest-root";
+    auto invalid_manifest_result = invalid_manifest_pkg
+        ? sage::archive::extract_package(*invalid_manifest_pkg, invalid_manifest_root)
+        : std::expected<sage::archive::ExtractedPackage, std::string>(std::unexpected("fixture failed"));
+    if (invalid_manifest_result
+        || std::filesystem::exists(invalid_manifest_root / "usr/bin/dummy")
+        || std::filesystem::exists(invalid_manifest_root / long_rel)) {
+        sage::util::log_error("Invalid manifest was rejected only after writing package files");
+        return 1;
+    }
+
+    auto traversal_bytes = raw_tar_bytes;
+    if (!rename_tar_entry(
+            traversal_bytes, "data/usr/bin/dummy", "data/../../escaped-by-package")) {
+        sage::util::log_error("Failed to create path traversal test fixture");
+        return 1;
+    }
+    auto traversal_pkg = write_mutated_package(traversal_bytes, "path-traversal");
+    auto traversal_root = temp_dir / "path-traversal-root/inner";
+    auto escaped_path = temp_dir / "escaped-by-package";
+    auto traversal_result = traversal_pkg
+        ? sage::archive::extract_package(*traversal_pkg, traversal_root)
+        : std::expected<sage::archive::ExtractedPackage, std::string>(std::unexpected("fixture failed"));
+    if (traversal_result || std::filesystem::exists(escaped_path)) {
+        sage::util::log_error("Package data path escaped the target root");
+        return 1;
+    }
+
+    auto symlink_pivot_bytes = raw_tar_bytes;
+    if (!rename_tar_entry(
+            symlink_pivot_bytes, "data/usr/bin/dummy", "data/usr/bin/link/escape")) {
+        sage::util::log_error("Failed to create archive symlink traversal fixture");
+        return 1;
+    }
+    auto symlink_pivot_pkg = write_mutated_package(symlink_pivot_bytes, "symlink-pivot");
+    auto symlink_pivot_root = temp_dir / "symlink-pivot-root";
+    auto symlink_pivot_result = symlink_pivot_pkg
+        ? sage::archive::extract_package(*symlink_pivot_pkg, symlink_pivot_root)
+        : std::expected<sage::archive::ExtractedPackage, std::string>(std::unexpected("fixture failed"));
+    if (symlink_pivot_result
+        || std::filesystem::exists(symlink_pivot_root / long_rel)
+        || std::filesystem::exists(symlink_pivot_root / "usr/bin/link")) {
+        sage::util::log_error("Archive symlink parent traversal was not rejected before extraction");
+        return 1;
+    }
+
+    auto existing_symlink_root = temp_dir / "existing-symlink-root";
+    auto outside_symlink_target = temp_dir / "outside-symlink-target";
+    std::filesystem::create_directories(existing_symlink_root);
+    std::filesystem::create_directories(outside_symlink_target);
+    std::filesystem::create_directory_symlink(outside_symlink_target, existing_symlink_root / "usr");
+    auto outside_dummy = outside_symlink_target / "bin/dummy";
+    auto existing_symlink_result = sage::archive::extract_package(pkg_path, existing_symlink_root);
+    if (existing_symlink_result || std::filesystem::exists(outside_dummy)) {
+        sage::util::log_error("Existing target symlink escaped the target root");
         return 1;
     }
 
@@ -1231,8 +1371,13 @@ install = [
         return 1;
     }
     auto corrupt_db = sage::db::Database::open(corrupt_db_dir, true);
+    auto corrupt_package = corrupt_db
+        ? corrupt_db->get_package("broken")
+        : std::expected<std::optional<sage::package::PackageManifest>, std::string>(
+            std::unexpected("database open failed"));
     if (!corrupt_db
         || corrupt_db->list_installed_packages()
+        || corrupt_package
         || corrupt_db->get_file_owner("usr/bin/broken") != "broken:system") {
         sage::util::log_error("Corrupt manifest failure changed existing file ownership");
         return 1;
@@ -1332,6 +1477,68 @@ install = [
     int rem_ret = cmd_remove(rem_opts);
     if (rem_ret != 0 || std::filesystem::exists(isolated_target / "usr/bin/dummy")) {
         sage::util::log_error("End-to-end sage remove from target root failed");
+        return 1;
+    }
+
+    auto transaction_repo = temp_dir / "transaction-repo";
+    auto transaction_a_data = temp_dir / "transaction-a-data";
+    auto transaction_b_data = temp_dir / "transaction-b-data";
+    std::filesystem::create_directories(transaction_repo);
+    std::filesystem::create_directories(transaction_a_data / "usr/bin");
+    std::ofstream(transaction_a_data / "usr/bin/transaction-a") << "committed package\n";
+    std::filesystem::create_directories(transaction_b_data / "usr/share");
+    std::filesystem::create_symlink("elsewhere", transaction_b_data / "usr/share/blocked");
+
+    sage::package::PackageManifest transaction_a;
+    transaction_a.name = "transaction-a";
+    transaction_a.version = sage::package::Version::parse("1.0.0-1");
+    transaction_a.channel = "system";
+    sage::package::PackageManifest transaction_b;
+    transaction_b.name = "transaction-b";
+    transaction_b.version = sage::package::Version::parse("1.0.0-1");
+    transaction_b.channel = "system";
+    transaction_b.dependencies.push_back(sage::package::Dependency::parse("transaction-a"));
+
+    auto transaction_a_pkg = transaction_repo / "transaction-a-1.0.0-1-x86_64.pkg.tar.zst";
+    auto transaction_b_pkg = transaction_repo / "transaction-b-1.0.0-1-x86_64.pkg.tar.zst";
+    if (!sage::archive::create_package(transaction_a, transaction_a_data, transaction_a_pkg)
+        || !sage::archive::create_package(transaction_b, transaction_b_data, transaction_b_pkg)
+        || !sage::archive::generate_repo_index(transaction_repo, "core")) {
+        sage::util::log_error("Failed to create multi-package transaction fixture");
+        return 1;
+    }
+
+    auto transaction_target = temp_dir / "transaction-target";
+    std::filesystem::create_directories(transaction_target / "etc/sage");
+    std::filesystem::create_directories(transaction_target / "usr/share/blocked");
+    std::ofstream(transaction_target / "usr/share/blocked/keep") << "must survive\n";
+    std::ofstream transaction_channels(transaction_target / "etc/sage/channels.toml");
+    transaction_channels
+        << "schema_version = 1\n\n[[channels]]\nname = \"core\"\nurl = \"file://"
+        << transaction_repo.string()
+        << "\"\nscope = \"system\"\npriority = 100\nenabled = true\n";
+    transaction_channels.close();
+
+    CliOptions transaction_install;
+    transaction_install.target_root = transaction_target;
+    transaction_install.args = {"transaction-b"};
+    if (cmd_install(transaction_install) == 0) {
+        sage::util::log_error("Multi-package install accepted a later package path conflict");
+        return 1;
+    }
+    auto transaction_db = sage::db::Database::open(
+        transaction_target / "var/lib/sage/data.mdb", true);
+    if (!transaction_db) {
+        sage::util::log_error("Failed to inspect multi-package transaction database");
+        return 1;
+    }
+    auto transaction_a_record = transaction_db->get_package("transaction-a");
+    auto transaction_b_record = transaction_db->get_package("transaction-b");
+    if (!transaction_a_record || !*transaction_a_record
+        || !transaction_b_record || *transaction_b_record
+        || !std::filesystem::exists(transaction_target / "usr/bin/transaction-a")
+        || !std::filesystem::exists(transaction_target / "usr/share/blocked/keep")) {
+        sage::util::log_error("A later package failure desynchronized an earlier committed package");
         return 1;
     }
     sage::util::log_success("9. End-to-End `sage install` & `sage remove` to Target Root OK");
@@ -1527,13 +1734,19 @@ int cmd_query(const CliOptions& opts) {
         }
     } else if (sub == "info" && opts.args.size() >= 2) {
         std::string pkg_name = opts.args[1];
-        if (auto pkg = db.get_package(pkg_name)) {
-            std::println("Package:     {}", pkg->name);
-            std::println("Version:     {}", pkg->version.to_string());
-            std::println("Channel:     {}", pkg->channel);
-            std::println("License:     {}", pkg->license);
-            std::println("Description: {}", pkg->description);
-            std::println("Provides:    {}", sage::util::join(pkg->provides, ", "));
+        auto pkg_res = db.get_package(pkg_name);
+        if (!pkg_res) {
+            sage::util::log_error("Installed package database is inconsistent: {}", pkg_res.error());
+            return 1;
+        }
+        if (*pkg_res) {
+            const auto& pkg = **pkg_res;
+            std::println("Package:     {}", pkg.name);
+            std::println("Version:     {}", pkg.version.to_string());
+            std::println("Channel:     {}", pkg.channel);
+            std::println("License:     {}", pkg.license);
+            std::println("Description: {}", pkg.description);
+            std::println("Provides:    {}", sage::util::join(pkg.provides, ", "));
         } else {
             sage::util::log_error("Package '{}' is not installed", pkg_name);
             return 1;
