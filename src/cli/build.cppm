@@ -42,6 +42,63 @@ std::optional<std::string> probe_compiler(std::string_view cc) {
     return std::string("unknown");
 }
 
+// -- Build provenance by artifact evidence -----------------------------------
+//
+// Provenance is stamped only for packages that actually compiled something,
+// and the compiler named is the one the artifacts themselves identify --
+// never merely what CC was injected. A pure-data or script-only package
+// (os-release) stays silent, and a rust build is labeled rustc, not clang.
+struct Provenance {
+    bool compiled = false;          // any ELF / object-like file in the payload
+    std::set<std::string> producers;
+    std::string producer_version;   // of the sole producer, when unambiguous
+};
+
+// First dotted numeric token at/after `pos`: "clang version 22.1.8 (...)",
+// "GCC: (GNU) 15.3.0" and "rustc version 1.90.0" all yield their version.
+std::string version_after(std::string_view text, size_t pos) {
+    for (size_t i = pos; i < text.size(); ++i) {
+        if (!std::isdigit(static_cast<unsigned char>(text[i]))) continue;
+        size_t j = i;
+        while (j < text.size() && (std::isdigit(static_cast<unsigned char>(text[j])) || text[j] == '.')) ++j;
+        if (j > i + 1) return std::string(text.substr(i, j - i));  // skip lone digits
+        i = j;
+    }
+    return {};
+}
+
+// Producer fingerprints live in .comment-style strings, which sit in the
+// leading or trailing slabs of real artifacts; capping the read keeps huge
+// libraries (libLLVM) cheap to inspect without parsing section tables.
+void fingerprint_producer(Provenance& prov, const std::filesystem::path& path) {
+    static constexpr std::pair<std::string_view, std::string_view> SIGS[] = {
+        {"clang version", "clang"}, {"GCC: (", "gcc"}, {"rustc version", "rustc"},
+    };
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return;
+    constexpr std::streamoff SLAB = 1 << 20;
+    in.seekg(0, std::ios::end);
+    std::streamoff size = in.tellg();
+    std::streamoff head = std::min(size, SLAB);
+    std::string window(head, '\0');
+    in.seekg(0);
+    in.read(window.data(), head);
+    if (size > SLAB) {  // tail slab too: markers often live near the end
+        std::streamoff tail = std::min(size - SLAB, SLAB);
+        window.resize(static_cast<size_t>(head + tail));
+        in.seekg(-tail, std::ios::end);
+        in.read(window.data() + head, tail);
+    }
+    for (const auto& [sig, name] : SIGS) {
+        if (window.find(sig) == std::string::npos) continue;
+        prov.producers.insert(std::string(name));
+        if (prov.producers.size() == 1 && prov.producer_version.empty()) {
+            size_t at = window.find(sig);
+            prov.producer_version = version_after(window, at + sig.size());
+        }
+    }
+}
+
 export int cmd_build(const CliOptions& opts) {
     if (opts.args.empty()) {
         std::println("Usage: sage build <RECIPE_DIR>");
@@ -101,8 +158,8 @@ export int cmd_build(const CliOptions& opts) {
 
     // Candidate toolchains in priority order: the configured pair first, the
     // fallback pair second. Each is probed once up front -- `<cc> --version`
-    // doubles as the existence check and yields the version that gets stamped
-    // into the package afterwards.
+    // doubles as the existence check; what ends up stamped is derived from
+    // the built artifacts themselves, not from this probe.
     struct Toolchain { std::string cc, cxx, version; };
     std::vector<Toolchain> candidates;
     for (const auto& [cc_name, cxx_name] : {std::pair{bcfg.cc, bcfg.cxx},
@@ -241,15 +298,10 @@ export int cmd_build(const CliOptions& opts) {
     manifest.capability_hooks = r.capability_hooks;
     manifest.triggers = r.triggers;
 
-    // Stamp build provenance: the compiler that actually succeeded (after any
-    // fallback) and the flags the recipe shell really saw.
-    if (!used.cc.empty()) {
-        manifest.build_compiler = used.cc;
-        manifest.build_compiler_version = used.version;
-    }
-    if (!eff_cflags.empty()) manifest.build_cflags = eff_cflags;
-    if (!eff_cxxflags.empty()) manifest.build_cxxflags = eff_cxxflags;
-    if (!bcfg.ldflags.empty()) manifest.build_ldflags = bcfg.ldflags;
+    // Stamp build provenance from what the payload proves (filled below):
+    // nothing compiled -> nothing claimed; compiled -> the producers the
+    // artifacts identify, plus the flags the recipe shell really saw.
+    Provenance provenance;
 
     // Every soname this package satisfies by itself, and every soname it still
     // needs from elsewhere -- remembering which file asked, so a failure can
@@ -281,6 +333,20 @@ export int cmd_build(const CliOptions& opts) {
                 self_sonames.insert(base);
             }
 
+            // Compiled-artifact evidence for provenance: ELF magic or an
+            // object-archive suffix. Each candidate is fingerprinted for its
+            // producer string while we are already walking every file.
+            bool elf_magic = false;
+            {
+                std::ifstream in(entry.path(), std::ios::binary);
+                char magic[4] = {};
+                if (in.read(magic, 4)) elf_magic = std::string_view(magic, 4) == "\x7f" "ELF";
+            }
+            if (elf_magic || base.ends_with(".o") || base.ends_with(".a") || base.find(".so") != std::string::npos) {
+                provenance.compiled = true;
+                fingerprint_producer(provenance, entry.path());
+            }
+
             auto elf_res = sage::util::scan_elf(entry.path());
             if (!elf_res) continue;
             if (!elf_res->soname.empty()) {
@@ -295,6 +361,21 @@ export int cmd_build(const CliOptions& opts) {
 
     for (const auto& soname : self_sonames) {
         manifest.provides.push_back("so:" + soname);
+    }
+
+    // The provenance verdict, now that every payload file has been seen.
+    if (provenance.compiled) {
+        if (!provenance.producers.empty()) {
+            std::string joined;
+            for (const auto& p : provenance.producers) {
+                joined += (joined.empty() ? "" : ", ") + p;
+            }
+            manifest.build_compiler = std::move(joined);
+            manifest.build_compiler_version = provenance.producer_version;
+        }
+        if (!eff_cflags.empty()) manifest.build_cflags = eff_cflags;
+        if (!eff_cxxflags.empty()) manifest.build_cxxflags = eff_cxxflags;
+        if (!bcfg.ldflags.empty()) manifest.build_ldflags = bcfg.ldflags;
     }
 
     // A package does not depend on itself: a soname it installs is not an

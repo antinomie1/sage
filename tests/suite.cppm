@@ -2252,6 +2252,8 @@ license = "MIT"
 channel = "system"
 install = [
     'mkdir -p "$DESTDIR/usr/share"',
+    'printf "int sage_canary;\n" > canary.c',
+    '$CC -c canary.c -o "$DESTDIR/usr/share/canary.o"',
     'printf "%s" "$CFLAGS" > "$DESTDIR/usr/share/cflags.txt"',
 ]
 )")) {
@@ -2260,10 +2262,13 @@ install = [
         }
         auto canary = build_with_root(canary_dir, canary_root, temp_dir / "bcfg-canary-x",
                                       "flagcanary-1.0.0-1-x86_64.pkg.tar.zst");
-        if (!canary || canary->build_compiler != "cc" || canary->build_compiler_version.empty()
+        // The compiled object carries its producer's fingerprint, so the
+        // stamp names the real compiler family rather than the injected CC.
+        if (!canary || canary->build_compiler.empty() || canary->build_compiler_version.empty()
             || canary->build_cflags != "-DGLOBAL_CFLAG=1"
             || canary->build_cxxflags != "-DGLOBAL_CFLAG=1"  // cxxflags mirror cflags
-            || read_text(temp_dir / "bcfg-canary-x/usr/share/cflags.txt") != "-DGLOBAL_CFLAG=1") {
+            || read_text(temp_dir / "bcfg-canary-x/usr/share/cflags.txt") != "-DGLOBAL_CFLAG=1"
+            || read_text(temp_dir / "bcfg-canary-x/usr/share/canary.o").empty()) {
             sage::util::log_error("Global build-config injection or provenance stamping failed");
             return 1;
         }
@@ -2289,6 +2294,8 @@ channel = "system"
 cflags = "-DLOCAL_CFLAG=2"
 install = [
     'mkdir -p "$DESTDIR/usr/share"',
+    'printf "int sage_canary;\n" > canary.c',
+    '$CC -c canary.c -o "$DESTDIR/usr/share/canary.o"',
     'printf "%s" "$CFLAGS" > "$DESTDIR/usr/share/cflags.txt"',
 ]
 )")) {
@@ -2297,7 +2304,7 @@ install = [
         }
         auto overridden = build_with_root(override_dir, override_root, temp_dir / "bcfg-override-x",
                                           "flagoverride-1.0.0-1-x86_64.pkg.tar.zst");
-        if (!overridden || overridden->build_compiler != "cc"
+        if (!overridden || overridden->build_compiler.empty()
             || overridden->build_cflags != "-DLOCAL_CFLAG=2"
             || overridden->build_cxxflags != "-DLOCAL_CFLAG=2"  // mirrors the recipe cflags
             || read_text(temp_dir / "bcfg-override-x/usr/share/cflags.txt") != "-DLOCAL_CFLAG=2") {
@@ -2323,6 +2330,8 @@ license = "MIT"
 channel = "system"
 install = [
     'mkdir -p "$DESTDIR/usr/share"',
+    'printf "int sage_canary;\n" > canary.c',
+    '$CC -c canary.c -o "$DESTDIR/usr/share/canary.o"',
     'printf "%s" "$CFLAGS" > "$DESTDIR/usr/share/cflags.txt"',
 ]
 )")) {
@@ -2331,10 +2340,38 @@ install = [
         }
         auto fallback = build_with_root(fallback_dir, fallback_root, temp_dir / "bcfg-fallback-x",
                                         "flagfallback-1.0.0-1-x86_64.pkg.tar.zst");
-        if (!fallback || fallback->build_compiler != "cc"
+        if (!fallback || fallback->build_compiler.empty()
             || fallback->build_cflags != "-DFALLBACK_CFLAG=3"
             || read_text(temp_dir / "bcfg-fallback-x/usr/share/cflags.txt") != "-DFALLBACK_CFLAG=3") {
             sage::util::log_error("Compiler fallback did not degrade to the configured fallback pair");
+            return 1;
+        }
+
+        // (d) A package that never compiled anything claims no provenance:
+        // os-release-style recipes stay silent about compilers and flags.
+        auto plain_dir = temp_dir / "bcfg-plain";
+        if (!write_canary_recipe(plain_dir, R"(schema_version = 1
+[package]
+name = "notcanary"
+version = "1.0.0"
+release = "1"
+description = "build-config silence canary"
+license = "MIT"
+channel = "system"
+install = [
+    'mkdir -p "$DESTDIR/usr/share"',
+    'printf "%s" "$CFLAGS" > "$DESTDIR/usr/share/cflags.txt"',
+]
+)")) {
+            sage::util::log_error("Failed to create provenance-silence fixture");
+            return 1;
+        }
+        auto plain = build_with_root(plain_dir, canary_root, temp_dir / "bcfg-plain-x",
+                                     "notcanary-1.0.0-1-x86_64.pkg.tar.zst");
+        if (!plain || !plain->build_compiler.empty() || !plain->build_compiler_version.empty()
+            || !plain->build_cflags.empty() || !plain->build_cxxflags.empty()
+            || !plain->build_ldflags.empty()) {
+            sage::util::log_error("A compiler-free package must not carry build provenance");
             return 1;
         }
 
