@@ -50,7 +50,6 @@ Commands:
   build <RECIPE_DIR>       Build package from recipe.toml (fetch source, check sha256, build, scan ELF)
   verify [PKG...]          Check installed files against the recorded files.idx hashes
   status [--full]          Show declared providers, channels, and database state
-  test-suite               Run internal engine self-test suite
 
 Global Options:
   --root, --sysroot <DIR>  Operate on target root directory (default: /)

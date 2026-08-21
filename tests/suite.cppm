@@ -1,18 +1,20 @@
-export module sage.cli.test;
+export module sage.tests;
 
-// Master architecture & subsystem integration suite (`sage test-suite`).
+// Master architecture & subsystem integration suite (`sage-tests` binary).
 // Drives the public engine surface end to end; the raw LMDB probes verify the
 // on-disk key layout itself, which is exactly what a regression must pin.
 import std;
 import sage;
 
-import sage.cli.build;
 import sage.cli;
+import sage.cli.build;
 import sage.cli.pkg;
 
-namespace sage::cli {
+namespace sage::tests {
 
-export int cmd_test_suite() {
+using namespace sage::cli;
+
+export int run_all() {
     sage::util::log_info("Running Sage Master Architecture & Subsystem Integration Test Suite...");
 
     // 1. Semantic Versioning Test
@@ -142,7 +144,7 @@ export int cmd_test_suite() {
         sage::util::log_error("Failed to inspect generated USTAR header");
         return 1;
     }
-    for (size_t i = 0; i < 6; ++i) {
+    for (std::size_t i = 0; i < 6; ++i) {
         checksum_digits = checksum_digits && first_header.chksum[i] >= '0' && first_header.chksum[i] <= '7';
     }
     if (std::memcmp(first_header.magic, "ustar\0", 6) != 0 ||
@@ -209,8 +211,8 @@ export int cmd_test_suite() {
     std::vector<std::uint8_t> raw_tar_bytes(
         std::istreambuf_iterator<char>(raw_tar_bytes_in), {});
     auto find_tar_header = [&](const std::vector<std::uint8_t>& bytes, std::string_view wanted)
-        -> std::optional<size_t> {
-        size_t offset = 0;
+        -> std::optional<std::size_t> {
+        std::size_t offset = 0;
         while (offset + sizeof(sage::archive::TarHeader) <= bytes.size()) {
             sage::archive::TarHeader header{};
             std::memcpy(&header, bytes.data() + offset, sizeof(header));
@@ -219,7 +221,7 @@ export int cmd_test_suite() {
                 [](std::uint8_t byte) { return byte == 0; });
             if (all_zero) break;
 
-            const auto bounded_string = [](const char* data, size_t size) {
+            const auto bounded_string = [](const char* data, std::size_t size) {
                 return std::string(data, std::find(data, data + size, '\0'));
             };
             std::string name;
@@ -230,7 +232,7 @@ export int cmd_test_suite() {
             if (name == wanted) return offset;
 
             auto size = sage::archive::parse_octal(header.size, sizeof(header.size));
-            offset += sizeof(header) + static_cast<size_t>(((size + 511) / 512) * 512);
+            offset += sizeof(header) + static_cast<std::size_t>(((size + 511) / 512) * 512);
         }
         return std::nullopt;
     };
@@ -530,9 +532,9 @@ export int cmd_test_suite() {
     auto write_test_elf = [](const std::filesystem::path& path,
                              std::string_view soname,
                              std::string_view needed) {
-        constexpr size_t phoff = 64;
-        constexpr size_t dynoff = 176;
-        constexpr size_t stroff = 256;
+        constexpr std::size_t phoff = 64;
+        constexpr std::size_t dynoff = 176;
+        constexpr std::size_t stroff = 256;
         constexpr std::uint64_t base = 0x400000;
 
         std::string strings(1, '\0');
@@ -544,8 +546,8 @@ export int cmd_test_suite() {
         strings.push_back('\0');
 
         std::vector<std::uint8_t> elf(stroff + strings.size());
-        auto put = [&](size_t offset, std::uint64_t value, size_t width) {
-            for (size_t i = 0; i < width; ++i) {
+        auto put = [&](std::size_t offset, std::uint64_t value, std::size_t width) {
+            for (std::size_t i = 0; i < width; ++i) {
                 elf[offset + i] = static_cast<std::uint8_t>(value >> (8 * i));
             }
         };
@@ -582,7 +584,7 @@ export int cmd_test_suite() {
         put(160, 80, 8);
         put(168, 8, 8);
 
-        auto put_dynamic = [&](size_t index, std::uint64_t tag, std::uint64_t value) {
+        auto put_dynamic = [&](std::size_t index, std::uint64_t tag, std::uint64_t value) {
             put(dynoff + index * 16, tag, 8);
             put(dynoff + index * 16 + 8, value, 8);
         };
@@ -1815,4 +1817,4 @@ install = [
     sage::util::log_success("🎉 All Sage Master Architecture & Subsystem Integration Tests Passed Successfully!");
     return 0;
 }
-} // namespace sage::cli
+} // namespace sage::tests

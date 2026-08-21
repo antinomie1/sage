@@ -4,7 +4,6 @@ import sage.cli;
 import sage.cli.build;
 import sage.cli.pkg;
 import sage.cli.query;
-import sage.cli.test;
 import sage.cli.toolchain;
 
 // Entry point: global option parsing lives in sage.cli; this file only maps
@@ -21,9 +20,6 @@ int main(int argc, char* argv[]) {
 
     using namespace sage::cli;
 
-    if (opts.command == "test-suite" || opts.command == "test") {
-        return cmd_test_suite();
-    }
     if (opts.command == "install") {
         return cmd_install(opts);
     }

@@ -39,6 +39,7 @@ graph TD
     subgraph Layer5["Layer 5: Primary Aggregator & CLI (src/cli/)"]
         ROOT["sage<br/>(Primary module: export import all sage.*)"]
         CLI["main.cpp + sage.cli.* modules<br/>(CliOptions/parsing + per-group command modules)"]
+        TESTS["sage.tests<br/>(tests/ -- standalone integration suite binary)"]
     end
 
     LMDB --> DB
@@ -62,6 +63,7 @@ graph TD
     ARCH --> REBUILD
     SOLVER --> REBUILD
     REBUILD --> ROOT
+    TESTS --> CLI
     ROOT --> CLI
 ```
 

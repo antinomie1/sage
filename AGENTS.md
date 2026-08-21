@@ -90,7 +90,10 @@ sage/
 │       ├── build.cppm            # sage.cli.build -- build / repo index
 │       ├── query.cppm            # sage.cli.query -- query / list / count / verify / status
 │       ├── toolchain.cppm        # sage.cli.toolchain -- channel / toolchains / shell / service
-│       └── test.cppm             # sage.cli.test -- integration test suite
+│       └── toolchain.cppm        # sage.cli.toolchain -- channel / toolchains / shell / service
+└── tests/                       # Standalone integration suite (sage-tests binary)
+    ├── suite.cppm               # sage.tests -- 11-scenario end-to-end regression
+    └── main.cpp                 # Suite entry point
 ```
 
 **Layout rules.** A directory corresponds to a dependency layer of Rule 5; a file
@@ -116,8 +119,8 @@ xmake
 # Run the compiled binary
 xmake run sage --help
 
-# Run the integrated architecture and regression suite
-xmake run sage test-suite
+# Build & run the integrated architecture and regression suite
+xmake build sage-tests && xmake run sage-tests
 ```
 
 ---
