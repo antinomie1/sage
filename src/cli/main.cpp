@@ -2012,6 +2012,31 @@ install = [
         return 1;
     }
 
+    auto embedded_epoch_manifest = sage::package::PackageManifest::parse_toml(R"(
+schema_version = 1
+[package]
+name = "embedded-epoch"
+version = "1:2.0-3"
+)");
+    auto embedded_epoch_index = sage::channel::ChannelIndex::parse_toml(R"(
+schema_version = 1
+[channel]
+name = "core"
+[[packages]]
+name = "embedded-epoch"
+version = "1:2.0-3"
+)");
+    if (!embedded_epoch_manifest
+        || embedded_epoch_manifest->version.epoch != 1
+        || embedded_epoch_manifest->version.rel != "3"
+        || !embedded_epoch_index
+        || embedded_epoch_index->available_packages.size() != 1
+        || embedded_epoch_index->available_packages.front().version.epoch != 1
+        || embedded_epoch_index->available_packages.front().version.rel != "3") {
+        sage::util::log_error("Embedded version epoch/release was not preserved");
+        return 1;
+    }
+
     sage::package::FileEntry owned_file;
     owned_file.path = "usr/bin/database-owned";
     {

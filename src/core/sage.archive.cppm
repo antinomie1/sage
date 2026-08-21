@@ -5,6 +5,7 @@ module;
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <cerrno>
 #include <cstring>
 #include <zstd.h>
@@ -388,6 +389,124 @@ private:
     }
 
     int fd_{-1};
+};
+
+class PrivateArchiveSnapshot {
+public:
+    PrivateArchiveSnapshot(const PrivateArchiveSnapshot&) = delete;
+    PrivateArchiveSnapshot& operator=(const PrivateArchiveSnapshot&) = delete;
+
+    PrivateArchiveSnapshot(PrivateArchiveSnapshot&& other) noexcept
+        : directory_(std::exchange(other.directory_, {})),
+          archive_(std::exchange(other.archive_, {})) {}
+
+    PrivateArchiveSnapshot& operator=(PrivateArchiveSnapshot&&) = delete;
+
+    ~PrivateArchiveSnapshot() noexcept {
+        std::error_code ec;
+        std::filesystem::remove(archive_, ec);
+        ec.clear();
+        std::filesystem::remove(directory_, ec);
+    }
+
+    [[nodiscard]] const std::filesystem::path& path() const noexcept {
+        return archive_;
+    }
+
+    static std::expected<PrivateArchiveSnapshot, std::string> create(
+        const std::filesystem::path& source_path)
+    {
+        int source_flags = O_RDONLY;
+#ifdef O_CLOEXEC
+        source_flags |= O_CLOEXEC;
+#endif
+        UniqueFd source(::open(source_path.c_str(), source_flags));
+        if (source.get() < 0) {
+            return std::unexpected(
+                "Cannot open package archive: " + source_path.string());
+        }
+
+        struct stat source_status {};
+        if (::fstat(source.get(), &source_status) != 0) {
+            return std::unexpected(
+                "Cannot stat package archive: " + std::string(std::strerror(errno)));
+        }
+        if (!S_ISREG(source_status.st_mode) || source_status.st_size < 0) {
+            return std::unexpected("Package archive is not a regular file");
+        }
+
+        std::string directory_template = "/tmp/sage-archive-XXXXXX";
+        std::vector<char> mutable_template(
+            directory_template.begin(), directory_template.end());
+        mutable_template.push_back('\0');
+        char* directory = ::mkdtemp(mutable_template.data());
+        if (!directory) {
+            return std::unexpected(
+                "Cannot create private archive directory: "
+                + std::string(std::strerror(errno)));
+        }
+
+        PrivateArchiveSnapshot snapshot{std::filesystem::path(directory)};
+        int destination_flags = O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW;
+#ifdef O_CLOEXEC
+        destination_flags |= O_CLOEXEC;
+#endif
+        UniqueFd destination(::open(
+            snapshot.archive_.c_str(), destination_flags, 0600));
+        if (destination.get() < 0) {
+            return std::unexpected(
+                "Cannot create private archive snapshot: "
+                + std::string(std::strerror(errno)));
+        }
+
+        std::array<uint8_t, 64 * 1024> buffer {};
+        uint64_t remaining = static_cast<uint64_t>(source_status.st_size);
+        while (remaining > 0) {
+            const auto requested = static_cast<size_t>(
+                std::min<uint64_t>(remaining, buffer.size()));
+            ssize_t count = ::read(source.get(), buffer.data(), requested);
+            if (count < 0 && errno == EINTR) continue;
+            if (count < 0) {
+                return std::unexpected(
+                    "Cannot read package archive: "
+                    + std::string(std::strerror(errno)));
+            }
+            if (count == 0) {
+                return std::unexpected(
+                    "Package archive changed while creating a private snapshot");
+            }
+
+            size_t written = 0;
+            while (written < static_cast<size_t>(count)) {
+                ssize_t result = ::write(
+                    destination.get(), buffer.data() + written,
+                    static_cast<size_t>(count) - written);
+                if (result < 0 && errno == EINTR) continue;
+                if (result <= 0) {
+                    return std::unexpected(
+                        "Cannot write private archive snapshot: "
+                        + std::string(std::strerror(errno)));
+                }
+                written += static_cast<size_t>(result);
+            }
+            remaining -= static_cast<uint64_t>(count);
+        }
+
+        if (::fsync(destination.get()) != 0) {
+            return std::unexpected(
+                "Cannot sync private archive snapshot: "
+                + std::string(std::strerror(errno)));
+        }
+        return snapshot;
+    }
+
+private:
+    explicit PrivateArchiveSnapshot(std::filesystem::path directory)
+        : directory_(std::move(directory)),
+          archive_(directory_ / "archive.pkg.tar.zst") {}
+
+    std::filesystem::path directory_;
+    std::filesystem::path archive_;
 };
 
 struct AnchoredPath {
@@ -955,9 +1074,14 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
     const package::PackageManifest* expected_manifest = nullptr,
     const InspectedPackage* expected_inspection = nullptr)
 {
-    std::ifstream archive_file(archive_path, std::ios::binary);
+    auto snapshot_res = PrivateArchiveSnapshot::create(archive_path);
+    if (!snapshot_res) return std::unexpected(snapshot_res.error());
+    auto snapshot = std::move(*snapshot_res);
+
+    std::ifstream archive_file(snapshot.path(), std::ios::binary);
     if (!archive_file.is_open()) {
-        return std::unexpected("Cannot open package archive: " + archive_path.string());
+        return std::unexpected(
+            "Cannot open private archive snapshot for: " + archive_path.string());
     }
     const auto archive_name = archive_path.string();
     auto inspect_res = inspect_package_stream(archive_file, archive_name, &target_root);

@@ -161,14 +161,17 @@ struct ChannelIndex {
                     m.name = (*ptab)["name"].value_or("");
                     std::string ver_str = std::string((*ptab)["version"].value_or(""));
                     m.version = package::Version::parse(ver_str);
-                    m.version.rel = std::string((*ptab)["release"].value_or("1"));
-                    auto epoch = (*ptab)["epoch"].value_or(0LL);
-                    if (epoch < 0
-                        || static_cast<unsigned long long>(epoch)
-                            > std::numeric_limits<uint32_t>::max()) {
-                        return std::unexpected("Package epoch is outside the uint32 range");
+                    if (auto release = (*ptab)["release"].value<std::string_view>()) {
+                        m.version.rel = std::string(*release);
                     }
-                    m.version.epoch = static_cast<uint32_t>(epoch);
+                    if (auto epoch = (*ptab)["epoch"].value<long long>()) {
+                        if (*epoch < 0
+                            || static_cast<unsigned long long>(*epoch)
+                                > std::numeric_limits<uint32_t>::max()) {
+                            return std::unexpected("Package epoch is outside the uint32 range");
+                        }
+                        m.version.epoch = static_cast<uint32_t>(*epoch);
+                    }
                     m.description = (*ptab)["description"].value_or("");
                     m.license = (*ptab)["license"].value_or("");
                     m.channel = (*ptab)["channel"].value_or("system");
