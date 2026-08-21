@@ -138,6 +138,7 @@ struct ExtractedPackage {
 struct InspectedPackage {
     package::PackageManifest manifest;
     std::optional<service::ServiceSpec> service;
+    std::vector<package::FileEntry> data_files;
 };
 
 struct ArchiveEntryView {
@@ -443,6 +444,17 @@ inline std::expected<InspectedPackage, std::string> inspect_package_impl(
     }
 
     for (const auto& entry : data_entries) {
+        package::FileEntry file;
+        file.path = entry.path;
+        if (entry.typeflag == '5') {
+            file.type = package::FileType::Directory;
+        } else if (entry.typeflag == '2') {
+            file.type = package::FileType::Symlink;
+        }
+        result.data_files.push_back(std::move(file));
+    }
+
+    for (const auto& entry : data_entries) {
         for (auto parent = std::filesystem::path(entry.path).parent_path();
              !parent.empty() && parent != ".";
              parent = parent.parent_path()) {
@@ -492,10 +504,21 @@ inline std::expected<InspectedPackage, std::string> inspect_package(
 
 inline std::expected<ExtractedPackage, std::string> extract_package(
     const std::filesystem::path& archive_path,
-    const std::filesystem::path& target_root)
+    const std::filesystem::path& target_root,
+    const package::PackageManifest* expected_manifest = nullptr)
 {
     auto inspect_res = inspect_package(archive_path, target_root);
     if (!inspect_res) return std::unexpected(inspect_res.error());
+    if (expected_manifest
+        && package::package_identity(inspect_res->manifest)
+            != package::package_identity(*expected_manifest)) {
+        return std::unexpected(std::format(
+            "Package archive identity mismatch: selected {} {} [{}; {}], archive contains {} {} [{}; {}]",
+            expected_manifest->name, expected_manifest->version.to_string(),
+            expected_manifest->arch, expected_manifest->channel,
+            inspect_res->manifest.name, inspect_res->manifest.version.to_string(),
+            inspect_res->manifest.arch, inspect_res->manifest.channel));
+    }
 
     ExtractedPackage result;
     result.manifest = std::move(inspect_res->manifest);

@@ -179,6 +179,25 @@ public:
         return std::nullopt;
     }
 
+    [[nodiscard]] std::expected<std::optional<std::string_view>, std::string> get_checked(
+        MdbTxn& txn,
+        std::string_view key) const noexcept
+    {
+        if (!valid_ || !txn.handle()) {
+            return std::unexpected("Invalid DBI or transaction");
+        }
+        MDB_val k = to_val(key);
+        MDB_val v{};
+        int rc = mdb_get(txn.handle(), dbi_, &k, &v);
+        if (rc == 0) {
+            return std::optional<std::string_view>{from_val(v)};
+        }
+        if (rc == MDB_NOTFOUND) {
+            return std::optional<std::string_view>{};
+        }
+        return std::unexpected(mdb_strerror(rc));
+    }
+
     std::expected<void, std::string> put(
         MdbTxn& txn, 
         std::string_view key, 

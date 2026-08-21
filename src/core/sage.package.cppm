@@ -408,6 +408,24 @@ struct PackageManifest {
     }
 };
 
+struct PackageIdentity {
+    std::string name;
+    Version version;
+    std::string arch;
+    std::string channel;
+
+    auto operator<=>(const PackageIdentity&) const = default;
+};
+
+inline PackageIdentity package_identity(const PackageManifest& manifest) {
+    return PackageIdentity{
+        .name = manifest.name,
+        .version = manifest.version,
+        .arch = manifest.arch,
+        .channel = manifest.channel,
+    };
+}
+
 // ============================================================================
 // Recipe Model for Package Building (`recipe.toml`)
 // ============================================================================
