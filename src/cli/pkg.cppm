@@ -32,7 +32,12 @@ load_install_snapshot(
     return current;
 }
 
-export int cmd_install(const CliOptions& opts) {
+// Self-tests may execute trigger commands on the host while package payloads
+// remain isolated under their temporary target root.
+export int cmd_install(
+    const CliOptions& opts,
+    std::optional<std::filesystem::path> trigger_sysroot = std::nullopt)
+{
     if (opts.args.empty()) {
         std::println("Usage: sage install <PKG...>");
         return 1;
@@ -273,7 +278,10 @@ export int cmd_install(const CliOptions& opts) {
         ch.enabled = ch_cfg.enabled;
         active_channels.push_back(std::move(ch));
     }
-    std::vector<sage::package::FileEntry> all_installed_files;
+    std::vector<sage::package::FileEntry> all_touched_files;
+    std::vector<sage::package::PackageManifest> committed_packages;
+    bool any_package_committed = false;
+    bool aggregate_done = false;
 
     auto run_package_postprocessing = [&](const sage::package::PackageManifest& installed_pkg) {
         auto spec = sage::channel::SubChannelSpec::parse(installed_pkg.channel);
@@ -290,21 +298,36 @@ export int cmd_install(const CliOptions& opts) {
 
         (void)sage::channel::ProfileManager::regenerate_fhs_profile(
             opts.target_root, active_channels);
+    };
+
+    auto run_aggregate_triggers = [&]() -> bool {
+        sage::rebuild::TriggerContext trig_ctx;
+        trig_ctx.sysroot = trigger_sysroot.value_or(opts.target_root);
+        trig_ctx.touched_files = all_touched_files;
+        trig_ctx.transaction_packages = committed_packages;
         auto current_packages = db.list_installed_packages();
         if (!current_packages) {
-            sage::util::log_warn(
-                "Skipping post-install triggers for '{}': {}",
-                installed_pkg.name, current_packages.error());
-            return;
+            sage::util::log_error(
+                "Cannot run aggregate triggers: {}", current_packages.error());
+            return false;
         }
-        sage::rebuild::TriggerContext trigger_context;
-        trigger_context.sysroot = opts.target_root;
-        trigger_context.touched_files = installed_pkg.files;
-        trigger_context.transaction_packages = {installed_pkg};
-        trigger_context.installed_packages = std::move(*current_packages);
-        trigger_context.providers = cfg.providers;
-        sage::rebuild::TriggerEngine::run(trigger_context);
+        trig_ctx.installed_packages = std::move(*current_packages);
+        trig_ctx.providers = cfg.providers;
+        trig_ctx.dry_run = opts.dry_run;
+        sage::rebuild::TriggerEngine::run(trig_ctx);
+        return true;
     };
+
+    struct TriggerGuard {
+        std::function<void()> action;
+        ~TriggerGuard() {
+            if (action) action();
+        }
+    } trigger_guard{[&] {
+        if (any_package_committed && !aggregate_done) {
+            (void)run_aggregate_triggers();
+        }
+    }};
 
     // 3. Streaming Unpack & LMDB State Registration
     for (const auto& pkg : unique_to_install) {
@@ -390,13 +413,13 @@ export int cmd_install(const CliOptions& opts) {
         // very trigger that has to run it.
         installed_pkg.capability_hooks = ext_res->manifest.capability_hooks;
         installed_pkg.triggers = ext_res->manifest.triggers;
+        auto package_touched_files = installed_pkg.files;
 
-        // Upgrade cleanup: remove physical files owned by a previously installed
-        // version of this package that are not part of the new version, so file
+        // Reinstall/upgrade cleanup: remove physical files owned by a previously
+        // installed package that are not part of the new payload, so file
         // ownership can transition to other packages (e.g. split -dev/-libs
         // children claim headers/libs the old monolithic version used to own).
-        if (*previous_package
-            && sage::package::package_identity(**previous_package) != identity) {
+        if (*previous_package) {
             std::unordered_set<std::string> new_paths;
             for (const auto& f : installed_pkg.files) {
                 new_paths.insert(sage::util::clean_rel_path(f.path));
@@ -424,7 +447,8 @@ export int cmd_install(const CliOptions& opts) {
                 }
                 sage::package::FileEntry fe;
                 fe.path = old_path;
-                stale.push_back(std::move(fe));
+                stale.push_back(fe);
+                package_touched_files.push_back(std::move(fe));
             }
             if (!stale.empty()) {
                 auto unregister_res = db.unregister_files(*package_txn, stale, old_owner);
@@ -434,7 +458,7 @@ export int cmd_install(const CliOptions& opts) {
                         pkg.name, unregister_res.error());
                     return 1;
                 }
-                sage::util::log_info("  ~ removed {} stale file(s) from previous {} {}", 
+                sage::util::log_info("  ~ removed {} stale file(s) from previous {} {}",
                     stale.size(), pkg.name, (**previous_package).version.to_string());
             }
         }
@@ -468,34 +492,28 @@ export int cmd_install(const CliOptions& opts) {
             return 1;
         }
 
-        // A later package may fail, so complete all post-processing for this
-        // committed package before advancing to the next archive.
+        committed_packages.push_back(installed_pkg);
+        all_touched_files.insert(
+            all_touched_files.end(),
+            package_touched_files.begin(), package_touched_files.end());
+        any_package_committed = true;
+
+        // Toolchain activation and profile generation are needed immediately:
+        // a later package may depend on the aliases created for this commit.
         run_package_postprocessing(installed_pkg);
-        all_installed_files.insert(
-            all_installed_files.end(), installed_pkg.files.begin(), installed_pkg.files.end());
     }
 
-    // Re-run aggregate triggers after the complete install set. A trigger tool
-    // may itself have arrived after an earlier package first requested it.
-    // Runs AFTER toolchain activation so freshly written
+    // Run triggers once after the complete install set. This happens after
+    // toolchain activation so freshly written
     // /etc/ld.so.conf.d/sage-*.conf entries are picked up by ldconfig, and
     // after the DB commit so a capability installed in this very transaction
     // (mkinitcpio arriving alongside the kernel that needs it) is already
     // visible when the initramfs trigger looks for its provider.
-    sage::rebuild::TriggerContext trig_ctx;
-    trig_ctx.sysroot = opts.target_root;
-    trig_ctx.touched_files = all_installed_files;
-    trig_ctx.transaction_packages = unique_to_install;
-    if (auto current_packages = db.list_installed_packages()) {
-        trig_ctx.installed_packages = std::move(*current_packages);
-    } else {
-        sage::util::log_error(
-            "Cannot run aggregate triggers: {}", current_packages.error());
+    if (!run_aggregate_triggers()) {
+        aggregate_done = true;
         return 1;
     }
-    trig_ctx.providers = cfg.providers;
-    trig_ctx.dry_run = opts.dry_run;
-    sage::rebuild::TriggerEngine::run(trig_ctx);
+    aggregate_done = true;
 
     sage::util::log_success("Successfully installed {} packages into {}", unique_to_install.size(), opts.target_root.string());
     return 0;

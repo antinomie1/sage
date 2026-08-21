@@ -1190,6 +1190,19 @@ version = "1:2.0-3"
             std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
     };
 
+    // Trigger timing fixtures execute on the host with sysroot "/". Their
+    // commands touch only this test's temporary directory, so the suite does
+    // not need a compiler or static libc merely to build a chroot-local probe.
+    auto host_trigger_args = [](const std::vector<std::filesystem::path>& required,
+                                const std::filesystem::path& counter) {
+        std::string script;
+        for (const auto& path : required) {
+            script += std::format("test -e \"{}\" && ", path.string());
+        }
+        script += std::format("echo x >> \"{}\"", counter.string());
+        return std::vector<std::string>{"-c", "'" + script + "'"};
+    };
+
     // A solver selection, direct archive request, and extracted archive must
     // all refer to the same complete package identity.
     auto version_repo = temp_dir / "version-repo";
@@ -1197,13 +1210,26 @@ version = "1:2.0-3"
     auto version_2_data = temp_dir / "version-2-data";
     std::filesystem::create_directories(version_repo);
     std::filesystem::create_directories(version_1_data / "usr/bin");
+    std::filesystem::create_directories(version_1_data / "usr/share/version-trigger");
     std::filesystem::create_directories(version_2_data / "usr/bin");
+    std::filesystem::create_directories(version_2_data / "usr/share/version-trigger");
     std::ofstream(version_1_data / "usr/bin/versioned") << "version 1\n";
+    std::ofstream(version_1_data / "usr/share/version-trigger/libversioned.so")
+        << "version 1 library\n";
     std::ofstream(version_2_data / "usr/bin/versioned") << "version 2\n";
+    std::ofstream(version_2_data / "usr/share/version-trigger/libversioned.so")
+        << "version 2 library\n";
 
     sage::package::PackageManifest version_1;
     version_1.name = "versioned-package";
     version_1.version = sage::package::Version::parse("1.0.0-1");
+    sage::package::Trigger version_trigger;
+    version_trigger.name = "version-cache";
+    version_trigger.on_paths = {"usr/share/version-trigger/"};
+    version_trigger.exec = "/bin/sh";
+    auto version_trigger_count = temp_dir / "version-trigger-count";
+    version_trigger.args = host_trigger_args({}, version_trigger_count);
+    version_1.triggers = {version_trigger};
     sage::package::PackageManifest version_2 = version_1;
     version_2.version = sage::package::Version::parse("2.0.0-1");
     auto version_1_pkg = version_repo / "versioned-package-1.0.0-1-x86_64.pkg.tar.zst";
@@ -1296,8 +1322,9 @@ version = "1:2.0-3"
     CliOptions direct_install;
     direct_install.target_root = direct_target;
     direct_install.args = {version_1_pkg.string()};
-    if (cmd_install(direct_install) != 0
-        || read_test_file(direct_target / "usr/bin/versioned") != "version 1\n") {
+    if (cmd_install(direct_install, "/") != 0
+        || read_test_file(direct_target / "usr/bin/versioned") != "version 1\n"
+        || read_test_file(version_trigger_count) != "x\n") {
         sage::util::log_error("Direct archive install was not locked to its exact version");
         return 1;
     }
@@ -1315,10 +1342,53 @@ version = "1:2.0-3"
         }
     }
 
+    // A direct archive may intentionally rebuild the same identity with a
+    // different payload. Paths dropped by that rebuild must be removed from
+    // both the target root and the ownership database.
+    auto same_identity_data = temp_dir / "same-identity-data";
+    std::filesystem::create_directories(same_identity_data / "usr/bin");
+    std::ofstream(same_identity_data / "usr/bin/replacement")
+        << "same identity replacement\n";
+    auto same_identity_archive =
+        temp_dir / "versioned-package-same-identity.pkg.tar.zst";
+    if (!sage::archive::create_package(
+            version_1, same_identity_data, same_identity_archive)) {
+        sage::util::log_error("Failed to create same-identity reinstall fixture");
+        return 1;
+    }
+    direct_install.args = {same_identity_archive.string()};
+    if (cmd_install(direct_install, "/") != 0
+        || std::filesystem::exists(direct_target / "usr/bin/versioned")
+        || std::filesystem::exists(
+            direct_target / "usr/share/version-trigger/libversioned.so")
+        || read_test_file(direct_target / "usr/bin/replacement")
+            != "same identity replacement\n"
+        || read_test_file(version_trigger_count) != "x\nx\n") {
+        sage::util::log_error("Same-identity reinstall left a stale payload path");
+        return 1;
+    }
+    auto same_identity_db = sage::db::Database::open(
+        direct_target / "var/lib/sage/data.mdb", true);
+    if (!same_identity_db) {
+        sage::util::log_error("Failed to open same-identity reinstall database");
+        return 1;
+    }
+    auto removed_owner = same_identity_db->get_file_owner("usr/bin/versioned");
+    auto removed_library_owner = same_identity_db->get_file_owner(
+        "usr/share/version-trigger/libversioned.so");
+    auto replacement_owner = same_identity_db->get_file_owner("usr/bin/replacement");
+    if (!removed_owner || *removed_owner
+        || !removed_library_owner || *removed_library_owner
+        || !replacement_owner || !*replacement_owner
+        || **replacement_owner != "versioned-package:system") {
+        sage::util::log_error("Same-identity reinstall left stale file ownership");
+        return 1;
+    }
+
     // A normal same-package upgrade may replace files already owned by that
     // package, while still selecting the exact newer archive.
     direct_install.args = {"versioned-package"};
-    if (cmd_install(direct_install) != 0
+    if (cmd_install(direct_install, "/") != 0
         || read_test_file(direct_target / "usr/bin/versioned") != "version 2\n") {
         sage::util::log_error("Same-package upgrade was blocked or extracted the wrong archive");
         return 1;
@@ -1338,7 +1408,7 @@ version = "1:2.0-3"
     // An explicit archive remains exact even when a newer same-name package is
     // installed. This is the local-package downgrade path used for rollback.
     direct_install.args = {version_1_pkg.string()};
-    if (cmd_install(direct_install) != 0
+    if (cmd_install(direct_install, "/") != 0
         || read_test_file(direct_target / "usr/bin/versioned") != "version 1\n") {
         sage::util::log_error("Direct archive downgrade was silently skipped");
         return 1;
@@ -1371,7 +1441,7 @@ version = "1:2.0-3"
         return 1;
     }
     direct_install.args = {alternate_archive.string()};
-    if (cmd_install(direct_install) != 0
+    if (cmd_install(direct_install, "/") != 0
         || std::filesystem::exists(direct_target / "usr/bin/versioned")
         || read_test_file(direct_target / "opt/channels/llvm/42/bin/versioned")
             != "alternate identity\n") {
@@ -1477,9 +1547,15 @@ version = "1:2.0-3"
     auto transaction_repo = temp_dir / "transaction-repo";
     auto transaction_a_data = temp_dir / "transaction-a-data";
     auto transaction_b_data = temp_dir / "transaction-b-data";
+    auto transaction_target = temp_dir / "transaction-target";
+    auto failed_install_trigger_count = temp_dir / "failed-install-trigger-count";
     std::filesystem::create_directories(transaction_repo);
     std::filesystem::create_directories(transaction_a_data / "usr/bin");
+    std::filesystem::create_directories(
+        transaction_a_data / "usr/share/transaction-trigger");
     std::ofstream(transaction_a_data / "usr/bin/transaction-a") << "committed package\n";
+    std::ofstream(transaction_a_data / "usr/share/transaction-trigger/committed")
+        << "committed trigger input\n";
     auto transaction_clang = transaction_a_data / "opt/channels/llvm/99/bin/clang";
     std::filesystem::create_directories(transaction_clang.parent_path());
     std::ofstream(transaction_clang) << "#!/bin/sh\nexit 0\n";
@@ -1497,6 +1573,14 @@ version = "1:2.0-3"
     transaction_a.name = "transaction-a";
     transaction_a.version = sage::package::Version::parse("1.0.0-1");
     transaction_a.channel = "toolchain/llvm:99";
+    sage::package::Trigger failed_install_trigger;
+    failed_install_trigger.name = "failed-install-cache";
+    failed_install_trigger.on_paths = {"usr/share/transaction-trigger/"};
+    failed_install_trigger.exec = "/bin/sh";
+    failed_install_trigger.args = host_trigger_args(
+        {transaction_target / "usr/share/transaction-trigger/committed"},
+        failed_install_trigger_count);
+    transaction_a.triggers = {failed_install_trigger};
     sage::package::PackageManifest transaction_b;
     transaction_b.name = "transaction-b";
     transaction_b.version = sage::package::Version::parse("1.0.0-1");
@@ -1512,7 +1596,6 @@ version = "1:2.0-3"
         return 1;
     }
 
-    auto transaction_target = temp_dir / "transaction-target";
     std::filesystem::create_directories(transaction_target / "etc/sage");
     std::filesystem::create_directories(transaction_target / "usr/share/blocked");
     std::ofstream(transaction_target / "usr/share/blocked/keep") << "must survive\n";
@@ -1526,7 +1609,7 @@ version = "1:2.0-3"
     CliOptions transaction_install;
     transaction_install.target_root = transaction_target;
     transaction_install.args = {"transaction-b"};
-    if (cmd_install(transaction_install) == 0) {
+    if (cmd_install(transaction_install, "/") == 0) {
         sage::util::log_error("Multi-package install accepted a later package path conflict");
         return 1;
     }
@@ -1547,7 +1630,8 @@ version = "1:2.0-3"
         || !std::filesystem::is_symlink(transaction_cc_link, transaction_cc_ec)
         || std::filesystem::read_symlink(transaction_cc_link, transaction_cc_ec)
             != "/opt/channels/llvm/99/bin/clang"
-        || !std::filesystem::exists(transaction_target / "etc/profile.d/sage-channels.sh")) {
+        || !std::filesystem::exists(transaction_target / "etc/profile.d/sage-channels.sh")
+        || read_test_file(failed_install_trigger_count) != "x\n") {
         sage::util::log_error(
             "A later package failure desynchronized an earlier committed package or skipped its post-processing");
         return 1;
@@ -1555,16 +1639,24 @@ version = "1:2.0-3"
 
     // Split packages in one toolchain slot must refresh activation as each
     // package commits. The dependency installs libraries first; the compiler
-    // package that follows is what makes the cc alias possible.
+    // package that follows is what makes the cc alias possible. Aggregate
+    // triggers run only after both packages are present, and duplicate trigger
+    // declarations resolving to one command execute once.
     auto split_repo = temp_dir / "split-toolchain-repo";
     auto split_libs_data = temp_dir / "split-toolchain-libs-data";
     auto split_compiler_data = temp_dir / "split-toolchain-compiler-data";
+    auto split_target = temp_dir / "split-toolchain-target";
+    auto split_trigger_count = temp_dir / "split-trigger-count";
     auto split_library = split_libs_data / "opt/channels/llvm/77/lib/libsplit.so";
+    auto split_compiler_library =
+        split_compiler_data / "opt/channels/llvm/77/lib/libsplit-compiler.so";
     auto split_clang = split_compiler_data / "opt/channels/llvm/77/bin/clang";
     std::filesystem::create_directories(split_repo);
     std::filesystem::create_directories(split_library.parent_path());
+    std::filesystem::create_directories(split_compiler_library.parent_path());
     std::filesystem::create_directories(split_clang.parent_path());
     std::ofstream(split_library) << "split toolchain library\n";
+    std::ofstream(split_compiler_library) << "split compiler library\n";
     std::ofstream(split_clang) << "#!/bin/sh\nexit 0\n";
     std::filesystem::permissions(
         split_clang,
@@ -1578,6 +1670,19 @@ version = "1:2.0-3"
     split_libs.name = "split-toolchain-libs";
     split_libs.version = sage::package::Version::parse("1.0.0-1");
     split_libs.channel = "toolchain/llvm:77";
+    sage::package::Trigger split_trigger;
+    split_trigger.name = "split-cache-primary";
+    split_trigger.on_paths = {"opt/channels/llvm/77/lib/"};
+    split_trigger.exec = "/bin/sh";
+    split_trigger.args = host_trigger_args(
+        {
+            split_target / "opt/channels/llvm/77/lib/libsplit.so",
+            split_target / "opt/channels/llvm/77/lib/libsplit-compiler.so",
+        },
+        split_trigger_count);
+    auto duplicate_split_trigger = split_trigger;
+    duplicate_split_trigger.name = "split-cache-duplicate";
+    split_libs.triggers = {split_trigger, duplicate_split_trigger};
     sage::package::PackageManifest split_compiler;
     split_compiler.name = "split-toolchain-compiler";
     split_compiler.version = sage::package::Version::parse("1.0.0-1");
@@ -1597,7 +1702,6 @@ version = "1:2.0-3"
         return 1;
     }
 
-    auto split_target = temp_dir / "split-toolchain-target";
     if (!write_test_channel(split_target, split_repo)) {
         sage::util::log_error("Failed to write split toolchain test channel");
         return 1;
@@ -1605,7 +1709,7 @@ version = "1:2.0-3"
     CliOptions split_install;
     split_install.target_root = split_target;
     split_install.args = {"split-toolchain-compiler"};
-    if (cmd_install(split_install) != 0) {
+    if (cmd_install(split_install, "/") != 0) {
         sage::util::log_error("Failed to install split toolchain packages");
         return 1;
     }
@@ -1613,8 +1717,10 @@ version = "1:2.0-3"
     std::error_code split_cc_ec;
     if (!std::filesystem::is_symlink(split_cc_link, split_cc_ec)
         || std::filesystem::read_symlink(split_cc_link, split_cc_ec)
-            != "/opt/channels/llvm/77/bin/clang") {
-        sage::util::log_error("Later split toolchain package did not refresh activation");
+            != "/opt/channels/llvm/77/bin/clang"
+        || read_test_file(split_trigger_count) != "x\n") {
+        sage::util::log_error(
+            "Split toolchain activation or aggregate trigger timing is incorrect");
         return 1;
     }
 
@@ -1669,7 +1775,9 @@ version = "1:2.0-3"
     std::ofstream(installed_split_clang) << "#!/bin/sh\nexit 0\n";
     if (cmd_remove(split_remove) != 0
         || std::filesystem::exists(split_target / "opt/channels/llvm/77/bin/clang")
-        || std::filesystem::exists(split_target / "opt/channels/llvm/77/lib/libsplit.so")) {
+        || std::filesystem::exists(split_target / "opt/channels/llvm/77/lib/libsplit.so")
+        || std::filesystem::exists(
+            split_target / "opt/channels/llvm/77/lib/libsplit-compiler.so")) {
         sage::util::log_error("Toolchain removal did not delete sysroot-relative package paths");
         return 1;
     }

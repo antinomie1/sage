@@ -221,7 +221,7 @@ public:
             if (!cmd) continue;
 
             if (!already_run.insert(*cmd).second) continue;
-            execute(*cmd, trig.name, ctx);
+            (void)execute(*cmd, trig.name, ctx);
         }
     }
 
@@ -303,10 +303,14 @@ private:
     // chroot: host-side they would rebuild the HOST's caches and leave the
     // sysroot's untouched, and the host loader may not even match the target's
     // glibc. Every path here is therefore relative to the target root.
-    static void execute(const std::string& cmd, std::string_view trigger_name, const TriggerContext& ctx) {
+    static bool execute(
+        const std::string& cmd,
+        std::string_view trigger_name,
+        const TriggerContext& ctx)
+    {
         std::string exec_path = cmd.substr(0, cmd.find(' '));
         if (!std::filesystem::exists(ctx.sysroot / std::filesystem::path(exec_path).relative_path())) {
-            return;
+            return false;
         }
 
         std::string full = (ctx.sysroot == "/")
@@ -315,14 +319,16 @@ private:
 
         if (ctx.dry_run) {
             util::log_info("Would run trigger '{}': {}", trigger_name, full);
-            return;
+            return true;
         }
 
         util::log_info("Running trigger '{}': {}", trigger_name, full);
         int ret = std::system(full.c_str());
         if (ret != 0) {
             util::log_warn("Trigger '{}' failed (exit {}): {}", trigger_name, ret, full);
+            return false;
         }
+        return true;
     }
 };
 
