@@ -1,17 +1,96 @@
 export module sage.rebuild;
 
 import std;
+import sage.archive;
+import sage.channel;
 import sage.config;
 import sage.package;
 import sage.service;
 import sage.db;
-import sage.archive;
 import sage.solver;
 import sage.util;
 
 export namespace sage::rebuild {
 
 using std::size_t;
+
+// ============================================================================
+// Channel Pool & Archive Resolution
+// ============================================================================
+//
+// `sage install` and `sage rebuild` both need the same two things from the
+// configured channels: the metadata pool the solver plans against, and the
+// local archive path backing each candidate. Priority order breaks
+// equal-version ties, so metadata and payload always come from one repository.
+
+struct RepoSnapshot {
+    std::vector<package::PackageManifest> pool;
+    std::map<package::PackageIdentity, std::filesystem::path> archives;
+};
+
+inline std::expected<RepoSnapshot, std::string> fetch_repo_snapshot(
+    const config::SystemConfig& cfg,
+    std::string_view channel_filter = {})
+{
+    RepoSnapshot snap;
+    auto channel_configs = cfg.channels;
+    std::ranges::stable_sort(channel_configs, std::greater{},
+        &config::ChannelConfig::priority);
+
+    bool filter_matched = channel_filter.empty();
+    for (const auto& ch_cfg : channel_configs) {
+        if (!ch_cfg.enabled) continue;
+        // --channel narrows the pool to one channel. Installed packages are
+        // still added by the caller, so a restricted install can satisfy
+        // constraints that are already met on the system.
+        if (!channel_filter.empty() && ch_cfg.name != channel_filter) continue;
+        filter_matched = true;
+
+        channel::Channel ch;
+        ch.name = ch_cfg.name;
+        ch.url = ch_cfg.url;
+        ch.scope = channel::parse_scope(ch_cfg.scope);
+        ch.priority = ch_cfg.priority;
+
+        auto idx_res = channel::ProfileManager::sync_channel(ch, cfg.cache_dir);
+        if (!idx_res) continue;
+
+        std::filesystem::path dir_base;
+        if (ch.url.starts_with("file://")) {
+            dir_base = std::filesystem::path(ch.url.substr(7));
+        } else if (ch.url.starts_with("/")) {
+            dir_base = std::filesystem::path(ch.url);
+        } else {
+            dir_base = cfg.cache_dir / "pkg";
+        }
+
+        for (const auto& pkg : idx_res->available_packages) {
+            snap.pool.push_back(pkg);
+            std::filesystem::path local_p;
+            if (!pkg.file.empty()) {
+                local_p = dir_base / pkg.file;
+            } else {
+                // Legacy naming fallbacks for hand-rolled repositories.
+                local_p = dir_base / std::format(
+                    "{}-{}-{}-{}.pkg.tar.zst", pkg.name, pkg.version.ver, pkg.version.rel, pkg.arch);
+                if (!std::filesystem::exists(local_p)) {
+                    local_p = dir_base / std::format("{}-{}-{}.pkg.tar.zst", pkg.name, pkg.version.ver, pkg.version.rel);
+                }
+                if (!std::filesystem::exists(local_p)) {
+                    local_p = dir_base / std::format("{}-{}.pkg.tar.zst", pkg.name, pkg.version.ver);
+                }
+            }
+            snap.archives.try_emplace(package::package_identity(pkg), std::move(local_p));
+        }
+    }
+
+    if (!filter_matched) {
+        return std::unexpected(std::format(
+            "No enabled channel named '{}' is configured for '{}'",
+            channel_filter, cfg.root_dir.string()));
+    }
+    return snap;
+}
 
 struct ProviderSwap {
     std::string iface;
@@ -28,6 +107,9 @@ struct ReconcilePlan {
     std::vector<ProviderSwap> swaps;
     std::vector<package::PackageManifest> packages_to_install;
     std::vector<PlannedPackageRemoval> packages_to_remove;
+    // Channel snapshot fetched during planning; execute unpacks installs from
+    // plan.repos.archives, so planning and payload can never disagree.
+    RepoSnapshot repos;
     service::InitType target_init{service::InitType::OpenRC};
     bool has_changes{false};
 };
@@ -254,8 +336,7 @@ class ReconcileEngine {
 public:
     static std::expected<ReconcilePlan, std::string> calculate_diff(
         db::Database& db,
-        const config::SystemConfig& desired_config,
-        const std::vector<package::PackageManifest>& repo_pool) 
+        const config::SystemConfig& desired_config)
     {
         ReconcilePlan plan;
         auto current_providers = db.get_all_system_providers();
@@ -293,7 +374,14 @@ public:
             return plan;
         }
 
-        // 2. Solve dependencies for new providers
+        // 2. Fetch channels: the solve pool and the archives behind it. Only
+        // reached when a swap is pending, so the common no-op reconcile never
+        // touches the network.
+        auto snapshot_res = fetch_repo_snapshot(desired_config);
+        if (!snapshot_res) return std::unexpected(snapshot_res.error());
+        plan.repos = std::move(*snapshot_res);
+
+        // 3. Solve dependencies for new providers
         std::vector<package::Dependency> root_reqs;
         for (const auto& swap : plan.swaps) {
             root_reqs.push_back(package::Dependency{
@@ -317,7 +405,7 @@ public:
             }
         }
 
-        solver::DependencySolver solver(repo_pool, desired_config.providers);
+        solver::DependencySolver solver(plan.repos.pool, desired_config.providers);
         auto solve_res = solver.solve(root_reqs);
         if (!solve_res) {
             return std::unexpected("Reconcile dependency resolution failed: " + solve_res.error());
@@ -379,7 +467,9 @@ public:
             if (!set_res) return std::unexpected(set_res.error());
         }
 
-        // 2. Unregister and remove obsolete packages
+        // 2. Remove obsolete providers -- physically first: an exclusive
+        // capability allows exactly one provider on disk, so the outgoing
+        // package's files must go before the incoming ones land.
         for (const auto& removal : plan.packages_to_remove) {
             auto old_pkg = db.get_package(*wtxn, removal.name);
             if (!old_pkg) {
@@ -396,9 +486,37 @@ public:
                     removal.name));
             }
             if (*old_pkg) {
-                auto file_res = db.unregister_files(*wtxn, (**old_pkg).files);
+                const auto& old_manifest = **old_pkg;
+                auto my_owner = std::format("{}:{}", removal.name, old_manifest.channel);
+
+                // Manifest files plus anything still registered to this
+                // package; children sort before parents so directories empty
+                // out and can be pruned.
+                std::set<std::string> paths;
+                for (const auto& f : old_manifest.files) paths.insert(util::clean_rel_path(f.path));
+                auto registered = db.get_package_files(*wtxn, removal.name);
+                if (!registered) return std::unexpected(registered.error());
+                paths.insert(registered->begin(), registered->end());
+                std::vector<std::string> ordered(paths.begin(), paths.end());
+                std::ranges::stable_sort(ordered, [&](const std::string& a, const std::string& b) {
+                    return util::path_depth(a) > util::path_depth(b);
+                });
+
+                for (const auto& path : ordered) {
+                    auto owner = db.get_file_owner(*wtxn, path);
+                    if (!owner) return std::unexpected(owner.error());
+                    if (*owner && **owner != my_owner) continue;
+                    auto rm_res = archive::remove_path_anchored(sysroot, path);
+                    if (!rm_res) {
+                        return std::unexpected(std::format(
+                            "Failed to remove '{}' of outgoing provider '{}': {}",
+                            path, removal.name, rm_res.error()));
+                    }
+                }
+
+                auto file_res = db.unregister_files(*wtxn, old_manifest.files);
                 if (!file_res) return std::unexpected(file_res.error());
-                auto provide_res = db.unregister_provides(*wtxn, (**old_pkg).provides);
+                auto provide_res = db.unregister_provides(*wtxn, old_manifest.provides);
                 if (!provide_res) return std::unexpected(provide_res.error());
                 auto delete_res = db.del_package(*wtxn, removal.name);
                 if (!delete_res) return std::unexpected(delete_res.error());
@@ -411,14 +529,57 @@ public:
             }
         }
 
-        // 3. Register newly installed packages in LMDB
-        for (const auto& new_pkg : plan.packages_to_install) {
-            auto p_res = db.put_package(*wtxn, new_pkg);
-            if (!p_res) return p_res;
-            auto f_res = db.register_files(*wtxn, new_pkg.name, new_pkg.channel, new_pkg.files);
-            if (!f_res) return f_res;
-            auto prov_res = db.register_provides(*wtxn, new_pkg.name, new_pkg.provides);
-            if (!prov_res) return prov_res;
+        // 3. Install newly selected packages: unpack the archive into the
+        // target root, then register the real result in LMDB. Channel index
+        // manifests carry names and versions but not files or capability
+        // hooks, so the archive manifest's hooks/triggers are adopted here --
+        // otherwise e.g. an initramfs generator installed by a swap would be
+        // invisible to the very trigger that has to run it.
+        std::vector<package::PackageManifest> installed_now;
+        for (const auto& selected : plan.packages_to_install) {
+            const auto identity = package::package_identity(selected);
+
+            // Exact version already installed and registered: keep its record,
+            // file list and hooks; a swap only needs the new provider itself.
+            auto existing = db.get_package(*wtxn, selected.name);
+            if (!existing) return std::unexpected(existing.error());
+            if (*existing && package::package_identity(**existing) == identity) continue;
+
+            auto archive_it = plan.repos.archives.find(identity);
+            if (archive_it == plan.repos.archives.end()) {
+                return std::unexpected(std::format(
+                    "No package archive available for '{}' {} in any configured channel",
+                    selected.name, selected.version.to_string()));
+            }
+            auto inspect_res = archive::inspect_package(archive_it->second);
+            if (!inspect_res) {
+                return std::unexpected(std::format(
+                    "Invalid package archive for '{}': {}", selected.name, inspect_res.error()));
+            }
+            if (package::package_identity(inspect_res->manifest) != identity) {
+                return std::unexpected(std::format(
+                    "Archive identity does not match selected package '{}'", selected.name));
+            }
+
+            util::log_info("Unpacking {} -> {}...", selected.name, sysroot.string());
+            auto ext_res = archive::extract_package(archive_it->second, sysroot, &selected, &*inspect_res);
+            if (!ext_res) {
+                return std::unexpected(std::format(
+                    "Failed to extract package '{}': {}", selected.name, ext_res.error()));
+            }
+
+            auto installed_pkg = selected;
+            installed_pkg.files = ext_res->extracted_files;
+            installed_pkg.capability_hooks = ext_res->manifest.capability_hooks;
+            installed_pkg.triggers = ext_res->manifest.triggers;
+
+            auto p_res = db.put_package(*wtxn, installed_pkg);
+            if (!p_res) return std::unexpected(p_res.error());
+            auto f_res = db.register_files(*wtxn, installed_pkg.name, installed_pkg.channel, installed_pkg.files);
+            if (!f_res) return std::unexpected(f_res.error());
+            auto prov_res = db.register_provides(*wtxn, installed_pkg.name, installed_pkg.provides);
+            if (!prov_res) return std::unexpected(prov_res.error());
+            installed_now.push_back(std::move(installed_pkg));
         }
 
         auto commit_res = wtxn->commit();
@@ -445,10 +606,10 @@ public:
         // 5. Execute post-transaction triggers
         TriggerContext trig_ctx;
         trig_ctx.sysroot = sysroot;
-        trig_ctx.transaction_packages = plan.packages_to_install;
+        trig_ctx.transaction_packages = std::move(installed_now);
         trig_ctx.installed_packages = std::move(*installed);
         trig_ctx.providers = providers;
-        for (const auto& pkg : plan.packages_to_install) {
+        for (const auto& pkg : trig_ctx.transaction_packages) {
             trig_ctx.touched_files.insert(trig_ctx.touched_files.end(), pkg.files.begin(), pkg.files.end());
         }
         TriggerEngine::run(trig_ctx);

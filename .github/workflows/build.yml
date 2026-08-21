@@ -46,4 +46,6 @@ jobs:
         run: xmake run sage --version
 
       - name: Engine self-test suite
-        run: xmake run sage test-suite
+        run: |
+          xmake build -y sage-tests
+          xmake run sage-tests

@@ -695,7 +695,9 @@ struct PackageIdentity {
     std::string arch;
     std::string channel;
 
-    auto operator<=>(const PackageIdentity&) const = default;
+    // Spelled out: a deduced return type does not survive module import
+    // boundaries in GCC 15 and breaks comparison in importing units.
+    std::strong_ordering operator<=>(const PackageIdentity&) const = default;
 };
 
 inline PackageIdentity package_identity(const PackageManifest& manifest) {
