@@ -26,7 +26,6 @@ using std::uint8_t;
 using std::uint32_t;
 using std::uint64_t;
 
-inline std::expected<std::string, std::string> normalize_data_path(std::string_view);
 inline std::expected<void, std::string> remove_path_anchored(
     const std::filesystem::path&, std::string_view, bool);
 
@@ -34,7 +33,7 @@ inline std::expected<void, std::string> remove_path_anchored(
 // target root and the operation list is fsync'd before its id is committed to
 // LMDB.  Publication is idempotent, so startup recovery can finish a commit
 // interrupted at any instruction (including after rename/unlink + fsync).
-export class FilesystemTransaction {
+class FilesystemTransaction {
 public:
     static std::expected<FilesystemTransaction, std::string> create(
         const std::filesystem::path& root)
@@ -65,6 +64,24 @@ public:
     }
 
     std::expected<void, std::string> prepare() {
+        // Strict removals represent package-owned non-directory entries. Catch
+        // type changes before the database commit; publication itself remains
+        // redo-only once the transaction has been committed.
+        std::ifstream operations(journal_, std::ios::binary);
+        char kind;
+        std::string path;
+        while (operations >> kind && operations.get() == ' ' && std::getline(operations, path)) {
+            if (kind != 'r') continue;
+            std::error_code ec;
+            const auto status = std::filesystem::symlink_status(root_ / path, ec);
+            if (ec && ec != std::errc::no_such_file_or_directory)
+                return std::unexpected("Cannot inspect removal path '" + path + "': " + ec.message());
+            if (!ec && std::filesystem::is_directory(status))
+                return std::unexpected("Cannot replace package file '" + path + "' with a directory");
+        }
+        if (!operations.eof())
+            return std::unexpected(std::string("Cannot validate filesystem transaction journal"));
+
         int flags = O_RDONLY;
 #ifdef O_CLOEXEC
         flags |= O_CLOEXEC;
@@ -98,7 +115,7 @@ public:
 
 private:
     FilesystemTransaction(std::filesystem::path root, std::string id)
-        : root_(std::move(root)), id_(std::move(id)),
+        : id_(std::move(id)), root_(std::move(root)),
           directory_(root_ / "var/lib/sage/transactions" / id_),
           payload_(directory_ / "payload"), journal_(directory_ / "operations") {}
 
@@ -143,7 +160,7 @@ private:
         // Removes precede installs, matching upgrades/provider swaps. Replays
         // tolerate already absent paths and already non-empty directories.
         for (const auto& [op, rel] : ops) if (op == 'R' || op == 'r') {
-            auto removed = remove_path_anchored(root, rel, true);
+            auto removed = remove_path_anchored(root, rel, op == 'R');
             if (!removed) return removed;
             if (auto fault = inject_fault(); !fault) return fault;
         }
@@ -191,8 +208,8 @@ private:
         return {};
     }
 
-    std::filesystem::path root_, directory_, payload_, journal_;
     std::string id_;
+    std::filesystem::path root_, directory_, payload_, journal_;
 };
 
 inline std::expected<void, std::string> remove_path_anchored(

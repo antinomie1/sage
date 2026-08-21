@@ -451,7 +451,7 @@ public:
         }
 
         auto wtxn = db.begin_write_txn();
-        if (!wtxn) return std::unexpected("Failed to open database write transaction");
+        if (!wtxn) return std::unexpected(std::string("Failed to open database write transaction"));
         auto filesystem_txn_res = archive::FilesystemTransaction::create(sysroot);
         if (!filesystem_txn_res) return std::unexpected(filesystem_txn_res.error());
         auto filesystem_txn = std::move(*filesystem_txn_res);
