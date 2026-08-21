@@ -68,28 +68,28 @@ sage/
 │   │   ├── zstd.cppm             # sage.vendor.zstd -- streaming Zstandard bridge
 │   │   ├── toml.cppm             # sage.vendor.toml -- tomlplusplus bridge
 │   │   └── curl.cppm             # sage.vendor.curl -- libcurl session & downloads
-│   ├── domain/                   # Layers 1-2: pure domain models & configuration
+│   ├── model/                    # Pure models & parsing (no process state)
 │   │   ├── util.cppm             # sage.util -- paths, ELF scanner, SHA256, formatting
 │   │   ├── package.cppm          # sage.package -- package model, recipes, manifests, triggers
 │   │   ├── config.cppm           # sage.config -- system.toml & provider configuration
 │   │   └── service.cppm          # sage.service -- universal init script generator
-│   ├── engine/                   # Layers 3-4: stateful subsystem engines
-│   │   ├── channel.cppm          # sage.channel -- multi-layer channels & FHS profile
+│   ├── store/                    # Persistent state & archive formats
 │   │   ├── db.cppm               # sage.db -- LMDB registry, file ownership & transactions
-│   │   ├── solver.cppm           # sage.solver -- PubGrub / CDCL dependency solver
-│   │   ├── rebuild.cppm          # sage.rebuild -- declarative reconcile orchestration
 │   │   └── archive/              # sage.archive, split into module partitions
 │   │       ├── archive.cppm      # facade (export import of the partitions below)
 │   │       ├── detail.cppm       # :detail (internal) RAII handles & anchored path safety
 │   │       ├── tape.cppm         # :tape USTAR format, streaming walker, inspection
 │   │       ├── extract.cppm      # :extract anchored cleanup & streaming extraction
 │   │       └── pack.cppm         # :pack package creation & repository indexing
-│   └── cli/                      # Layer 5: command layer (sage.cli.* modules)
+│   ├── sys/                      # Stateful system subsystems
+│   │   ├── channel.cppm          # sage.channel -- multi-layer channels & FHS profile
+│   │   ├── solver.cppm           # sage.solver -- PubGrub / CDCL dependency solver
+│   │   └── rebuild.cppm          # sage.rebuild -- declarative reconcile orchestration
+│   ├── cli/                      # Layer 5: command layer (sage.cli.* modules)
 │       ├── cli.cppm              # sage.cli -- CliOptions, help text, argument parsing
 │       ├── pkg.cppm              # sage.cli.pkg -- install / remove / rebuild
 │       ├── build.cppm            # sage.cli.build -- build / repo index
 │       ├── query.cppm            # sage.cli.query -- query / list / count / verify / status
-│       ├── toolchain.cppm        # sage.cli.toolchain -- channel / toolchains / shell / service
 │       └── toolchain.cppm        # sage.cli.toolchain -- channel / toolchains / shell / service
 └── tests/                       # Standalone integration suite (sage-tests binary)
     ├── suite.cppm               # sage.tests -- 11-scenario end-to-end regression

@@ -15,23 +15,26 @@ graph TD
         CURL["sage.vendor.curl<br/>(Wraps libcurl RAII session & streaming download)"]
     end
 
-    subgraph Layer1["Layer 1: Utility & Foundation (src/domain/)"]
+    subgraph Layer1["Layer 1: Utility & Foundation (src/model/)"]
         UTIL["sage.util<br/>(Path normalization, ELF SONAME scanner, SHA256, ANSI styles)"]
     end
 
-    subgraph Layer2["Layer 2: Domain Models & Engine Primitives (src/domain/, src/engine/)"]
+    subgraph Layer2["Layer 2: Models & Parsing (src/model/)"]
         CONFIG["sage.config<br/>(system.toml parser & provider configuration)"]
         PKG["sage.package<br/>(Package model, recipe.toml, manifest.toml, triggers)"]
         SVC["sage.service<br/>(Universal service.toml -> OpenRC/Runit/Systemd/Dinit/s6)"]
+    end
+
+    subgraph SysSubgraph["System Subsystems (src/sys/)"]
         CHAN["sage.channel<br/>(Channel scopes, target roots, FHS Profile aggregator)"]
     end
 
-    subgraph Layer3["Layer 3: Storage & Archiving (src/engine/)"]
+    subgraph Layer3["Layer 3: Storage & Archiving (src/store/)"]
         DB["sage.db<br/>(LMDB zero-copy ACID state & file ownership engine)"]
         ARCH["sage.archive<br/>(Streaming Tar + Zstd engine; partitions :detail/:tape/:extract/:pack)"]
     end
 
-    subgraph Layer4["Layer 4: High-Level Orchestration (src/engine/)"]
+    subgraph Layer4["Layer 4: High-Level Orchestration (src/sys/)"]
         SOLVER["sage.solver<br/>(Native PubGrub / CDCL SAT solver with cause tree diagnostics)"]
         REBUILD["sage.rebuild<br/>(Declarative reconcile engine & atomic swap pipeline)"]
     end
