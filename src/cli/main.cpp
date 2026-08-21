@@ -747,12 +747,11 @@ int cmd_install(const CliOptions& opts) {
         installed_pkg.capability_hooks = ext_res->manifest.capability_hooks;
         installed_pkg.triggers = ext_res->manifest.triggers;
 
-        // Upgrade cleanup: remove physical files owned by a previously installed
-        // version of this package that are not part of the new version, so file
+        // Reinstall/upgrade cleanup: remove physical files owned by a previously
+        // installed package that are not part of the new payload, so file
         // ownership can transition to other packages (e.g. split -dev/-libs
         // children claim headers/libs the old monolithic version used to own).
-        if (*previous_package
-            && sage::package::package_identity(**previous_package) != identity) {
+        if (*previous_package) {
             std::unordered_set<std::string> new_paths;
             for (const auto& f : installed_pkg.files) {
                 new_paths.insert(sage::util::clean_rel_path(f.path));
@@ -2531,6 +2530,43 @@ version = "1:2.0-3"
             sage::util::log_error("Direct archive manifest identity was not preserved in the database");
             return 1;
         }
+    }
+
+    // A direct archive may intentionally rebuild the same identity with a
+    // different payload. Paths dropped by that rebuild must be removed from
+    // both the target root and the ownership database.
+    auto same_identity_data = temp_dir / "same-identity-data";
+    std::filesystem::create_directories(same_identity_data / "usr/bin");
+    std::ofstream(same_identity_data / "usr/bin/replacement")
+        << "same identity replacement\n";
+    auto same_identity_archive =
+        temp_dir / "versioned-package-same-identity.pkg.tar.zst";
+    if (!sage::archive::create_package(
+            version_1, same_identity_data, same_identity_archive)) {
+        sage::util::log_error("Failed to create same-identity reinstall fixture");
+        return 1;
+    }
+    direct_install.args = {same_identity_archive.string()};
+    if (cmd_install(direct_install) != 0
+        || std::filesystem::exists(direct_target / "usr/bin/versioned")
+        || read_test_file(direct_target / "usr/bin/replacement")
+            != "same identity replacement\n") {
+        sage::util::log_error("Same-identity reinstall left a stale payload path");
+        return 1;
+    }
+    auto same_identity_db = sage::db::Database::open(
+        direct_target / "var/lib/sage/data.mdb", true);
+    if (!same_identity_db) {
+        sage::util::log_error("Failed to open same-identity reinstall database");
+        return 1;
+    }
+    auto removed_owner = same_identity_db->get_file_owner("usr/bin/versioned");
+    auto replacement_owner = same_identity_db->get_file_owner("usr/bin/replacement");
+    if (!removed_owner || *removed_owner
+        || !replacement_owner || !*replacement_owner
+        || **replacement_owner != "versioned-package:system") {
+        sage::util::log_error("Same-identity reinstall left stale file ownership");
+        return 1;
     }
 
     // A normal same-package upgrade may replace files already owned by that
