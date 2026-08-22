@@ -1448,82 +1448,6 @@ release = "10"
             std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
     };
 
-    // Existing-state previews take Sage's shared lock and disable LMDB's own
-    // writable lock table. Neither lock file may change while reading the plan.
-    CliOptions existing_dry_run;
-    existing_dry_run.target_root = isolated_target;
-    existing_dry_run.args = {"dummy-tool"};
-    existing_dry_run.dry_run = true;
-    {
-        CliOptions seed_lock;
-        seed_lock.target_root = isolated_target;
-        if (!acquire_root_write_lock(seed_lock)) {
-            sage::util::log_error("Failed to create existing-target lock fixture");
-            return 1;
-        }
-    }
-    const auto sage_lock_path = isolated_target / "var/lib/sage/lock";
-    const auto lmdb_lock_path = isolated_target / "var/lib/sage/lock.mdb";
-    const auto sage_lock_before = read_test_file(sage_lock_path);
-    const auto lmdb_lock_before = read_test_file(lmdb_lock_path);
-    {
-        auto dry_run_lock = acquire_root_write_lock(existing_dry_run);
-        auto blocked_writer = sage::util::RootLock::acquire_directory(isolated_target);
-        if (!dry_run_lock || blocked_writer
-            || blocked_writer.error().kind != sage::util::LockFailure::Busy
-            || cmd_install(existing_dry_run) != 0) {
-            sage::util::log_error("Existing-target dry-run failed");
-            return 1;
-        }
-    }
-    if (read_test_file(sage_lock_path) != sage_lock_before
-        || read_test_file(lmdb_lock_path) != lmdb_lock_before
-        || std::filesystem::exists(isolated_target / "usr/bin/dummy")) {
-        sage::util::log_error("Existing-target dry-run modified package or lock state");
-        return 1;
-    }
-
-    // A preview against a fresh target must not initialize the lock or LMDB
-    // hierarchy while resolving the same package plan as a real install.
-    auto dry_run_target = temp_dir / "dry-run-target";
-    if (!write_test_channel(dry_run_target, local_repo)) {
-        sage::util::log_error("Failed to configure dry-run target channel");
-        return 1;
-    }
-    CliOptions dry_run_install;
-    dry_run_install.target_root = dry_run_target;
-    dry_run_install.args = {"dummy-tool"};
-    dry_run_install.dry_run = true;
-    auto dry_run_lock = acquire_root_write_lock(dry_run_install);
-    auto blocked_first_install = sage::util::RootLock::acquire_directory(dry_run_target);
-    if (!dry_run_lock || blocked_first_install
-        || blocked_first_install.error().kind != sage::util::LockFailure::Busy
-        || cmd_install(dry_run_install) != 0
-        || std::filesystem::exists(dry_run_target / "var/lib/sage")) {
-        sage::util::log_error("Dry-run initialized package state under a fresh target root");
-        return 1;
-    }
-
-    // Probe failures are not equivalent to an empty database: otherwise a
-    // permission or type error would silently produce an incorrect preview.
-    auto invalid_probe_target = temp_dir / "invalid-database-probe-target";
-    if (!write_test_channel(invalid_probe_target, local_repo)) {
-        sage::util::log_error("Failed to configure invalid database probe target");
-        return 1;
-    }
-    std::filesystem::create_directories(
-        invalid_probe_target / "var/lib/sage/data.mdb");
-    CliOptions invalid_probe_remove;
-    invalid_probe_remove.target_root = invalid_probe_target;
-    invalid_probe_remove.args = {"dummy-tool"};
-    invalid_probe_remove.dry_run = true;
-    auto invalid_probe_lock = acquire_root_write_lock(invalid_probe_remove);
-    if (!invalid_probe_lock || cmd_remove(invalid_probe_remove) == 0
-        || std::filesystem::exists(invalid_probe_target / "var/lib/sage/lock")) {
-        sage::util::log_error("Invalid database probe was treated as empty state");
-        return 1;
-    }
-
     // Trigger timing fixtures execute on the host with sysroot "/". Their
     // commands touch only this test's temporary directory, so the suite does
     // not need a compiler or static libc merely to build a chroot-local probe.
@@ -2637,20 +2561,9 @@ channel = "system"
             return 1;
         }
         { auto moved = std::move(*first); }  // release: fd closes here
-        {
-            auto reacquired = sage::util::RootLock::acquire(lock_path);
-            if (!reacquired) {
-                sage::util::log_error("Root write lock was not reacquirable after release");
-                return 1;
-            }
-        }
-
-        auto first_reader = sage::util::RootLock::acquire_read_only(lock_path);
-        auto second_reader = sage::util::RootLock::acquire_read_only(lock_path);
-        auto blocked_writer = sage::util::RootLock::acquire(lock_path);
-        if (!first_reader || !second_reader || blocked_writer
-            || blocked_writer.error().kind != sage::util::LockFailure::Busy) {
-            sage::util::log_error("Shared dry-run locks did not exclude a writer");
+        auto reacquired = sage::util::RootLock::acquire(lock_path);
+        if (!reacquired) {
+            sage::util::log_error("Root write lock was not reacquirable after release");
             return 1;
         }
 
@@ -2664,6 +2577,18 @@ channel = "system"
         }
         if (missing.error().message.find("cannot open lock file") == std::string::npos) {
             sage::util::log_error("Unusable lock error does not carry the underlying reason");
+            return 1;
+        }
+
+        // A real first operation creates its own package-state directory
+        // before locking it; callers do not need to pre-seed var/lib/sage.
+        CliOptions fresh_root;
+        fresh_root.target_root = temp_dir / "fresh-lock-root";
+        auto fresh_lock = acquire_root_write_lock(fresh_root);
+        if (!fresh_lock
+            || !std::filesystem::is_regular_file(
+                fresh_root.target_root / "var/lib/sage/lock")) {
+            sage::util::log_error("A fresh target root could not initialize its write lock");
             return 1;
         }
     }

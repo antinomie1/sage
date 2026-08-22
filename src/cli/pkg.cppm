@@ -50,33 +50,18 @@ export int cmd_install(
     }
     const auto& cfg = *cfg_res;
 
-    std::optional<sage::db::Database> database;
-    std::vector<sage::package::PackageManifest> installed_packages;
-    bool database_exists = true;
-    if (opts.dry_run) {
-        auto exists_res = package_database_exists(cfg.db_path);
-        if (!exists_res) {
-            sage::util::log_error("{}", exists_res.error());
-            return 1;
-        }
-        database_exists = *exists_res;
+    auto db_res = sage::db::Database::open(cfg.db_path);
+    if (!db_res) {
+        sage::util::log_error("Failed to open database at {}: {}", cfg.db_path.string(), db_res.error());
+        return 1;
     }
-    if (!opts.dry_run || database_exists) {
-        auto db_res = opts.dry_run
-            ? sage::db::Database::open_read_only_externally_locked(cfg.db_path)
-            : sage::db::Database::open(cfg.db_path);
-        if (!db_res) {
-            sage::util::log_error("Failed to open database at {}: {}", cfg.db_path.string(), db_res.error());
-            return 1;
-        }
-        database.emplace(std::move(*db_res));
-        auto installed_res = database->list_installed_packages();
-        if (!installed_res) {
-            sage::util::log_error("Installed package database is inconsistent: {}", installed_res.error());
-            return 1;
-        }
-        installed_packages = std::move(*installed_res);
+    auto& db = *db_res;
+    auto installed_res = db.list_installed_packages();
+    if (!installed_res) {
+        sage::util::log_error("Installed package database is inconsistent: {}", installed_res.error());
+        return 1;
     }
+    auto installed_packages = std::move(*installed_res);
 
     // 1. Gather Available Package Pool from Channels and Local Repos
     auto snapshot_res = sage::rebuild::fetch_repo_snapshot(cfg, opts.channel_filter);
@@ -160,7 +145,7 @@ export int cmd_install(
             && it != installed_by_name.end() && it->second.version >= pkg.version) {
             std::vector<std::string> db_files;
             if (it->second.files.empty()) {
-                auto db_files_res = database->get_package_files(pkg.name);
+                auto db_files_res = db.get_package_files(pkg.name);
                 if (!db_files_res) {
                     sage::util::log_error(
                         "Failed to read files owned by '{}': {}", pkg.name, db_files_res.error());
@@ -238,8 +223,6 @@ export int cmd_install(
         sage::util::log_info("Dry-run preview completed successfully (no changes written).");
         return 0;
     }
-
-    auto& db = *database;
 
     std::map<sage::package::PackageIdentity, sage::archive::InspectedPackage> inspected_packages;
     for (const auto& pkg : unique_to_install) {
@@ -613,24 +596,7 @@ export int cmd_remove(const CliOptions& opts) {
     }
     const auto& cfg = *cfg_res;
 
-    if (opts.dry_run) {
-        auto exists_res = package_database_exists(cfg.db_path);
-        if (!exists_res) {
-            sage::util::log_error("{}", exists_res.error());
-            return 1;
-        }
-        if (!*exists_res) {
-            for (const auto& pkg_name : opts.args) {
-                sage::util::log_warn("Package '{}' is not installed, skipping", pkg_name);
-            }
-            sage::util::log_info("No matching installed packages found to remove.");
-            return 0;
-        }
-    }
-
-    auto db_res = opts.dry_run
-        ? sage::db::Database::open_read_only_externally_locked(cfg.db_path)
-        : sage::db::Database::open(cfg.db_path);
+    auto db_res = sage::db::Database::open(cfg.db_path);
     if (!db_res) {
         sage::util::log_error("Failed to open database: {}", db_res.error());
         return 1;
@@ -1045,23 +1011,7 @@ export int cmd_rebuild(const CliOptions& opts) {
         return 1;
     }
 
-    if (opts.dry_run) {
-        auto exists_res = package_database_exists(cfg_res->db_path);
-        if (!exists_res) {
-            sage::util::log_error("{}", exists_res.error());
-            return 1;
-        }
-        if (!*exists_res) {
-            sage::util::log_error(
-                "Cannot calculate rebuild preview: no package database exists at {}",
-                cfg_res->db_path.string());
-            return 1;
-        }
-    }
-
-    auto db_res = opts.dry_run
-        ? sage::db::Database::open_read_only_externally_locked(cfg_res->db_path)
-        : sage::db::Database::open(cfg_res->db_path);
+    auto db_res = sage::db::Database::open(cfg_res->db_path);
     if (!db_res) {
         sage::util::log_error("Failed to open database: {}", db_res.error());
         return 1;

@@ -215,61 +215,15 @@ class RootLock {
 public:
     static std::expected<RootLock, LockError> acquire(
         const std::filesystem::path& path, int wait_seconds = 0) {
-        return acquire_impl(path, wait_seconds, false, false);
-    }
-
-    static std::expected<RootLock, LockError> acquire_read_only(
-        const std::filesystem::path& path, int wait_seconds = 0) {
-        return acquire_impl(path, wait_seconds, true, false);
-    }
-
-    static std::expected<RootLock, LockError> acquire_directory(
-        const std::filesystem::path& path,
-        int wait_seconds = 0,
-        const std::filesystem::path& pid_path = {}) {
-        auto lock = acquire_impl(path, wait_seconds, false, true);
-        if (!lock) return lock;
-        if (!pid_path.empty()) {
-            std::ofstream pid_file(pid_path, std::ios::trunc);
-            if (pid_file.is_open()) pid_file << current_pid() << '\n';
-        }
-        return lock;
-    }
-
-    static std::expected<RootLock, LockError> acquire_directory_read_only(
-        const std::filesystem::path& path, int wait_seconds = 0) {
-        return acquire_impl(path, wait_seconds, true, true);
-    }
-
-    RootLock() = default;
-    RootLock(RootLock&& other) noexcept : fd_(std::exchange(other.fd_, -1)) {}
-    RootLock& operator=(RootLock&& other) noexcept {
-        if (fd_ >= 0) ::close(fd_);
-        fd_ = std::exchange(other.fd_, -1);
-        return *this;
-    }
-    RootLock(const RootLock&) = delete;
-    RootLock& operator=(const RootLock&) = delete;
-    ~RootLock() { if (fd_ >= 0) ::close(fd_); }
-
-private:
-    static std::expected<RootLock, LockError> acquire_impl(
-        const std::filesystem::path& path,
-        int wait_seconds,
-        bool read_only,
-        bool directory) {
-        int open_flags = O_RDONLY | O_CLOEXEC;
-        if (directory) open_flags |= O_DIRECTORY;
-        else if (!read_only) open_flags = O_RDWR | O_CREAT | O_CLOEXEC;
         RootLock lock;
-        lock.fd_ = ::open(path.c_str(), open_flags, 0644);
+        lock.fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
         if (lock.fd_ < 0) {
             return std::unexpected(LockError{LockFailure::Unusable, std::format(
                 "cannot open lock file '{}': {}", path.string(), std::strerror(errno))});
         }
 
         auto try_lock = [&]() -> std::expected<bool, LockError> {
-            if (::flock(lock.fd_, (read_only ? LOCK_SH : LOCK_EX) | LOCK_NB) == 0) return true;
+            if (::flock(lock.fd_, LOCK_EX | LOCK_NB) == 0) return true;
             const int lock_errno = errno;
             if (lock_errno == EWOULDBLOCK || lock_errno == EAGAIN) return false;
             return std::unexpected(LockError{LockFailure::Unusable, std::format(
@@ -287,13 +241,25 @@ private:
             }
         }
         if (!*locked) return std::unexpected(LockError{LockFailure::Busy, {}});
-        if (!read_only && !directory) {
-            const auto pid = std::format("{}\n", static_cast<long>(getpid()));
-            (void)!::ftruncate(lock.fd_, 0);
-            (void)!::write(lock.fd_, pid.c_str(), pid.size());
-        }
+
+        const auto pid = std::format("{}\n", static_cast<long>(getpid()));
+        (void)!::ftruncate(lock.fd_, 0);
+        (void)!::write(lock.fd_, pid.c_str(), pid.size());
         return lock;
     }
+
+    RootLock() = default;
+    RootLock(RootLock&& other) noexcept : fd_(std::exchange(other.fd_, -1)) {}
+    RootLock& operator=(RootLock&& other) noexcept {
+        if (fd_ >= 0) ::close(fd_);
+        fd_ = std::exchange(other.fd_, -1);
+        return *this;
+    }
+    RootLock(const RootLock&) = delete;
+    RootLock& operator=(const RootLock&) = delete;
+    ~RootLock() { if (fd_ >= 0) ::close(fd_); }
+
+private:
     int fd_{-1};
 };
 

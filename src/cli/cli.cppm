@@ -110,32 +110,10 @@ inline std::optional<CliOptions> parse_args(int argc, char* argv[]) {
     return opts;
 }
 
-inline std::expected<bool, std::string> package_database_exists(
-    const std::filesystem::path& db_path) {
-    const auto data_path = db_path.extension() == ".mdb"
-        ? db_path
-        : db_path / "data.mdb";
-    std::error_code ec;
-    const auto status = std::filesystem::status(data_path, ec);
-    if (ec == std::errc::no_such_file_or_directory
-        || ec == std::errc::not_a_directory) {
-        return false;
-    }
-    if (ec) {
-        return std::unexpected(std::format(
-            "cannot inspect package database '{}': {}", data_path.string(), ec.message()));
-    }
-    if (!std::filesystem::exists(status)) return false;
-    if (!std::filesystem::is_regular_file(status)) {
-        return std::unexpected(std::format(
-            "package database '{}' is not a regular file", data_path.string()));
-    }
-    return true;
-}
-
 // Serialize state-changing commands (install/remove/rebuild) against a second
-// sage instance on the same target root: real mutations take an exclusive
-// flock, while dry-run readers share the existing lock without writing it.
+// sage instance on the same target root: flock on <db_dir>/lock, held by the
+// returned RootLock for the command's lifetime. Read-only commands never take
+// it and are never blocked.
 inline std::expected<util::RootLock, int> acquire_root_write_lock(const CliOptions& opts) {
     auto cfg_res = sage::config::SystemConfig::load_from_root(opts.target_root);
     if (!cfg_res) {
@@ -145,13 +123,9 @@ inline std::expected<util::RootLock, int> acquire_root_write_lock(const CliOptio
     const auto lock_path = cfg_res->db_path.parent_path() / "lock";
 
     if (!opts.dry_run) {
+        // A real first operation will create the database in this directory;
+        // callers should not have to pre-seed Sage's internal state path.
         std::error_code ec;
-        std::filesystem::create_directories(cfg_res->root_dir, ec);
-        if (ec) {
-            sage::util::log_error("cannot create target root '{}': {}",
-                cfg_res->root_dir.string(), ec.message());
-            return std::unexpected(1);
-        }
         std::filesystem::create_directories(lock_path.parent_path(), ec);
         if (ec) {
             sage::util::log_error("cannot create lock directory '{}': {}",
@@ -160,11 +134,7 @@ inline std::expected<util::RootLock, int> acquire_root_write_lock(const CliOptio
         }
     }
 
-    auto lock = opts.dry_run
-        ? sage::util::RootLock::acquire_directory_read_only(
-            cfg_res->root_dir, opts.wait_seconds)
-        : sage::util::RootLock::acquire_directory(
-            cfg_res->root_dir, opts.wait_seconds, lock_path);
+    auto lock = sage::util::RootLock::acquire(lock_path, opts.wait_seconds);
     if (!lock) {
         if (lock.error().kind != sage::util::LockFailure::Busy) {
             sage::util::log_error("cannot lock target root '{}': {}",
