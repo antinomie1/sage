@@ -173,7 +173,7 @@ inline std::expected<bool, std::string> probe_package_database(
 // existence decision those command implementations consume.
 inline std::expected<OperationContext, int> acquire_operation_context(
     const CliOptions& opts,
-    const std::filesystem::path& operation_lock_path = "/run/lock/sage/operation.lock")
+    const std::filesystem::path& operation_lock_path = "/run/sage/operation.lock")
 {
     auto user = validate_operation_user(sage::util::current_effective_uid());
     if (!user) {

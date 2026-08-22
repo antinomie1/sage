@@ -64,12 +64,12 @@ The state database `/var/lib/sage/data.mdb` uses dedicated named databases (tabl
 ### Package-state operation synchronization
 
 Root-only `install`, `remove`, and `rebuild` use
-`/run/lock/sage/operation.lock` as one host-wide advisory lock. Sage creates a
+`/run/sage/operation.lock` as one host-wide advisory lock. Sage creates a
 root-owned `0700` namespace and `0600` regular file, opens them without following
-symlinks, and validates ownership, type, and mode. The public `/run/lock`
-directory inode is never locked. If `/run/lock` is absent while `/run` exists,
-Sage creates it once as `root:root` mode `0755`; an existing public directory is
-neither modified nor metadata-validated. Preview operations take `LOCK_SH`; real
+symlinks, and validates ownership, type, and mode. The namespace is directly
+beneath root-owned `/run`, so an unprivileged user cannot pre-create it; Sage
+does not create `/run` or use the public `/run/lock` hierarchy. Preview
+operations take `LOCK_SH`; real
 mutations take `LOCK_EX`. The operation lock is held by an RAII descriptor in
 the CLI entry point until the command and all of its LMDB environments have
 returned. This intentionally serializes operations for distinct target roots

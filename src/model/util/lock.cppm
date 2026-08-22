@@ -7,7 +7,7 @@ module;
 #include <cerrno>
 #include <cstring>
 
-export module sage.util:operation_lock;
+export module sage.util:lock;
 
 import std;
 
@@ -72,59 +72,10 @@ public:
         }
 
         bool created_directory = false;
-        int mkdir_errno = 0;
         if (::mkdir(parent.c_str(), 0700) == 0) {
             created_directory = true;
-        } else {
-            mkdir_errno = errno;
-        }
-
-        OperationLock public_directory;
-        if (mkdir_errno == ENOENT) {
-            // /run exists by contract; bootstrap only its missing public lock
-            // directory, never a higher ancestor.
-            const auto public_parent = parent.parent_path();
-            bool created_public_parent = false;
-            if (public_parent.empty()) {
-                return std::unexpected(LockError{LockFailure::Unusable,
-                    "operation lock directory has no parent"});
-            }
-            if (::mkdir(public_parent.c_str(), 0755) == 0) {
-                created_public_parent = true;
-            } else if (errno != EEXIST) {
-                const int parent_errno = errno;
-                return std::unexpected(LockError{LockFailure::Unusable, std::format(
-                    "cannot create operation lock parent directory '{}': {}",
-                    public_parent.string(), std::strerror(parent_errno))});
-            }
-
-            if (created_public_parent) {
-                public_directory.fd_ = ::open(
-                    public_parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-                if (public_directory.fd_ < 0) {
-                    const int open_errno = errno;
-                    return std::unexpected(LockError{LockFailure::Unusable, std::format(
-                        "cannot open operation lock parent directory '{}': {}",
-                        public_parent.string(), std::strerror(open_errno))});
-                }
-                if (::fchown(public_directory.fd_, 0, 0) != 0
-                    || ::fchmod(public_directory.fd_, 0755) != 0) {
-                    const int metadata_errno = errno;
-                    return std::unexpected(LockError{LockFailure::Unusable, std::format(
-                        "cannot secure operation lock parent directory '{}': {}",
-                        public_parent.string(), std::strerror(metadata_errno))});
-                }
-            }
-
-            if (::mkdir(parent.c_str(), 0700) == 0) {
-                created_directory = true;
-            } else if (errno != EEXIST) {
-                const int retry_errno = errno;
-                return std::unexpected(LockError{LockFailure::Unusable, std::format(
-                    "cannot create operation lock directory '{}': {}",
-                    parent.string(), std::strerror(retry_errno))});
-            }
-        } else if (mkdir_errno != 0 && mkdir_errno != EEXIST) {
+        } else if (errno != EEXIST) {
+            const int mkdir_errno = errno;
             return std::unexpected(LockError{LockFailure::Unusable, std::format(
                 "cannot create operation lock directory '{}': {}",
                 parent.string(), std::strerror(mkdir_errno))});

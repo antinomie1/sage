@@ -10,7 +10,7 @@ module;
 export module sage.util;
 
 import std;
-export import :operation_lock;
+export import :lock;
 
 export namespace sage::util {
 

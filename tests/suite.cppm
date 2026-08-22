@@ -2544,6 +2544,15 @@ channel = "system"
     {
         const auto operation_lock_root = temp_dir / "operation-lock-host";
         const auto operation_lock_path = operation_lock_root / "sage/operation.lock";
+        std::filesystem::create_directory(operation_lock_root);
+        std::filesystem::permissions(
+            operation_lock_root,
+            std::filesystem::perms::owner_all
+                | std::filesystem::perms::group_read
+                | std::filesystem::perms::group_exec
+                | std::filesystem::perms::others_read
+                | std::filesystem::perms::others_exec,
+            std::filesystem::perm_options::replace);
 
         auto non_root = validate_operation_user(1000);
         if (non_root || !validate_operation_user(0)) {
@@ -2586,25 +2595,6 @@ channel = "system"
             || lock_metadata->owner_gid != 0
             || lock_metadata->mode != 0600) {
             sage::util::log_error("Operation lock namespace is not securely provisioned");
-            return 1;
-        }
-
-        // An existing public parent is not normalized or validated; 1777 is a
-        // valid host policy even though a newly bootstrapped parent uses 0755.
-        const auto existing_public_root = temp_dir / "existing-public-operation-lock";
-        std::filesystem::create_directory(existing_public_root);
-        std::filesystem::permissions(
-            existing_public_root,
-            std::filesystem::perms::all | std::filesystem::perms::sticky_bit,
-            std::filesystem::perm_options::replace);
-        auto existing_public_lock = sage::util::OperationLock::acquire(
-            existing_public_root / "sage/operation.lock",
-            sage::util::LockMode::Shared);
-        const auto existing_public_metadata = sage::util::snapshot_file_metadata(
-            existing_public_root);
-        if (!existing_public_lock || !existing_public_metadata
-            || existing_public_metadata->mode != 01777) {
-            sage::util::log_error("Existing public lock directory was normalized or rejected");
             return 1;
         }
 
@@ -2652,7 +2642,7 @@ channel = "system"
 
         // Fatal open/flock failures keep their real classification and reason.
         auto missing_lock = sage::util::OperationLock::acquire(
-            temp_dir / "no-such-run/lock/sage/operation.lock",
+            temp_dir / "no-such-run/sage/operation.lock",
             sage::util::LockMode::Shared);
         const auto wrong_lock_root = temp_dir / "wrong-operation-lock-host";
         const auto wrong_lock_file = wrong_lock_root / "operation.lock";
@@ -2679,6 +2669,28 @@ channel = "system"
             || fatal_flock.error().kind != sage::util::LockFailure::Unusable
             || fatal_flock.error().message.find("Input/output") == std::string::npos) {
             sage::util::log_error("Fatal operation-lock errors were reported as contention");
+            return 1;
+        }
+
+        const auto loose_namespace_host = temp_dir / "loose-namespace-host";
+        const auto loose_namespace = loose_namespace_host / "sage";
+        std::filesystem::create_directory(loose_namespace_host);
+        std::filesystem::create_directory(loose_namespace);
+        std::filesystem::permissions(
+            loose_namespace,
+            std::filesystem::perms::owner_all
+                | std::filesystem::perms::group_read
+                | std::filesystem::perms::group_exec
+                | std::filesystem::perms::others_read
+                | std::filesystem::perms::others_exec,
+            std::filesystem::perm_options::replace);
+        auto loose_namespace_lock = sage::util::OperationLock::acquire(
+            loose_namespace / "operation.lock", sage::util::LockMode::Shared);
+        if (loose_namespace_lock
+            || loose_namespace_lock.error().kind != sage::util::LockFailure::Unusable
+            || loose_namespace_lock.error().message.find("mode 0700 directory")
+                == std::string::npos) {
+            sage::util::log_error("Insecure operation lock namespace was accepted");
             return 1;
         }
 

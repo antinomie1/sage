@@ -20,14 +20,13 @@ Global Options:
 ```
 
 `install`, `remove`, and `rebuild` require root and serialize package-state
-access on one host lock: `/run/lock/sage/operation.lock`. Sage creates the
+access on one host lock: `/run/sage/operation.lock`. Sage creates the
 namespace as `root:root` mode `0700` and the file as `root:root` mode `0600`,
 then validates ownership, type, and mode before locking. Dry-runs take a shared
 advisory lock and real mutations take an exclusive lock; operations for
-different target roots therefore also serialize. The public `/run/lock`
-directory inode is never locked. When `/run` exists but `/run/lock` does not,
-Sage creates that one missing parent as `root:root` mode `0755`; an existing
-public directory is left unchanged, including a valid mode such as `1777`.
+different target roots therefore also serialize. The root-owned `/run` parent
+prevents unprivileged namespace pre-creation; Sage neither creates `/run` nor
+uses the public `/run/lock` hierarchy.
 
 A dry-run probes the target root and database exactly once after locking. An
 absent database is modeled as empty for install, is a no-op for remove, and is
