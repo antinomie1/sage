@@ -25,7 +25,9 @@ namespace as `root:root` mode `0700` and the file as `root:root` mode `0600`,
 then validates ownership, type, and mode before locking. Dry-runs take a shared
 advisory lock and real mutations take an exclusive lock; operations for
 different target roots therefore also serialize. The public `/run/lock`
-directory inode is never locked.
+directory inode is never locked. When `/run` exists but `/run/lock` does not,
+Sage creates that one missing parent as `root:root` mode `0755`; an existing
+public directory is left unchanged, including a valid mode such as `1777`.
 
 A dry-run probes the target root and database exactly once after locking. An
 absent database is modeled as empty for install, is a no-op for remove, and is
