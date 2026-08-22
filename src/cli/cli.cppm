@@ -121,8 +121,20 @@ inline std::expected<util::RootLock, int> acquire_root_write_lock(const CliOptio
         return std::unexpected(1);
     }
     const auto lock_path = cfg_res->db_path.parent_path() / "lock";
+
+    // A target root that has never been installed into has no <db_dir> yet, and
+    // the very commands taking this lock are about to create the database there
+    // anyway. Without this, a first `--root` install fails before it starts.
+    std::error_code ec;
+    std::filesystem::create_directories(lock_path.parent_path(), ec);
+
     auto lock = sage::util::RootLock::acquire(lock_path, opts.wait_seconds);
     if (!lock) {
+        if (lock.error().kind != sage::util::LockFailure::Busy) {
+            sage::util::log_error("cannot lock target root '{}': {}",
+                cfg_res->root_dir.string(), lock.error().message);
+            return std::unexpected(1);
+        }
         int holder = 0;
         if (std::ifstream f(lock_path); f.is_open()) (void)(f >> holder);
         sage::util::log_error("another sage instance (pid {}) is operating on '{}'; retry once it finishes",
