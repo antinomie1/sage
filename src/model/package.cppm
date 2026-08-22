@@ -122,6 +122,35 @@ struct Version {
     }
 };
 
+// Releases participate in monotonic publication identity selection, so their
+// textual representation is intentionally narrower than upstream versions.
+// Keep the parser here so recipes, manifests, and repository indexes enforce
+// exactly the same positive-decimal contract.
+inline std::expected<uint64_t, std::string> parse_release(std::string_view release) {
+    uint64_t value = 0;
+    if (release.empty()) return std::unexpected("Release must be a positive decimal integer");
+    auto [end, error] = std::from_chars(release.data(), release.data() + release.size(), value);
+    if (error != std::errc{} || end != release.data() + release.size() || value == 0) {
+        return std::unexpected(std::format(
+            "Invalid release '{}' (expected a positive decimal integer)", release));
+    }
+    return value;
+}
+
+inline std::expected<std::string, std::string> parse_release_field(
+    const vendor::toml::table& table,
+    std::string_view fallback = "1")
+{
+    const auto* node = table.get("release");
+    if (!node) return std::string(fallback);
+    auto release = node->value<std::string_view>();
+    if (!release) return std::unexpected("Release must be a TOML string when present");
+    if (auto parsed = parse_release(*release); !parsed) {
+        return std::unexpected(parsed.error());
+    }
+    return std::string(*release);
+}
+
 // ============================================================================
 // Dependency Model
 // ============================================================================
@@ -516,9 +545,9 @@ struct PackageManifest {
             m.name = (*pkg)["name"].value_or("");
             std::string ver_str = std::string((*pkg)["version"].value_or(""));
             m.version = Version::parse(ver_str);
-            if (auto release = (*pkg)["release"].value<std::string_view>()) {
-                m.version.rel = std::string(*release);
-            }
+            auto release = parse_release_field(*pkg, m.version.rel);
+            if (!release) return std::unexpected(release.error());
+            m.version.rel = std::move(*release);
             if (auto epoch = (*pkg)["epoch"].value<long long>()) {
                 if (*epoch < 0
                     || static_cast<unsigned long long>(*epoch)
@@ -821,7 +850,9 @@ struct Recipe {
             r.name = (*pkg)["name"].value_or("");
             std::string ver_str = std::string((*pkg)["version"].value_or(""));
             r.version = Version::parse(ver_str);
-            r.version.rel = std::string((*pkg)["release"].value_or("1"));
+            auto release = parse_release_field(*pkg);
+            if (!release) return std::unexpected(release.error());
+            r.version.rel = std::move(*release);
             r.description = (*pkg)["description"].value_or("");
             r.license = (*pkg)["license"].value_or("");
             r.channel = (*pkg)["channel"].value_or("system");

@@ -165,17 +165,26 @@ export int cmd_build(const CliOptions& opts) {
             return 1;
         }
         for (const auto& package : published->available_packages) {
-            if (package.name != r.name || package.version.ver != r.version.ver) continue;
-            std::uint64_t release = 0;
-            auto text = std::string_view(package.version.rel);
-            auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), release);
-            if (error != std::errc{} || end != text.data() + text.size()) continue;
-            highest_published_release = std::max(highest_published_release, release);
+            if (package.name != r.name
+                || package.channel != r.channel
+                || package.version.epoch != r.version.epoch
+                || package.version.ver != r.version.ver) continue;
+            auto release = sage::package::parse_release(package.version.rel);
+            if (!release) continue;  // Channel parsing already rejects this; defensive for constructed indexes.
+            highest_published_release = std::max(highest_published_release, *release);
             has_published_release = true;
         }
     }
     if (has_published_release) {
-        r.version.rel = std::format("{}", highest_published_release + 1);
+        if (highest_published_release == std::numeric_limits<std::uint64_t>::max()) {
+            sage::util::log_error(
+                "Published release range exhausted for package '{}' in channel '{}' at epoch {} version '{}': highest published release is UINT64_MAX",
+                r.name, r.channel, r.version.epoch, r.version.ver);
+            return 1;
+        }
+        auto declared_release = sage::package::parse_release(r.version.rel);
+        r.version.rel = std::format("{}", std::max(
+            *declared_release, highest_published_release + 1));
     }
     sage::util::log_info("Building package '{}' version {} (channel: {})...", r.name, r.version.to_string(), r.channel);
 

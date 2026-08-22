@@ -83,6 +83,44 @@ export int run_all() {
         sage::util::log_error("Missing required trigger executable was treated as success");
         return 1;
     }
+
+    auto trigger_sysroot = std::filesystem::temp_directory_path() / "sage_trigger_symlink_test";
+    std::filesystem::remove_all(trigger_sysroot);
+    std::filesystem::create_directories(trigger_sysroot / "usr/bin");
+    std::filesystem::create_directories(trigger_sysroot / "usr/libexec");
+    std::ofstream(trigger_sysroot / "usr/libexec/real-trigger") << "fixture\n";
+    std::filesystem::create_symlink(
+        "/usr/libexec/real-trigger", trigger_sysroot / "usr/bin/absolute-trigger");
+    std::filesystem::create_symlink(
+        "../libexec/real-trigger", trigger_sysroot / "usr/bin/relative-trigger");
+    std::filesystem::create_symlink(
+        "../../../usr/libexec/real-trigger", trigger_sysroot / "usr/bin/clamped-trigger");
+    std::filesystem::create_symlink(
+        "/usr/libexec/missing-trigger", trigger_sysroot / "usr/bin/dangling-trigger");
+    failing_trigger_context.sysroot = trigger_sysroot;
+    failing_trigger_context.dry_run = true;
+    for (std::string_view executable : {
+             "/usr/bin/absolute-trigger", "/usr/bin/relative-trigger",
+             "/usr/bin/clamped-trigger"}) {
+        failing_trigger_package.triggers.front().name = "sysroot-symlink-trigger";
+        failing_trigger_package.triggers.front().exec = executable;
+        failing_trigger_context.installed_packages = {failing_trigger_package};
+        if (auto result = sage::rebuild::TriggerEngine::run(failing_trigger_context); !result) {
+            sage::util::log_error(
+                "Target-root trigger symlink '{}' was not resolved: {}", executable, result.error());
+            return 1;
+        }
+    }
+    failing_trigger_package.triggers.front().name = "dangling-sysroot-trigger";
+    failing_trigger_package.triggers.front().exec = "/usr/bin/dangling-trigger";
+    failing_trigger_context.installed_packages = {failing_trigger_package};
+    auto dangling_trigger_result = sage::rebuild::TriggerEngine::run(failing_trigger_context);
+    if (dangling_trigger_result
+        || dangling_trigger_result.error().find("Required executable") == std::string::npos) {
+        sage::util::log_error("Dangling target-root trigger symlink was treated as executable");
+        return 1;
+    }
+    std::filesystem::remove_all(trigger_sysroot);
     sage::util::log_success("1. Semantic & Alphanum Version Comparator OK");
 
     // 2. Tar+Zstd Archive Packaging & Streaming Extractor Test
@@ -896,6 +934,106 @@ version = "1:2.0-3"
         || embedded_epoch_index->available_packages.front().version.epoch != 1
         || embedded_epoch_index->available_packages.front().version.rel != "3") {
         sage::util::log_error("Embedded version epoch/release was not preserved");
+        return 1;
+    }
+
+    auto absent_release_manifest = sage::package::PackageManifest::parse_toml(R"(
+schema_version = 1
+[package]
+name = "absent-release"
+version = "1.0"
+)");
+    auto absent_release_recipe = sage::package::Recipe::parse_toml(R"(
+schema_version = 1
+[package]
+name = "absent-release"
+version = "1.0"
+)");
+    auto absent_release_index = sage::channel::ChannelIndex::parse_toml(R"(
+schema_version = 1
+[channel]
+name = "core"
+[[packages]]
+name = "absent-release"
+version = "1.0"
+)");
+    if (!absent_release_manifest || absent_release_manifest->version.rel != "1"
+        || !absent_release_recipe || absent_release_recipe->version.rel != "1"
+        || !absent_release_index || absent_release_index->available_packages.size() != 1
+        || absent_release_index->available_packages.front().version.rel != "1") {
+        sage::util::log_error("Absent release did not default to one");
+        return 1;
+    }
+
+    for (std::string_view wrong_type : {"0", "1", "false"}) {
+        auto manifest = sage::package::PackageManifest::parse_toml(std::format(R"(
+schema_version = 1
+[package]
+name = "wrong-release-type"
+version = "1.0"
+release = {}
+)", wrong_type));
+        auto recipe = sage::package::Recipe::parse_toml(std::format(R"(
+schema_version = 1
+[package]
+name = "wrong-release-type"
+version = "1.0"
+release = {}
+)", wrong_type));
+        auto index = sage::channel::ChannelIndex::parse_toml(std::format(R"(
+schema_version = 1
+[channel]
+name = "core"
+[[packages]]
+name = "wrong-release-type"
+version = "1.0"
+release = {}
+)", wrong_type));
+        if (manifest || recipe || index) {
+            sage::util::log_error(
+                "Package, recipe, or channel parser accepted wrong-typed release {}", wrong_type);
+            return 1;
+        }
+    }
+
+    for (std::string_view invalid : {"0", "alpha", "1x", "-1"}) {
+        auto manifest = sage::package::PackageManifest::parse_toml(std::format(R"(
+schema_version = 1
+[package]
+name = "bad-release"
+version = "1.0"
+release = "{}"
+)", invalid));
+        auto recipe = sage::package::Recipe::parse_toml(std::format(R"(
+schema_version = 1
+[package]
+name = "bad-release"
+version = "1.0"
+release = "{}"
+)", invalid));
+        auto index = sage::channel::ChannelIndex::parse_toml(std::format(R"(
+schema_version = 1
+[channel]
+name = "core"
+[[packages]]
+name = "bad-release"
+version = "1.0"
+release = "{}"
+)", invalid));
+        if (manifest || recipe || index) {
+            sage::util::log_error("Package, recipe, or channel parser accepted invalid release '{}'", invalid);
+            return 1;
+        }
+    }
+    auto positive_release_recipe = sage::package::Recipe::parse_toml(R"(
+schema_version = 1
+[package]
+name = "positive-release"
+version = "1.0"
+release = "10"
+)");
+    if (!positive_release_recipe || positive_release_recipe->version.rel != "10") {
+        sage::util::log_error("Recipe parser rejected a positive decimal release");
         return 1;
     }
 
@@ -2116,7 +2254,7 @@ version = "1:2.0-3"
     lib_recipe << R"(schema_version = 1
 [package]
 name = "libsample"
-version = "1.2.0"
+version = "2:2.0"
 release = "1"
 description = "Sample dynamic library"
 license = "MIT"
@@ -2165,8 +2303,15 @@ install = [
     std::ofstream(recipedia_root / "etc/sage/channels.toml")
         << "schema_version = 1\n[[channels]]\nname = \"core\"\nurl = \"file://"
         << recipedia.string() << "\"\nenabled = true\n";
-    if (!publish_index("")) {
-        sage::util::log_error("Failed to create empty Recipedia fixture");
+    if (!publish_index(R"(
+[[packages]]
+name = "libsample"
+version = "2.0"
+release = "20"
+epoch = 2
+channel = "toolchain/foo"
+)")) {
+        sage::util::log_error("Failed to create cross-channel Recipedia fixture");
         return 1;
     }
     CliOptions build_lib_opts;
@@ -2176,31 +2321,44 @@ install = [
         sage::util::log_error("Failed to build libsample");
         return 1;
     }
-    // A local artifact is not a publication. Rebuilding against an empty
-    // Recipedia index must retain the recipe's release and may replace it.
+    // A package published in another package channel is not this identity,
+    // and the local artifact is not a publication. Rebuilding must therefore
+    // retain the recipe's release and may replace the local archive.
     if (cmd_build(build_lib_opts) != 0) {
         sage::util::log_error("Failed to rebuild unpublished local libsample");
         return 1;
     }
     auto local_rebuild = sage::archive::inspect_package(
-        build_test_dir / "libsample/libsample-1.2.0-1-x86_64.pkg.tar.zst");
+        build_test_dir / "libsample/libsample-2.0-1-x86_64.pkg.tar.zst");
     if (!local_rebuild || local_rebuild->manifest.version.rel != "1") {
-        sage::util::log_error("Local archive incorrectly advanced an unpublished release");
+        sage::util::log_error("Local or cross-channel publication incorrectly advanced the system release");
         return 1;
     }
     if (!publish_index(R"(
 [[packages]]
 name = "libsample"
-version = "1.2.0"
+version = "2.0"
 release = "1"
+epoch = 2
+channel = "system"
 [[packages]]
 name = "libsample"
-version = "1.2.0"
+version = "2.0"
 release = "3"
+epoch = 2
+channel = "system"
 [[packages]]
 name = "libsample"
-version = "1.2.0"
+version = "2.0"
 release = "2"
+epoch = 2
+channel = "system"
+[[packages]]
+name = "libsample"
+version = "2.0"
+release = "99"
+epoch = 1
+channel = "system"
 )")) {
         sage::util::log_error("Failed to publish Recipedia release fixtures");
         return 1;
@@ -2210,9 +2368,50 @@ release = "2"
         return 1;
     }
     auto rebuilt_lib = sage::archive::inspect_package(
-        build_test_dir / "libsample/libsample-1.2.0-4-x86_64.pkg.tar.zst");
+        build_test_dir / "libsample/libsample-2.0-4-x86_64.pkg.tar.zst");
     if (!rebuilt_lib || rebuilt_lib->manifest.version.rel != "4") {
         sage::util::log_error("Rebuild did not advance beyond the highest published release");
+        return 1;
+    }
+
+    // A packager may intentionally skip releases. Published 2:2.0-1..3 must
+    // not pull an explicitly declared 2:2.0-10 backwards to release 4.
+    {
+        std::ifstream recipe_in(build_test_dir / "libsample/recipe.toml");
+        std::stringstream recipe_text;
+        recipe_text << recipe_in.rdbuf();
+        auto updated = recipe_text.str();
+        auto release = updated.find("release = \"1\"");
+        if (release == std::string::npos) {
+            sage::util::log_error("Failed to locate declared release in libsample fixture");
+            return 1;
+        }
+        updated.replace(release, std::string_view("release = \"1\"").size(), "release = \"10\"");
+        std::ofstream(build_test_dir / "libsample/recipe.toml") << updated;
+    }
+    if (cmd_build(build_lib_opts) != 0) {
+        sage::util::log_error("Failed to build explicitly higher libsample release");
+        return 1;
+    }
+    auto declared_lib = sage::archive::inspect_package(
+        build_test_dir / "libsample/libsample-2.0-10-x86_64.pkg.tar.zst");
+    if (!declared_lib || declared_lib->manifest.version.rel != "10") {
+        sage::util::log_error("Published release lookup regressed an explicitly higher recipe release");
+        return 1;
+    }
+    if (!publish_index(R"(
+[[packages]]
+name = "libsample"
+version = "2.0"
+release = "18446744073709551615"
+epoch = 2
+channel = "system"
+)")) {
+        sage::util::log_error("Failed to publish exhausted release fixture");
+        return 1;
+    }
+    if (cmd_build(build_lib_opts) == 0) {
+        sage::util::log_error("UINT64_MAX published release wrapped or reused a package identity");
         return 1;
     }
 
@@ -2239,8 +2438,8 @@ release = "2"
         return true;
     };
 
-    if (!stage_package(build_test_dir / "libsample/libsample-1.2.0-1-x86_64.pkg.tar.zst",
-                       build_test_dir / "repo/libsample-1.2.0-1-x86_64.pkg.tar.zst")) {
+    if (!stage_package(build_test_dir / "libsample/libsample-2.0-1-x86_64.pkg.tar.zst",
+                       build_test_dir / "repo/libsample-2.0-1-x86_64.pkg.tar.zst")) {
         return 1;
     }
     if (!stage_package(build_test_dir / "sample-app/sample-app-2.0.0-1-x86_64.pkg.tar.zst",

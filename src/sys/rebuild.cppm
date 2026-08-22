@@ -312,7 +312,8 @@ private:
     {
         std::string exec_path = cmd.substr(0, cmd.find(' '));
         auto within_root = [&](std::filesystem::path path) {
-            path = path.relative_path();
+            path = (std::filesystem::path("/") / path.relative_path())
+                       .lexically_normal().relative_path();
             for (unsigned links = 0; links < 40; ++links) {
                 std::filesystem::path resolved;
                 bool followed = false;
@@ -328,10 +329,11 @@ private:
                     for (auto rest = std::next(component); rest != path.end(); ++rest) {
                         remainder /= *rest;
                     }
-                    path = (target.is_absolute() ? target.relative_path()
-                                                 : resolved.parent_path() / target)
-                         / remainder;
-                    path = path.lexically_normal();
+                    path = target.is_absolute() ? target.relative_path()
+                                                : resolved.parent_path() / target;
+                    if (!remainder.empty()) path /= remainder;
+                    path = (std::filesystem::path("/") / path)
+                               .lexically_normal().relative_path();
                     followed = true;
                     break;
                 }
