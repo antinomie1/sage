@@ -2198,6 +2198,12 @@ cflags = "-O3 -march=x86-64-v3"
             sage::util::log_error("BuildConfig defaults or shipped-default parse drifted");
             return 1;
         }
+        // Explicit job count parses through; absence stays auto (0 = nproc).
+        auto jobs_cfg = sage::config::BuildConfig::parse_toml("jobs = 4\n");
+        if (!jobs_cfg || jobs_cfg->jobs != 4 || empty_cfg->jobs != 0) {
+            sage::util::log_error("BuildConfig jobs parsing drifted");
+            return 1;
+        }
 
         auto write_build_toml = [&](const std::filesystem::path& root, std::string_view body) {
             std::filesystem::create_directories(root / "etc/sage");
@@ -2372,6 +2378,37 @@ install = [
             || !plain->build_cflags.empty() || !plain->build_cxxflags.empty()
             || !plain->build_ldflags.empty()) {
             sage::util::log_error("A compiler-free package must not carry build provenance");
+            return 1;
+        }
+
+        // (e) The job count reaches the phase shells as MAKEFLAGS="-jN" and
+        // CARGO_BUILD_JOBS="N"; unset in build.toml means one per hardware
+        // thread.
+        const unsigned expect_jobs = std::max(1u, std::thread::hardware_concurrency());
+        auto job_dir = temp_dir / "bcfg-jobs";
+        if (!write_canary_recipe(job_dir, R"(schema_version = 1
+[package]
+name = "jobcanary"
+version = "1.0.0"
+release = "1"
+description = "build-config jobs canary"
+license = "MIT"
+channel = "system"
+install = [
+    'mkdir -p "$DESTDIR/usr/share"',
+    'printf "%s" "$MAKEFLAGS" > "$DESTDIR/usr/share/makeflags.txt"',
+    'printf "%s" "$CARGO_BUILD_JOBS" > "$DESTDIR/usr/share/cargojobs.txt"',
+]
+)")) {
+            sage::util::log_error("Failed to create jobs canary fixture");
+            return 1;
+        }
+        auto jobcanary = build_with_root(job_dir, canary_root, temp_dir / "bcfg-jobs-x",
+                                         "jobcanary-1.0.0-1-x86_64.pkg.tar.zst");
+        if (!jobcanary
+            || read_text(temp_dir / "bcfg-jobs-x/usr/share/makeflags.txt") != std::format("-j{}", expect_jobs)
+            || read_text(temp_dir / "bcfg-jobs-x/usr/share/cargojobs.txt") != std::to_string(expect_jobs)) {
+            sage::util::log_error("MAKEFLAGS/CARGO_BUILD_JOBS did not carry the configured job count");
             return 1;
         }
 

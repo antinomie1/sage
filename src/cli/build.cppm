@@ -156,6 +156,13 @@ export int cmd_build(const CliOptions& opts) {
                                    : !bcfg.cxxflags.empty() ? bcfg.cxxflags
                                    : bcfg.cflags;
 
+    // Parallelism for the phase shells: an explicit build.toml `jobs`, else
+    // one per hardware thread. MAKEFLAGS reaches make-based recipes,
+    // CARGO_BUILD_JOBS the cargo ones.
+    const unsigned jobs = bcfg.jobs > 0 ? static_cast<unsigned>(bcfg.jobs)
+                                        : std::max(1u, std::thread::hardware_concurrency());
+    const std::string jobs_makeflags = std::format("-j{}", jobs);
+
     // Candidate toolchains in priority order: the configured pair first, the
     // fallback pair second. Each is probed once up front -- `<cc> --version`
     // doubles as the existence check; what ends up stamped is derived from
@@ -285,8 +292,10 @@ export int cmd_build(const CliOptions& opts) {
             for (const auto& cmd_line : cmds) {
                 std::string full_cmd = std::format(
                     "export CC=\"{}\" CXX=\"{}\" CPPFLAGS=\"{}\" CFLAGS=\"{}\" CXXFLAGS=\"{}\" LDFLAGS=\"{}\" "
+                    "MAKEFLAGS=\"{}\" CARGO_BUILD_JOBS=\"{}\" "
                     "DESTDIR=\"{}\" PREFIX=\"/usr\" RECIPE_DIR=\"{}\" SRCDIR=\"{}\" PKGDIR=\"{}\"; cd \"{}\" && {}",
                     cand.cc, cand.cxx, bcfg.cppflags, eff_cflags, eff_cxxflags, bcfg.ldflags,
+                    jobs_makeflags, jobs,
                     pkg_dir.string(), recipe_dir.string(), src_dir.string(), pkg_dir.string(),
                     work_dir.string(), cmd_line);
                 int ret = std::system(full_cmd.c_str());

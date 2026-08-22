@@ -86,6 +86,9 @@ struct BuildConfig {
     std::string cxxflags;
     std::string cppflags;
     std::string ldflags;
+    // Parallel job count injected as MAKEFLAGS/CARGO_BUILD_JOBS. 0 (the
+    // default) means auto: one job per hardware thread.
+    int jobs{0};
 
     bool operator==(const BuildConfig&) const = default;
 
@@ -104,6 +107,7 @@ struct BuildConfig {
         if (auto v = tbl["cxxflags"].value<std::string_view>()) cfg.cxxflags = std::string(*v);
         if (auto v = tbl["cppflags"].value<std::string_view>()) cfg.cppflags = std::string(*v);
         if (auto v = tbl["ldflags"].value<std::string_view>()) cfg.ldflags = std::string(*v);
+        cfg.jobs = static_cast<int>(tbl["jobs"].value_or(0LL));
         return cfg;
     }
 };
