@@ -121,8 +121,26 @@ inline std::expected<util::RootLock, int> acquire_root_write_lock(const CliOptio
         return std::unexpected(1);
     }
     const auto lock_path = cfg_res->db_path.parent_path() / "lock";
+
+    if (!opts.dry_run) {
+        // A real first operation will create the database in this directory;
+        // callers should not have to pre-seed Sage's internal state path.
+        std::error_code ec;
+        std::filesystem::create_directories(lock_path.parent_path(), ec);
+        if (ec) {
+            sage::util::log_error("cannot create lock directory '{}': {}",
+                lock_path.parent_path().string(), ec.message());
+            return std::unexpected(1);
+        }
+    }
+
     auto lock = sage::util::RootLock::acquire(lock_path, opts.wait_seconds);
     if (!lock) {
+        if (lock.error().kind != sage::util::LockFailure::Busy) {
+            sage::util::log_error("cannot lock target root '{}': {}",
+                cfg_res->root_dir.string(), lock.error().message);
+            return std::unexpected(1);
+        }
         int holder = 0;
         if (std::ifstream f(lock_path); f.is_open()) (void)(f >> holder);
         sage::util::log_error("another sage instance (pid {}) is operating on '{}'; retry once it finishes",

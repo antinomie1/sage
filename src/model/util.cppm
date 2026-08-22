@@ -195,6 +195,17 @@ inline long current_pid() {
     return static_cast<long>(::getpid());
 }
 
+// Why a root lock could not be taken. Contention is the only failure a caller
+// can tell the user to wait out; everything else means the lock file itself was
+// unusable, and saying "another instance holds it" would send them looking for
+// a process that does not exist.
+enum class LockFailure { Busy, Unusable };
+
+struct LockError {
+    LockFailure kind{LockFailure::Unusable};
+    std::string message;  // empty for Busy: the caller reads the holder's pid
+};
+
 // Advisory exclusive lock serializing state-changing commands against a
 // second sage instance on the same target root. The flock lives on an open fd,
 // so the kernel releases it when the process dies -- no stale-lock cleanup
@@ -202,29 +213,38 @@ inline long current_pid() {
 // a rejected instance can name it.
 class RootLock {
 public:
-    static std::expected<RootLock, std::string> acquire(
+    static std::expected<RootLock, LockError> acquire(
         const std::filesystem::path& path, int wait_seconds = 0) {
-        int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-        if (fd < 0) {
-            return std::unexpected(std::format(
-                "cannot open lock file '{}': {}", path.string(), std::strerror(errno)));
+        RootLock lock;
+        lock.fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+        if (lock.fd_ < 0) {
+            return std::unexpected(LockError{LockFailure::Unusable, std::format(
+                "cannot open lock file '{}': {}", path.string(), std::strerror(errno))});
         }
-        auto locked = [&] { return ::flock(fd, LOCK_EX | LOCK_NB) == 0; };
-        if (!locked() && wait_seconds > 0) {
+
+        auto try_lock = [&]() -> std::expected<bool, LockError> {
+            if (::flock(lock.fd_, LOCK_EX | LOCK_NB) == 0) return true;
+            const int lock_errno = errno;
+            if (lock_errno == EWOULDBLOCK || lock_errno == EAGAIN) return false;
+            return std::unexpected(LockError{LockFailure::Unusable, std::format(
+                "cannot lock file '{}': {}", path.string(), std::strerror(lock_errno))});
+        };
+
+        auto locked = try_lock();
+        if (!locked) return std::unexpected(std::move(locked.error()));
+        if (!*locked && wait_seconds > 0) {
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(wait_seconds);
-            while (!locked() && std::chrono::steady_clock::now() < deadline) {
+            while (!*locked && std::chrono::steady_clock::now() < deadline) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                locked = try_lock();
+                if (!locked) return std::unexpected(std::move(locked.error()));
             }
         }
-        if (!locked()) {
-            ::close(fd);
-            return std::unexpected("busy");
-        }
+        if (!*locked) return std::unexpected(LockError{LockFailure::Busy, {}});
+
         const auto pid = std::format("{}\n", static_cast<long>(getpid()));
-        (void)!::ftruncate(fd, 0);
-        (void)!::write(fd, pid.c_str(), pid.size());
-        RootLock lock;
-        lock.fd_ = fd;
+        (void)!::ftruncate(lock.fd_, 0);
+        (void)!::write(lock.fd_, pid.c_str(), pid.size());
         return lock;
     }
 

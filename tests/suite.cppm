@@ -2551,7 +2551,7 @@ channel = "system"
             return 1;
         }
         auto second = sage::util::RootLock::acquire(lock_path);
-        if (second || second.error() != "busy") {
+        if (second || second.error().kind != sage::util::LockFailure::Busy) {
             sage::util::log_error("A second root write lock was granted while one is held");
             return 1;
         }
@@ -2564,6 +2564,31 @@ channel = "system"
         auto reacquired = sage::util::RootLock::acquire(lock_path);
         if (!reacquired) {
             sage::util::log_error("Root write lock was not reacquirable after release");
+            return 1;
+        }
+
+        // An unopenable lock path is not contention. Reporting it as such sends
+        // the user hunting for a process that does not exist, so the failure
+        // must carry the real reason instead of the wait-and-retry advice.
+        auto missing = sage::util::RootLock::acquire(temp_dir / "no-such-dir" / "lock");
+        if (missing || missing.error().kind != sage::util::LockFailure::Unusable) {
+            sage::util::log_error("A lock path under a missing directory was not reported as unusable");
+            return 1;
+        }
+        if (missing.error().message.find("cannot open lock file") == std::string::npos) {
+            sage::util::log_error("Unusable lock error does not carry the underlying reason");
+            return 1;
+        }
+
+        // A real first operation creates its own package-state directory
+        // before locking it; callers do not need to pre-seed var/lib/sage.
+        CliOptions fresh_root;
+        fresh_root.target_root = temp_dir / "fresh-lock-root";
+        auto fresh_lock = acquire_root_write_lock(fresh_root);
+        if (!fresh_lock
+            || !std::filesystem::is_regular_file(
+                fresh_root.target_root / "var/lib/sage/lock")) {
+            sage::util::log_error("A fresh target root could not initialize its write lock");
             return 1;
         }
     }
