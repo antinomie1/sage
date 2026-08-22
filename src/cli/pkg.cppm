@@ -448,7 +448,24 @@ export int cmd_install(
             }
             const auto& old_owner = *previous_owner;
             for (const auto& old_path : previous_paths) {
-                if (new_paths.contains(old_path)) continue;
+                // Compare in the canonicalized domain: a legacy claim spelled
+                // usr/sbin/iconvconfig denotes the same physical file the new
+                // payload installs as usr/bin/iconvconfig. Such claims are
+                // released from the registry but their (freshly extracted)
+                // files stay put.
+                auto canonical_old = sage::archive::canonicalize_merge_claim(old_path);
+                if (!canonical_old || new_paths.contains(*canonical_old)) {
+                    sage::package::FileEntry fe;
+                    fe.path = old_path;
+                    fe.type = !canonical_old
+                        || (old_types.contains(old_path)
+                            && old_types.at(old_path) == sage::package::FileType::Directory)
+                        ? sage::package::FileType::Directory
+                        : sage::package::FileType::Regular;
+                    stale_claims.push_back(fe);
+                    package_touched_files.push_back(std::move(fe));
+                    continue;
+                }
                 auto owners = db.get_path_owners(*package_txn, old_path);
                 if (!owners) {
                     sage::util::log_error(

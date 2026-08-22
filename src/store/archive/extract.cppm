@@ -40,7 +40,8 @@ inline std::expected<std::string, bool> canonicalize_merge_claim(std::string_vie
         {"lib", "usr/lib"},
     }};
     for (const auto& [from, to] : aliases) {
-        if (path == from) return std::string{};
+        // A claim naming exactly a merge point maps to nothing deletable.
+        if (path == from) return std::unexpected(true);
         const auto prefix = std::format("{}/", from);
         if (path.starts_with(prefix))
             return std::format("{}/{}", to, path.substr(prefix.size()));
