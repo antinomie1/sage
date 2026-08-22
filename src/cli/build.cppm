@@ -105,8 +105,13 @@ constexpr std::streamoff kSlabBytes = 1 << 20;
 constexpr size_t kFrameLead = 4u << 20;
 
 void scan_producers(Provenance& prov, std::string_view window) {
-    static constexpr std::pair<std::string_view, std::string_view> SIGS[] = {
-        {"clang version", "clang"}, {"GCC: (", "gcc"}, {"rustc version", "rustc"},
+    // The needles assemble at runtime: a spelled-out "clang version" literal
+    // would live in sage's own .rodata, and scanning a sage binary would
+    // then prove sage was built by clang, gcc AND rustc at once.
+    static const std::vector<std::pair<std::string, std::string_view>> SIGS = {
+        {std::string("clang vers") + "ion", "clang"},
+        {std::string("GC") + "C: (", "gcc"},
+        {std::string("rustc vers") + "ion", "rustc"},
     };
     for (const auto& [sig, name] : SIGS) {
         const size_t at = window.find(sig);
