@@ -200,6 +200,9 @@ struct FileMetadataSnapshot {
     std::uintmax_t size{0};
     std::int64_t mtime_nanoseconds{0};
     std::int64_t ctime_nanoseconds{0};
+    std::uint32_t owner_uid{0};
+    std::uint32_t owner_gid{0};
+    std::uint32_t mode{0};
     bool operator==(const FileMetadataSnapshot&) const = default;
 };
 
@@ -218,7 +221,14 @@ inline std::expected<FileMetadataSnapshot, std::string> snapshot_file_metadata(
             + info.st_mtim.tv_nsec,
         .ctime_nanoseconds = static_cast<std::int64_t>(info.st_ctim.tv_sec) * 1'000'000'000
             + info.st_ctim.tv_nsec,
+        .owner_uid = static_cast<std::uint32_t>(info.st_uid),
+        .owner_gid = static_cast<std::uint32_t>(info.st_gid),
+        .mode = static_cast<std::uint32_t>(info.st_mode & 07777),
     };
+}
+
+inline std::uint32_t current_effective_uid() {
+    return static_cast<std::uint32_t>(::geteuid());
 }
 
 // Contention is the only lock failure a caller can wait out. Open and flock
@@ -231,9 +241,9 @@ struct LockError {
     std::string message;
 };
 
-// Host-wide operation lock. Sage flocks the existing /run/lock directory inode
-// and never creates or modifies a lock file. The fd enters this RAII owner
-// immediately after open(), so every return path releases it.
+// Host-wide operation lock. The parent namespace and lock file are root-only;
+// the public /run/lock directory inode is never itself locked. Every successful
+// open enters an RAII owner before validation or flock.
 class OperationLock {
 public:
     using Deadline = std::chrono::steady_clock::time_point;
@@ -268,14 +278,73 @@ public:
         Deadline deadline,
         FlockCall flock_call)
     {
-        OperationLock lock;
-        lock.fd_ = ::open(
-            path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-        if (lock.fd_ < 0) {
+        const auto parent = path.parent_path();
+        const auto filename = path.filename();
+        if (parent.empty() || filename.empty()) {
+            return std::unexpected(LockError{LockFailure::Unusable,
+                "operation lock path must name a file inside a directory"});
+        }
+
+        bool created_directory = false;
+        if (::mkdir(parent.c_str(), 0700) == 0) {
+            created_directory = true;
+        } else if (errno != EEXIST) {
+            const int mkdir_errno = errno;
+            return std::unexpected(LockError{LockFailure::Unusable, std::format(
+                "cannot create operation lock directory '{}': {}",
+                parent.string(), std::strerror(mkdir_errno))});
+        }
+
+        OperationLock directory;
+        directory.fd_ = ::open(
+            parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        if (directory.fd_ < 0) {
             const int open_errno = errno;
             return std::unexpected(LockError{LockFailure::Unusable, std::format(
                 "cannot open operation lock directory '{}': {}",
+                parent.string(), std::strerror(open_errno))});
+        }
+        if (created_directory
+            && (::fchown(directory.fd_, 0, 0) != 0
+                || ::fchmod(directory.fd_, 0700) != 0)) {
+            const int metadata_errno = errno;
+            return std::unexpected(LockError{LockFailure::Unusable, std::format(
+                "cannot secure operation lock directory '{}': {}",
+                parent.string(), std::strerror(metadata_errno))});
+        }
+        if (auto valid = validate_fd(
+                directory.fd_, parent, true, 0700); !valid) {
+            return std::unexpected(std::move(valid.error()));
+        }
+
+        OperationLock lock;
+        lock.fd_ = ::openat(
+            directory.fd_, filename.c_str(),
+            O_RDONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+            0600);
+        bool created_file = lock.fd_ >= 0;
+        if (lock.fd_ < 0 && errno == EEXIST) {
+            lock.fd_ = ::openat(
+                directory.fd_, filename.c_str(),
+                O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+            created_file = false;
+        }
+        if (lock.fd_ < 0) {
+            const int open_errno = errno;
+            return std::unexpected(LockError{LockFailure::Unusable, std::format(
+                "cannot open operation lock file '{}': {}",
                 path.string(), std::strerror(open_errno))});
+        }
+        if (created_file
+            && (::fchown(lock.fd_, 0, 0) != 0
+                || ::fchmod(lock.fd_, 0600) != 0)) {
+            const int metadata_errno = errno;
+            return std::unexpected(LockError{LockFailure::Unusable, std::format(
+                "cannot secure operation lock file '{}': {}",
+                path.string(), std::strerror(metadata_errno))});
+        }
+        if (auto valid = validate_fd(lock.fd_, path, false, 0600); !valid) {
+            return std::unexpected(std::move(valid.error()));
         }
 
         auto try_lock = [&]() -> std::expected<bool, LockError> {
@@ -287,7 +356,7 @@ public:
                 if (lock_errno == EINTR) continue;
                 if (lock_errno == EWOULDBLOCK || lock_errno == EAGAIN) return false;
                 return std::unexpected(LockError{LockFailure::Unusable, std::format(
-                    "cannot lock operation directory '{}': {}",
+                    "cannot lock operation file '{}': {}",
                     path.string(), std::strerror(lock_errno))});
             }
         };
@@ -320,6 +389,35 @@ public:
     ~OperationLock() { if (fd_ >= 0) ::close(fd_); }
 
 private:
+    static std::expected<void, LockError> validate_fd(
+        int fd,
+        const std::filesystem::path& path,
+        bool expect_directory,
+        std::uint32_t expected_mode)
+    {
+        struct stat info {};
+        if (::fstat(fd, &info) != 0) {
+            const int stat_errno = errno;
+            return std::unexpected(LockError{LockFailure::Unusable, std::format(
+                "cannot inspect operation lock '{}': {}",
+                path.string(), std::strerror(stat_errno))});
+        }
+        const bool right_type = expect_directory
+            ? S_ISDIR(info.st_mode)
+            : S_ISREG(info.st_mode);
+        const auto actual_mode = static_cast<std::uint32_t>(info.st_mode & 07777);
+        if (!right_type
+            || info.st_uid != 0
+            || info.st_gid != 0
+            || actual_mode != expected_mode) {
+            return std::unexpected(LockError{LockFailure::Unusable, std::format(
+                "operation lock '{}' must be root:root mode {:04o} {}",
+                path.string(), expected_mode,
+                expect_directory ? "directory" : "regular file")});
+        }
+        return {};
+    }
+
     static std::expected<void, int> call_flock(int fd, int operation) {
         if (::flock(fd, operation) == 0) return {};
         return std::unexpected(errno);

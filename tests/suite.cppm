@@ -2542,10 +2542,17 @@ channel = "system"
 
     // 12. Host operation lock and zero-write dry-run protocol.
     {
-        const auto operation_lock_path = temp_dir / "operation-lock";
-        std::filesystem::create_directory(operation_lock_path);
+        const auto operation_lock_root = temp_dir / "operation-lock-host";
+        const auto operation_lock_path = operation_lock_root / "sage/operation.lock";
+        std::filesystem::create_directory(operation_lock_root);
 
-        // Shared previews coexist, but their directory lock excludes the first
+        auto non_root = validate_operation_user(1000);
+        if (non_root || !validate_operation_user(0)) {
+            sage::util::log_error("Package-state operation root requirement failed");
+            return 1;
+        }
+
+        // Shared previews coexist, but their root-only file lock excludes the first
         // writer just as it excludes an established writer.
         {
             auto shared_a = sage::util::OperationLock::acquire(
@@ -2559,6 +2566,22 @@ channel = "system"
                 sage::util::log_error("SH/SH coexistence or SH-to-EX exclusion failed");
                 return 1;
             }
+        }
+
+        const auto namespace_metadata = sage::util::snapshot_file_metadata(
+            operation_lock_path.parent_path());
+        const auto lock_metadata = sage::util::snapshot_file_metadata(operation_lock_path);
+        if (!namespace_metadata || !lock_metadata
+            || !std::filesystem::is_directory(operation_lock_path.parent_path())
+            || !std::filesystem::is_regular_file(operation_lock_path)
+            || namespace_metadata->owner_uid != 0
+            || namespace_metadata->owner_gid != 0
+            || namespace_metadata->mode != 0700
+            || lock_metadata->owner_uid != 0
+            || lock_metadata->owner_gid != 0
+            || lock_metadata->mode != 0600) {
+            sage::util::log_error("Operation lock namespace is not securely provisioned");
+            return 1;
         }
 
         // An exclusive writer excludes both modes, then release of its fd makes
@@ -2605,9 +2628,15 @@ channel = "system"
 
         // Fatal open/flock failures keep their real classification and reason.
         auto missing_lock = sage::util::OperationLock::acquire(
-            temp_dir / "no-such-operation-lock", sage::util::LockMode::Shared);
-        auto wrong_lock_file = temp_dir / "operation-lock-file";
-        std::ofstream(wrong_lock_file) << "not a directory\n";
+            temp_dir / "no-such-parent/sage/operation.lock",
+            sage::util::LockMode::Shared);
+        const auto wrong_lock_root = temp_dir / "wrong-operation-lock-host";
+        const auto wrong_lock_file = wrong_lock_root / "operation.lock";
+        std::filesystem::create_directory(wrong_lock_root);
+        std::filesystem::permissions(
+            wrong_lock_root, std::filesystem::perms::owner_all,
+            std::filesystem::perm_options::replace);
+        std::filesystem::create_directory(wrong_lock_file);
         auto wrong_lock = sage::util::OperationLock::acquire(
             wrong_lock_file, sage::util::LockMode::Shared);
         auto fatal_flock_call = +[](int, int) -> std::expected<void, int> {
@@ -2624,6 +2653,26 @@ channel = "system"
             || fatal_flock.error().kind != sage::util::LockFailure::Unusable
             || fatal_flock.error().message.find("Input/output") == std::string::npos) {
             sage::util::log_error("Fatal operation-lock errors were reported as contention");
+            return 1;
+        }
+
+        const auto loose_lock_root = temp_dir / "loose-operation-lock-host";
+        const auto loose_lock_file = loose_lock_root / "operation.lock";
+        std::filesystem::create_directory(loose_lock_root);
+        std::filesystem::permissions(
+            loose_lock_root, std::filesystem::perms::owner_all,
+            std::filesystem::perm_options::replace);
+        std::ofstream(loose_lock_file) << "insecure\n";
+        std::filesystem::permissions(
+            loose_lock_file,
+            std::filesystem::perms::owner_read
+                | std::filesystem::perms::owner_write
+                | std::filesystem::perms::group_read
+                | std::filesystem::perms::others_read,
+            std::filesystem::perm_options::replace);
+        if (sage::util::OperationLock::acquire(
+                loose_lock_file, sage::util::LockMode::Shared)) {
+            sage::util::log_error("Insecure operation lock mode was accepted");
             return 1;
         }
 
@@ -2644,6 +2693,26 @@ channel = "system"
             || wrong_type_probe.error().find("wrong file type") == std::string::npos) {
             sage::util::log_error("Database probe error classification failed");
             return 1;
+        }
+
+        // A configured *.mdb name denotes an LMDB environment directory; both
+        // Database::open and the synchronized probe must resolve its real
+        // data.mdb file through the same helper.
+        {
+            const auto configured_db_path = temp_dir / "custom-lmdb/state.mdb";
+            const auto resolved_db_paths = sage::db::resolve_lmdb_paths(configured_db_path);
+            auto custom_db = sage::db::Database::open(configured_db_path);
+            auto custom_probe = probe_package_database(configured_db_path);
+            if (!custom_db || !custom_probe || !*custom_probe
+                || resolved_db_paths.environment != configured_db_path.parent_path()
+                || resolved_db_paths.data_file != configured_db_path.parent_path() / "data.mdb"
+                || resolved_db_paths.lock_file != configured_db_path.parent_path() / "lock.mdb"
+                || std::filesystem::exists(configured_db_path)
+                || !std::filesystem::is_regular_file(resolved_db_paths.data_file)
+                || !std::filesystem::is_regular_file(resolved_db_paths.lock_file)) {
+                sage::util::log_error("Custom LMDB path probe/open resolution diverged");
+                return 1;
+            }
         }
 
         // An absent target can be previewed without creating the root. The held

@@ -9,6 +9,23 @@ export namespace sage::db {
 
 using std::size_t;
 
+struct LmdbPaths {
+    std::filesystem::path environment;
+    std::filesystem::path data_file;
+    std::filesystem::path lock_file;
+};
+
+inline LmdbPaths resolve_lmdb_paths(const std::filesystem::path& configured_path) {
+    auto environment = configured_path.extension() == ".mdb"
+        ? configured_path.parent_path()
+        : configured_path;
+    return LmdbPaths{
+        .environment = environment,
+        .data_file = environment / "data.mdb",
+        .lock_file = environment / "lock.mdb",
+    };
+}
+
 // A files-table value is a newline-separated set of "pkg:channel" owners.
 // Regular files and symlinks always carry exactly one; explicitly declared
 // directories accumulate one claim per installing package, so removing one
@@ -70,11 +87,11 @@ private:
         bool create_path,
         size_t map_size)
     {
-        std::filesystem::path actual_dir = (db_path.extension() == ".mdb") ? db_path.parent_path() : db_path;
+        const auto paths = resolve_lmdb_paths(db_path);
         unsigned int env_flags = read_only ? vendor::lmdb::flag_rdonly : 0;
         if (!use_lmdb_lock) env_flags |= vendor::lmdb::flag_nolock;
         auto env_res = vendor::lmdb::MdbEnv::create(
-            actual_dir, map_size, 32, env_flags, create_path);
+            paths.environment, map_size, 32, env_flags, create_path);
         if (!env_res) return std::unexpected(env_res.error());
 
         Database db;

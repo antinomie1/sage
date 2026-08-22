@@ -63,8 +63,11 @@ The state database `/var/lib/sage/data.mdb` uses dedicated named databases (tabl
 
 ### Package-state operation synchronization
 
-`install`, `remove`, and `rebuild` use the existing Linux `/run/lock` directory
-inode as one host-wide advisory lock. Preview operations take `LOCK_SH`; real
+Root-only `install`, `remove`, and `rebuild` use
+`/run/lock/sage/operation.lock` as one host-wide advisory lock. Sage creates a
+root-owned `0700` namespace and `0600` regular file, opens them without following
+symlinks, and validates ownership, type, and mode. The public `/run/lock`
+directory inode is never locked. Preview operations take `LOCK_SH`; real
 mutations take `LOCK_EX`. The operation lock is held by an RAII descriptor in
 the CLI entry point until the command and all of its LMDB environments have
 returned. This intentionally serializes operations for distinct target roots
@@ -74,7 +77,8 @@ After locking, the target root and `data.mdb` are probed once. Existing-state
 previews open LMDB with `MDB_RDONLY | MDB_NOLOCK`; the external shared lock then
 excludes every Sage LMDB writer for the environment's complete lifetime.
 Absent-state previews do not open LMDB, and channel indexes are fetched and
-parsed without persisting cache files.
+parsed without persisting cache files. Creating the root-only ephemeral host
+lock under `/run` is outside the target-root zero-write guarantee.
 
 ---
 

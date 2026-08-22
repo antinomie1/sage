@@ -19,11 +19,13 @@ Global Options:
   --version, -V        Display Sage version
 ```
 
-For `install`, `remove`, and `rebuild`, Sage serializes package-state access on
-the existing host `/run/lock` directory inode. Dry-runs take a shared advisory
-lock and real mutations take an exclusive lock; operations for different target
-roots therefore also serialize. The lock directory is opened read-only and is
-never created or modified by Sage.
+`install`, `remove`, and `rebuild` require root and serialize package-state
+access on one host lock: `/run/lock/sage/operation.lock`. Sage creates the
+namespace as `root:root` mode `0700` and the file as `root:root` mode `0600`,
+then validates ownership, type, and mode before locking. Dry-runs take a shared
+advisory lock and real mutations take an exclusive lock; operations for
+different target roots therefore also serialize. The public `/run/lock`
+directory inode is never locked.
 
 A dry-run probes the target root and database exactly once after locking. An
 absent database is modeled as empty for install, is a no-op for remove, and is
@@ -31,7 +33,8 @@ an explicit uninitialized-state error for rebuild. An existing database is
 opened with `MDB_RDONLY | MDB_NOLOCK` while the shared host lock remains held.
 Dry-run channel indexes are parsed in memory without updating the target-root
 cache, so previews do not change package files, LMDB files/tables, legacy PID
-locks, or cache state.
+locks, or cache state. The root-only ephemeral host coordination state under
+`/run` is the sole allowed dry-run write.
 
 ---
 

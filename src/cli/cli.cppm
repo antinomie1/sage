@@ -151,13 +151,36 @@ inline std::expected<bool, std::string> probe_path_type(
     return classify_path_probe(path, status, ec, expected_type, description);
 }
 
+inline std::expected<void, std::string> validate_operation_user(
+    std::uint32_t effective_uid)
+{
+    if (effective_uid == 0) return {};
+    return std::unexpected(
+        "install, remove, and rebuild operations require root privileges");
+}
+
+inline std::expected<bool, std::string> probe_package_database(
+    const std::filesystem::path& configured_path)
+{
+    return probe_path_type(
+        sage::db::resolve_lmdb_paths(configured_path).data_file,
+        std::filesystem::file_type::regular,
+        "package database");
+}
+
 // install/remove/rebuild call this in main before touching package state. The
 // returned lock spans the complete command and the snapshots are the only DB
 // existence decision those command implementations consume.
 inline std::expected<OperationContext, int> acquire_operation_context(
     const CliOptions& opts,
-    const std::filesystem::path& operation_lock_path = "/run/lock")
+    const std::filesystem::path& operation_lock_path = "/run/lock/sage/operation.lock")
 {
+    auto user = validate_operation_user(sage::util::current_effective_uid());
+    if (!user) {
+        sage::util::log_error("{}", user.error());
+        return std::unexpected(1);
+    }
+
     const auto mode = opts.dry_run
         ? sage::util::LockMode::Shared
         : sage::util::LockMode::Exclusive;
@@ -189,11 +212,7 @@ inline std::expected<OperationContext, int> acquire_operation_context(
         sage::util::log_error("Failed to load configuration: {}", cfg_res.error());
         return std::unexpected(1);
     }
-    const auto data_path = cfg_res->db_path.extension() == ".mdb"
-        ? cfg_res->db_path
-        : cfg_res->db_path / "data.mdb";
-    auto database_exists = probe_path_type(
-        data_path, std::filesystem::file_type::regular, "package database");
+    auto database_exists = probe_package_database(cfg_res->db_path);
     if (!database_exists) {
         sage::util::log_error("{}", database_exists.error());
         return std::unexpected(1);
