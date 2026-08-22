@@ -24,6 +24,30 @@ using std::uint8_t;
 using std::uint32_t;
 using std::uint64_t;
 
+// Bootstrap-era registry claims may reference compatibility paths that only
+// exist as base-files merge symlinks on a collapsed layout. Rewriting the
+// claim onto its canonical target lets stale cleanup delete at the real
+// location without ever opening through a link -- anything else that turns
+// out to be a symlink mid-walk stays a hard error.
+inline std::expected<std::string, bool> canonicalize_merge_claim(std::string_view path)
+{
+    static constexpr std::array<std::pair<std::string_view, std::string_view>, 6> aliases{{
+        {"usr/sbin", "usr/bin"},
+        {"usr/lib64", "usr/lib"},
+        {"sbin", "usr/bin"},
+        {"lib64", "usr/lib"},
+        {"bin", "usr/bin"},
+        {"lib", "usr/lib"},
+    }};
+    for (const auto& [from, to] : aliases) {
+        if (path == from) return std::string{};
+        const auto prefix = std::format("{}/", from);
+        if (path.starts_with(prefix))
+            return std::format("{}/{}", to, path.substr(prefix.size()));
+    }
+    return std::string{path};
+}
+
 inline std::expected<void, std::string> remove_path_anchored(
     const std::filesystem::path& target_root,
     std::string_view raw_path,
@@ -31,6 +55,16 @@ inline std::expected<void, std::string> remove_path_anchored(
 {
     auto normalized = normalize_data_path(raw_path);
     if (!normalized) return std::unexpected(normalized.error());
+
+    // A claim naming exactly a merge point cannot be deleted through its
+    // symlink; release it untouched.
+    auto canonical = canonicalize_merge_claim(*normalized);
+    if (!canonical.has_value())
+        return {};
+    if (*canonical != *normalized)
+        sage::util::log_info(
+            "  ~ claim '{}' predates the usr merge; cleaning as '{}'",
+            raw_path, *canonical);
 
     int root_flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW;
 #ifdef O_CLOEXEC
@@ -42,7 +76,7 @@ inline std::expected<void, std::string> remove_path_anchored(
             "Cannot securely open target root: " + std::string(std::strerror(errno)));
     }
     UniqueFd current(root_fd);
-    const auto relative = std::filesystem::path(*normalized);
+    const auto relative = std::filesystem::path(*canonical);
     for (const auto& component : relative.parent_path()) {
         if (component == ".") continue;
         const auto name = component.string();
