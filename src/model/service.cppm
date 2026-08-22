@@ -208,50 +208,56 @@ struct ServiceSpec {
     }
 };
 
+// Where this init system's script for `name` lives under the sysroot.
+// Callers use it to decide whether the path is already owned by a package
+// (a shipped native unit wins over the generated form).
+inline std::expected<std::filesystem::path, std::string> service_destination(
+    std::string_view name,
+    InitType init_type,
+    const std::filesystem::path& sysroot = "/")
+{
+    switch (init_type) {
+        case InitType::OpenRC:  return sysroot / "etc/init.d" / name;
+        case InitType::Systemd: return sysroot / "usr/lib/systemd/system" / (std::string(name) + ".service");
+        case InitType::Runit:   return sysroot / "etc/sv" / name / "run";
+        case InitType::Dinit:   return sysroot / "etc/dinit.d" / name;
+        case InitType::S6:      return sysroot / "etc/s6/services" / name / "run";
+        default:                return std::unexpected("Unsupported init system");
+    }
+}
+
 inline std::expected<std::filesystem::path, std::string> generate_service(
     const ServiceSpec& spec,
     InitType init_type,
-    const std::filesystem::path& sysroot = "/") 
+    const std::filesystem::path& sysroot = "/")
 {
-    std::filesystem::path dest;
+    auto dest_res = service_destination(spec.name, init_type, sysroot);
+    if (!dest_res) return std::unexpected(dest_res.error());
+    std::filesystem::path dest = std::move(*dest_res);
     std::string content;
     bool is_executable = false;
 
     switch (init_type) {
-        case InitType::OpenRC: {
-            dest = sysroot / "etc/init.d" / spec.name;
+        case InitType::OpenRC:
             content = spec.render_openrc();
             is_executable = true;
             break;
-        }
-        case InitType::Systemd: {
-            dest = sysroot / "usr/lib/systemd/system" / (spec.name + ".service");
+        case InitType::Systemd:
             content = spec.render_systemd();
             is_executable = false;
             break;
-        }
-        case InitType::Runit: {
-            std::filesystem::path sv_dir = sysroot / "etc/sv" / spec.name;
-            std::filesystem::create_directories(sv_dir);
-            dest = sv_dir / "run";
+        case InitType::Runit:
             content = spec.render_runit();
             is_executable = true;
             break;
-        }
-        case InitType::Dinit: {
-            dest = sysroot / "etc/dinit.d" / spec.name;
+        case InitType::Dinit:
             content = spec.render_dinit();
             is_executable = false;
             break;
-        }
-        case InitType::S6: {
-            std::filesystem::path s6_dir = sysroot / "etc/s6/services" / spec.name;
-            std::filesystem::create_directories(s6_dir);
-            dest = s6_dir / "run";
+        case InitType::S6:
             content = spec.render_s6();
             is_executable = true;
             break;
-        }
         default:
             return std::unexpected("Unsupported init system");
     }

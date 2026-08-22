@@ -611,6 +611,20 @@ public:
                 util::log_warn("Skipping service for '{}': {}", pkg.name, spec.error());
                 continue;
             }
+            // A package may ship its own native script for this init (the
+            // systemd split packages keep their upstream units): package data
+            // wins over the generated form.
+            auto dest = service::service_destination(spec->name, plan.target_init, sysroot);
+            if (!dest) {
+                util::log_warn("Skipping service for '{}': {}", pkg.name, dest.error());
+                continue;
+            }
+            auto owners = db.get_path_owners(dest->string());
+            if (owners && !owners->empty()) {
+                util::log_info("  · {:<20} ships its own {} script", spec->name,
+                    service::to_string(plan.target_init));
+                continue;
+            }
             auto gen_res = service::generate_service(*spec, plan.target_init, sysroot);
             if (gen_res) {
                 gen_count++;
