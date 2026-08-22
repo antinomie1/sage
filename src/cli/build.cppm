@@ -196,7 +196,11 @@ export int cmd_build(const CliOptions& opts) {
                             std::filesystem::path& out_path) -> bool {
         if (url.empty()) return true;
         std::filesystem::create_directories(dist_dir);
-        std::string filename = std::filesystem::path(url).filename().string();
+        // Derive the on-disk name from the URL path alone: query strings
+        // (?inline=false on GitLab raw links) and fragments are not part of
+        // it and must not leak into distfiles/ filenames.
+        std::string path = std::string(url.substr(0, url.find_first_of("?#")));
+        std::string filename = std::filesystem::path(path).filename().string();
         if (filename.empty()) filename = "source.tar.gz";
         out_path = dist_dir / filename;
 
