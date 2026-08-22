@@ -27,9 +27,10 @@ struct LockError {
     std::string message;
 };
 
-// Host-wide operation lock. The parent namespace and lock file are root-only;
-// the public /run/lock directory inode is never itself locked. Every successful
-// open enters an RAII owner before validation or flock.
+// Host-wide operation lock. Linux /run is root-owned mode 0755, so an
+// unprivileged user cannot pre-create the sage namespace. The namespace and
+// lock file remain root-only, and every successful open enters an RAII owner
+// before validation or flock.
 class OperationLock {
 public:
     using Deadline = std::chrono::steady_clock::time_point;
