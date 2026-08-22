@@ -455,33 +455,33 @@ inline std::expected<InspectedPackage, std::string> inspect_package_stream(
         result.manifest.triggers = std::move(*trigger_res);
     }
 
-    constexpr std::array<std::pair<std::string_view, std::string_view>, 3> usr_merge_aliases{
+    constexpr std::array<std::pair<std::string_view, std::string_view>, 6> usr_merge_aliases{
         std::pair{"bin", "usr/bin"},
+        std::pair{"sbin", "usr/bin"},
         std::pair{"lib", "usr/lib"},
-        std::pair{"lib64", "usr/lib64"},
+        std::pair{"lib64", "usr/lib"},
+        std::pair{"usr/sbin", "bin"},
+        std::pair{"usr/lib64", "lib"},
     };
     for (const auto& entry : data_entries) {
-        if (entry.path == "sbin" || entry.path.starts_with("sbin/")
-            || entry.path == "usr/sbin" || entry.path.starts_with("usr/sbin/")) {
+        if (entry.path.starts_with("usr/sbin/")
+            || entry.path.starts_with("usr/lib64/")) {
             return std::unexpected(std::format(
-                "Package '{}' must use usr/bin instead of unsupported sbin path '{}'",
+                "Package '{}' must not install payload below compatibility path '{}'",
                 result.manifest.name, entry.path));
         }
 
-        auto top = std::string_view(entry.path);
-        if (auto slash = top.find('/'); slash != std::string_view::npos) {
-            top = top.substr(0, slash);
-        }
         auto alias = std::ranges::find_if(
-            usr_merge_aliases, [&](const auto& candidate) { return candidate.first == top; });
+            usr_merge_aliases, [&](const auto& candidate) {
+                return entry.path == candidate.first
+                    || entry.path.starts_with(std::string(candidate.first) + "/");
+            });
         if (alias == usr_merge_aliases.end()) continue;
 
-        const bool is_collapsed_merge_target =
-            entry.path == "lib64" && entry.link_target == "usr/lib";
         const bool is_base_merge_link = result.manifest.name == "base-files"
-            && entry.path == top
+            && entry.path == alias->first
             && entry.typeflag == '2'
-            && (entry.link_target == alias->second || is_collapsed_merge_target);
+            && entry.link_target == alias->second;
         if (!is_base_merge_link) {
             return std::unexpected(std::format(
                 "Package '{}' must use canonical usr/ paths instead of '{}'",

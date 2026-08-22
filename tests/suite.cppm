@@ -522,11 +522,14 @@ export int run_all() {
     }
 
     auto base_files_data = temp_dir / "base-files-data";
-    std::filesystem::create_directories(base_files_data);
+    std::filesystem::create_directories(base_files_data / "usr");
     constexpr std::array base_files_aliases{
         std::pair{"bin", "usr/bin"},
+        std::pair{"sbin", "usr/bin"},
         std::pair{"lib", "usr/lib"},
         std::pair{"lib64", "usr/lib"},
+        std::pair{"usr/sbin", "bin"},
+        std::pair{"usr/lib64", "lib"},
     };
     for (const auto& [path, target] : base_files_aliases) {
         std::filesystem::create_symlink(target, base_files_data / path);
@@ -553,26 +556,6 @@ export int run_all() {
         return 1;
     }
 
-    for (const auto& [target, label] : std::array{
-             std::pair{"usr/bin", "collapsed"}, std::pair{"usr/sbin", "standard"}}) {
-        auto sbin_data = temp_dir / std::format("base-files-{}-data", label);
-        std::filesystem::create_directories(sbin_data);
-        std::filesystem::create_symlink(target, sbin_data / "sbin");
-        auto sbin_pkg = malformed_archive_dir
-            / std::format("base-files-{}.pkg.tar.zst", label);
-        if (!sage::archive::create_package(base_files_manifest, sbin_data, sbin_pkg)) {
-            sage::util::log_error("Failed to create base-files sbin fixture");
-            return 1;
-        }
-        auto sbin_extract = sage::archive::extract_package(
-            sbin_pkg, temp_dir / std::format("base-files-{}-root", label));
-        if (sbin_extract
-            || sbin_extract.error().find("unsupported sbin path") == std::string::npos) {
-            sage::util::log_error("Base-files accepted an sbin compatibility alias");
-            return 1;
-        }
-    }
-
     auto usr_sbin_bytes = raw_tar_bytes;
     if (!rename_tar_entry(
             usr_sbin_bytes, "data/usr/bin/dummy", "data/usr/sbin/dummy")) {
@@ -585,8 +568,25 @@ export int run_all() {
         : std::expected<sage::archive::InspectedPackage, std::string>(
             std::unexpected("fixture failed"));
     if (usr_sbin_result
-        || usr_sbin_result.error().find("unsupported sbin path") == std::string::npos) {
+        || usr_sbin_result.error().find("compatibility path") == std::string::npos) {
         sage::util::log_error("Package accepted an usr/sbin payload path");
+        return 1;
+    }
+
+    auto usr_lib64_bytes = raw_tar_bytes;
+    if (!rename_tar_entry(
+            usr_lib64_bytes, "data/usr/bin/dummy", "data/usr/lib64/dummy")) {
+        sage::util::log_error("Failed to create usr/lib64 package fixture");
+        return 1;
+    }
+    auto usr_lib64_pkg = write_mutated_package(usr_lib64_bytes, "usr-lib64-path");
+    auto usr_lib64_result = usr_lib64_pkg
+        ? sage::archive::inspect_package(*usr_lib64_pkg)
+        : std::expected<sage::archive::InspectedPackage, std::string>(
+            std::unexpected("fixture failed"));
+    if (usr_lib64_result
+        || usr_lib64_result.error().find("compatibility path") == std::string::npos) {
+        sage::util::log_error("Package accepted an usr/lib64 payload path");
         return 1;
     }
 
@@ -1348,6 +1348,7 @@ version = "1:2.0-3"
     version_1.triggers = {version_trigger};
     sage::package::PackageManifest version_2 = version_1;
     version_2.version = sage::package::Version::parse("2.0.0-1");
+    version_2.triggers.clear();
     auto version_1_pkg = version_repo / "versioned-package-1.0.0-1-x86_64.pkg.tar.zst";
     auto version_2_pkg = version_repo / "versioned-package-2.0.0-1-x86_64.pkg.tar.zst";
     if (!sage::archive::create_package(version_1, version_1_data, version_1_pkg)
@@ -1365,7 +1366,7 @@ version = "1:2.0-3"
     CliOptions version_install;
     version_install.target_root = version_target;
     version_install.args = {"versioned-package"};
-    if (cmd_install(version_install) != 0
+    if (cmd_install(version_install, "/") != 0
         || read_test_file(version_target / "usr/bin/versioned") != "version 2\n") {
         sage::util::log_error("Solver selection did not install the selected archive version");
         return 1;
@@ -2120,8 +2121,8 @@ channel = "system"
 provides = ["libsample", "so:libsample.so.1"]
 
 install = [
-    'mkdir -p "$DESTDIR/usr/lib"',
-    'printf "/* libsample binary */\n" > "$DESTDIR/usr/lib/libsample.so.1"',
+    'mkdir -p "$DESTDIR/usr/share/libsample"',
+    'printf "/* libsample fixture */\n" > "$DESTDIR/usr/share/libsample/payload"',
 ]
 )";
     lib_recipe.close();
@@ -2152,6 +2153,16 @@ install = [
     build_lib_opts.args = {(build_test_dir / "libsample").string()};
     if (cmd_build(build_lib_opts) != 0) {
         sage::util::log_error("Failed to build libsample");
+        return 1;
+    }
+    if (cmd_build(build_lib_opts) != 0) {
+        sage::util::log_error("Failed to rebuild an already published libsample");
+        return 1;
+    }
+    auto rebuilt_lib = sage::archive::inspect_package(
+        build_test_dir / "libsample/libsample-1.2.0-2-x86_64.pkg.tar.zst");
+    if (!rebuilt_lib || rebuilt_lib->manifest.version.rel != "2") {
+        sage::util::log_error("Rebuild did not advance beyond the highest published release");
         return 1;
     }
 
@@ -2204,14 +2215,14 @@ install = [
     CliOptions loop_inst_opts;
     loop_inst_opts.target_root = loop_target;
     loop_inst_opts.args = {"sample-app"};
-    if (cmd_install(loop_inst_opts) != 0) {
+    if (cmd_install(loop_inst_opts, "/") != 0) {
         sage::util::log_error("Failed to install built sample-app");
         return 1;
     }
 
     // Verify files on disk and packages in LMDB
     if (!std::filesystem::exists(loop_target / "usr/bin/sample-app") || 
-        !std::filesystem::exists(loop_target / "usr/lib/libsample.so.1")) {
+        !std::filesystem::exists(loop_target / "usr/share/libsample/payload")) {
         sage::util::log_error("Files from sample-app and libsample were not properly installed to target root");
         return 1;
     }
@@ -2234,7 +2245,7 @@ install = [
 
     // Verify all files from both sample-app and libsample are gone from disk!
     if (std::filesystem::exists(loop_target / "usr/bin/sample-app") ||
-        std::filesystem::exists(loop_target / "usr/lib/libsample.so.1")) {
+        std::filesystem::exists(loop_target / "usr/share/libsample/payload")) {
         sage::util::log_error("Files still exist on disk after cascade removal");
         return 1;
     }

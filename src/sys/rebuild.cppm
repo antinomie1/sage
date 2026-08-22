@@ -311,7 +311,38 @@ private:
         const TriggerContext& ctx)
     {
         std::string exec_path = cmd.substr(0, cmd.find(' '));
-        if (!std::filesystem::exists(ctx.sysroot / std::filesystem::path(exec_path).relative_path())) {
+        auto within_root = [&](std::filesystem::path path) {
+            path = path.relative_path();
+            for (unsigned links = 0; links < 40; ++links) {
+                std::filesystem::path resolved;
+                bool followed = false;
+                for (auto component = path.begin(); component != path.end(); ++component) {
+                    resolved /= *component;
+                    std::error_code ec;
+                    auto status = std::filesystem::symlink_status(ctx.sysroot / resolved, ec);
+                    if (ec || status.type() == std::filesystem::file_type::not_found) return false;
+                    if (status.type() != std::filesystem::file_type::symlink) continue;
+                    auto target = std::filesystem::read_symlink(ctx.sysroot / resolved, ec);
+                    if (ec) return false;
+                    std::filesystem::path remainder;
+                    for (auto rest = std::next(component); rest != path.end(); ++rest) {
+                        remainder /= *rest;
+                    }
+                    path = (target.is_absolute() ? target.relative_path()
+                                                 : resolved.parent_path() / target)
+                         / remainder;
+                    path = path.lexically_normal();
+                    followed = true;
+                    break;
+                }
+                if (!followed) return true;
+            }
+            return false;
+        };
+        const bool executable_exists = ctx.sysroot == "/"
+            ? std::filesystem::exists(exec_path)
+            : within_root(exec_path);
+        if (!executable_exists) {
             return std::unexpected(std::format(
                 "Required executable '{}' for trigger '{}' is missing",
                 exec_path, trigger_name));
@@ -446,7 +477,7 @@ public:
         }
 
         auto wtxn = db.begin_write_txn();
-        if (!wtxn) return std::unexpected("Failed to open database write transaction");
+        if (!wtxn) return std::unexpected(std::string("Failed to open database write transaction"));
 
         // The plan was computed before taking the writer lock. Validate every
         // provider binding before changing any of them so a stale reconcile

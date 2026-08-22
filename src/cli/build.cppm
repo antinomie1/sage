@@ -136,7 +136,29 @@ export int cmd_build(const CliOptions& opts) {
         sage::util::log_error("Failed to parse recipe: {}", recipe_res.error());
         return 1;
     }
-    const auto& r = *recipe_res;
+    auto r = std::move(*recipe_res);
+
+    // A published identity is immutable. Recipedia keeps built archives next
+    // to their recipe, so a rebuild of the same upstream version advances to
+    // one beyond the highest numeric release already present instead of
+    // overwriting an earlier publication.
+    std::uint64_t highest_published_release = 0;
+    bool has_published_release = false;
+    for (const auto& entry : std::filesystem::directory_iterator(recipe_dir)) {
+        if (!entry.is_regular_file() || !entry.path().filename().string().ends_with(".pkg.tar.zst")) continue;
+        auto published = sage::archive::inspect_package(entry.path());
+        if (!published || published->manifest.name != r.name
+            || published->manifest.version.ver != r.version.ver) continue;
+        std::uint64_t release = 0;
+        auto text = std::string_view(published->manifest.version.rel);
+        auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), release);
+        if (error != std::errc{} || end != text.data() + text.size()) continue;
+        highest_published_release = std::max(highest_published_release, release);
+        has_published_release = true;
+    }
+    if (has_published_release) {
+        r.version.rel = std::format("{}", highest_published_release + 1);
+    }
     sage::util::log_info("Building package '{}' version {} (channel: {})...", r.name, r.version.to_string(), r.channel);
 
     // Load the build configuration up front: the phases need the compiler
