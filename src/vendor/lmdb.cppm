@@ -61,26 +61,25 @@ public:
             return std::unexpected(mdb_strerror(rc));
         }
 
-        mdb_env_set_mapsize(env, map_size);
-        mdb_env_set_maxdbs(env, max_dbs);
+        MdbEnv res;
+        res.env_ = env;
+
+        mdb_env_set_mapsize(res.env_, map_size);
+        mdb_env_set_maxdbs(res.env_, max_dbs);
 
         if (create_path) {
             std::error_code ec;
             std::filesystem::create_directories(path, ec);
             if (ec) {
-                mdb_env_close(env);
                 return std::unexpected(std::format(
                     "cannot create LMDB directory '{}': {}", path.string(), ec.message()));
             }
         }
-        rc = mdb_env_open(env, path.c_str(), flags, 0644);
+        rc = mdb_env_open(res.env_, path.c_str(), flags, 0644);
         if (rc != 0) {
-            mdb_env_close(env);
             return std::unexpected(mdb_strerror(rc));
         }
 
-        MdbEnv res;
-        res.env_ = env;
         return res;
     }
 
