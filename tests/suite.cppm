@@ -1448,6 +1448,25 @@ release = "10"
             std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
     };
 
+    // A preview against a fresh target must not initialize the lock or LMDB
+    // hierarchy while resolving the same package plan as a real install.
+    auto dry_run_target = temp_dir / "dry-run-target";
+    if (!write_test_channel(dry_run_target, local_repo)) {
+        sage::util::log_error("Failed to configure dry-run target channel");
+        return 1;
+    }
+    CliOptions dry_run_install;
+    dry_run_install.target_root = dry_run_target;
+    dry_run_install.args = {"dummy-tool"};
+    dry_run_install.dry_run = true;
+    auto dry_run_lock = acquire_root_write_lock(dry_run_install);
+    if (!dry_run_lock
+        || cmd_install(dry_run_install) != 0
+        || std::filesystem::exists(dry_run_target / "var/lib/sage")) {
+        sage::util::log_error("Dry-run initialized package state under a fresh target root");
+        return 1;
+    }
+
     // Trigger timing fixtures execute on the host with sysroot "/". Their
     // commands touch only this test's temporary directory, so the suite does
     // not need a compiler or static libc merely to build a chroot-local probe.

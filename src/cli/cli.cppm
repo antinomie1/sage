@@ -115,6 +115,10 @@ inline std::optional<CliOptions> parse_args(int argc, char* argv[]) {
 // returned RootLock for the command's lifetime. Read-only commands never take
 // it and are never blocked.
 inline std::expected<util::RootLock, int> acquire_root_write_lock(const CliOptions& opts) {
+    // A dry-run only reads state. Taking the ordinary lock would create both
+    // its parent directory and the lock file on a fresh target root.
+    if (opts.dry_run) return util::RootLock{};
+
     auto cfg_res = sage::config::SystemConfig::load_from_root(opts.target_root);
     if (!cfg_res) {
         sage::util::log_error("Failed to load configuration: {}", cfg_res.error());
