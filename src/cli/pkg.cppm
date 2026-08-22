@@ -959,6 +959,20 @@ export int cmd_remove(const CliOptions& opts) {
     auto commit_res = wtxn->commit();
     if (!commit_res) return 1;
 
+    // The filesystem and package database are committed at this point, so the
+    // generated profile must reflect the new state even when a post-remove
+    // trigger fails below.
+    std::vector<sage::channel::Channel> active_channels;
+    for (const auto& ch_cfg : cfg.channels) {
+        sage::channel::Channel ch;
+        ch.name = ch_cfg.name;
+        ch.scope = sage::channel::parse_scope(ch_cfg.scope);
+        ch.enabled = ch_cfg.enabled;
+        active_channels.push_back(std::move(ch));
+    }
+    (void)sage::channel::ProfileManager::regenerate_fhs_profile(
+        opts.target_root, active_channels);
+
     // Removing a kernel is as much a reason to regenerate the initramfs and
     // the bootloader entries as installing one, so removal runs the same
     // triggers -- with the removed packages as the transaction set, since it
@@ -984,15 +998,6 @@ export int cmd_remove(const CliOptions& opts) {
             "Post-remove trigger failed: {}", trigger_result.error());
         return 1;
     }
-    std::vector<sage::channel::Channel> active_channels;
-    for (const auto& ch_cfg : cfg.channels) {
-        sage::channel::Channel ch;
-        ch.name = ch_cfg.name;
-        ch.scope = sage::channel::parse_scope(ch_cfg.scope);
-        ch.enabled = ch_cfg.enabled;
-        active_channels.push_back(std::move(ch));
-    }
-    (void)sage::channel::ProfileManager::regenerate_fhs_profile(opts.target_root, active_channels);
 
     sage::util::log_success("Successfully removed {} packages (including orphaned dependencies) from {}",
         to_remove_set.size(), opts.target_root.string());

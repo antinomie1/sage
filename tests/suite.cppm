@@ -1900,6 +1900,7 @@ release = "10"
     auto split_repo = temp_dir / "split-toolchain-repo";
     auto split_libs_data = temp_dir / "split-toolchain-libs-data";
     auto split_compiler_data = temp_dir / "split-toolchain-compiler-data";
+    auto split_guard_data = temp_dir / "split-toolchain-guard-data";
     auto split_target = temp_dir / "split-toolchain-target";
     auto split_trigger_count = temp_dir / "split-trigger-count";
     auto split_library = split_libs_data / "opt/channels/llvm/77/lib/libsplit.so";
@@ -1910,9 +1911,11 @@ release = "10"
     std::filesystem::create_directories(split_library.parent_path());
     std::filesystem::create_directories(split_compiler_library.parent_path());
     std::filesystem::create_directories(split_clang.parent_path());
+    std::filesystem::create_directories(split_guard_data / "usr/share");
     std::ofstream(split_library) << "split toolchain library\n";
     std::ofstream(split_compiler_library) << "split compiler library\n";
     std::ofstream(split_clang) << "#!/bin/sh\nexit 0\n";
+    std::ofstream(split_guard_data / "usr/share/split-trigger-guard") << "guard\n";
     std::filesystem::permissions(
         split_clang,
         std::filesystem::perms::owner_all
@@ -1944,14 +1947,25 @@ release = "10"
     split_compiler.channel = "toolchain/llvm:77";
     split_compiler.dependencies.push_back(
         sage::package::Dependency::parse("split-toolchain-libs"));
+    sage::package::PackageManifest split_guard;
+    split_guard.name = "split-trigger-guard";
+    split_guard.version = sage::package::Version::parse("1.0.0-1");
+    sage::package::Trigger failed_remove_trigger;
+    failed_remove_trigger.name = "failed-remove-trigger";
+    failed_remove_trigger.on_paths = {"opt/channels/llvm/77/bin/"};
+    failed_remove_trigger.exec = "/usr/bin/sage-missing-remove-trigger";
+    split_guard.triggers = {failed_remove_trigger};
 
     auto split_libs_archive =
         split_repo / "split-toolchain-libs-1.0.0-1-x86_64.pkg.tar.zst";
     auto split_compiler_archive =
         split_repo / "split-toolchain-compiler-1.0.0-1-x86_64.pkg.tar.zst";
+    auto split_guard_archive =
+        split_repo / "split-trigger-guard-1.0.0-1-x86_64.pkg.tar.zst";
     if (!sage::archive::create_package(split_libs, split_libs_data, split_libs_archive)
         || !sage::archive::create_package(
             split_compiler, split_compiler_data, split_compiler_archive)
+        || !sage::archive::create_package(split_guard, split_guard_data, split_guard_archive)
         || !sage::archive::generate_repo_index(split_repo, "core")) {
         sage::util::log_error("Failed to create split toolchain fixtures");
         return 1;
@@ -1966,6 +1980,11 @@ release = "10"
     split_install.args = {"split-toolchain-compiler"};
     if (cmd_install(split_install, "/") != 0) {
         sage::util::log_error("Failed to install split toolchain packages");
+        return 1;
+    }
+    split_install.args = {"split-trigger-guard"};
+    if (cmd_install(split_install, "/") != 0) {
+        sage::util::log_error("Failed to install post-remove trigger guard");
         return 1;
     }
     auto split_cc_link = split_target / "etc/sage/profiles/default/bin/cc";
@@ -2021,6 +2040,9 @@ release = "10"
 
     // Restore the owned file and verify removal uses the sysroot-relative paths
     // stored in the manifest instead of prepending the toolchain root twice.
+    // A remaining package deliberately fails its post-remove trigger; removal
+    // still commits, and profile regeneration must discard the now-dangling cc
+    // link before that trigger error is returned.
     std::error_code restore_ec;
     std::filesystem::remove_all(installed_split_clang, restore_ec);
     if (restore_ec) {
@@ -2028,12 +2050,14 @@ release = "10"
         return 1;
     }
     std::ofstream(installed_split_clang) << "#!/bin/sh\nexit 0\n";
-    if (cmd_remove(split_remove) != 0
+    if (cmd_remove(split_remove) == 0
         || std::filesystem::exists(split_target / "opt/channels/llvm/77/bin/clang")
         || std::filesystem::exists(split_target / "opt/channels/llvm/77/lib/libsplit.so")
         || std::filesystem::exists(
-            split_target / "opt/channels/llvm/77/lib/libsplit-compiler.so")) {
-        sage::util::log_error("Toolchain removal did not delete sysroot-relative package paths");
+            split_target / "opt/channels/llvm/77/lib/libsplit-compiler.so")
+        || std::filesystem::is_symlink(split_cc_link)) {
+        sage::util::log_error(
+            "Failed post-remove trigger left package paths or a stale profile link");
         return 1;
     }
     auto removed_split_db = sage::db::Database::open(
@@ -2042,8 +2066,9 @@ release = "10"
         ? removed_split_db->list_installed_packages()
         : std::expected<std::vector<sage::package::PackageManifest>, std::string>(
             std::unexpected("database open failed"));
-    if (!removed_split_packages || !removed_split_packages->empty()) {
-        sage::util::log_error("Split toolchain database was not cleared after removal");
+    if (!removed_split_packages || removed_split_packages->size() != 1
+        || removed_split_packages->front().name != "split-trigger-guard") {
+        sage::util::log_error("Failed trigger changed the committed removal state");
         return 1;
     }
     // An empty directory declared by two packages is shared: both register as

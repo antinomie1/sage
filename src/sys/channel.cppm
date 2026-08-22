@@ -445,6 +445,29 @@ public:
         std::filesystem::create_directories(lib_dir);
         std::filesystem::create_directories(include_dir);
 
+        // Toolchain activation writes chroot-absolute links here. Package
+        // removal may delete their targets before this regeneration runs, so
+        // discard only dangling generated links and preserve every live one.
+        auto prune_dangling_links = [&](const std::filesystem::path& dir) {
+            if (!std::filesystem::is_directory(dir)) return;
+            for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+                std::error_code ec;
+                if (!entry.is_symlink(ec) || ec) continue;
+                auto target = std::filesystem::read_symlink(entry.path(), ec);
+                if (ec) continue;
+                auto anchored_target = target.is_absolute()
+                    ? sysroot / target.relative_path()
+                    : entry.path().parent_path() / target;
+                if (!std::filesystem::exists(anchored_target, ec) && !ec) {
+                    std::filesystem::remove(entry.path(), ec);
+                }
+            }
+        };
+        prune_dangling_links(bin_dir);
+        prune_dangling_links(lib_dir);
+        prune_dangling_links(include_dir);
+        prune_dangling_links(profile_dir / "runtimes");
+
         // Aggregate symlinks from active toolchains & runtimes in priority order
         auto chroot_abs = [&](const std::filesystem::path& p) -> std::filesystem::path {
             return std::filesystem::path("/") / p.lexically_relative(sysroot);
