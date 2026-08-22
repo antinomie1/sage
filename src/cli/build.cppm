@@ -420,8 +420,25 @@ export int cmd_build(const CliOptions& opts) {
             std::filesystem::create_directories(src_dir / "distfiles");
             if (!archive_path.empty()) {
                 sage::util::log_info("Unpacking source to {}...", src_dir.string());
-                std::string cmd = std::format("tar -xf \"{}\" -C \"{}\" --strip-components=1 2>/dev/null || tar -xf \"{}\" -C \"{}\"",
-                    archive_path.string(), src_dir.string(), archive_path.string(), src_dir.string());
+                // Strip the top-level directory only when there is one: flat
+                // archives (tzcode, tzdata) carry their files at the root,
+                // and stripping a component of those silently extracts
+                // nothing -- every entry loses its only path element.
+                const auto probe = std::format(
+                    "/tmp/sage-tarhead-{}.txt", sage::util::current_pid());
+                std::system(std::format("tar -tf \"{}\" 2>/dev/null | head -n1 > \"{}\"",
+                    archive_path.string(), probe).c_str());
+                std::ifstream head_in(probe);
+                std::string first_entry;
+                std::getline(head_in, first_entry);
+                std::filesystem::remove(probe, ec);
+                const bool flat = !first_entry.empty()
+                    && first_entry.find('/') == std::string::npos;
+                std::string cmd = flat
+                    ? std::format("tar -xf \"{}\" -C \"{}\"",
+                        archive_path.string(), src_dir.string())
+                    : std::format("tar -xf \"{}\" -C \"{}\" --strip-components=1 2>/dev/null || tar -xf \"{}\" -C \"{}\"",
+                        archive_path.string(), src_dir.string(), archive_path.string(), src_dir.string());
                 if (std::system(cmd.c_str()) != 0) {
                     sage::util::log_error("Failed to unpack source archive! Archive may be corrupted. Cleaning up...");
                     std::filesystem::remove(archive_path, ec);
