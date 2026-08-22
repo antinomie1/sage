@@ -36,10 +36,15 @@ load_install_snapshot(
 // remain isolated under their temporary target root.
 export int cmd_install(
     const CliOptions& opts,
-    std::optional<std::filesystem::path> trigger_sysroot = std::nullopt)
+    std::optional<std::filesystem::path> trigger_sysroot = std::nullopt,
+    DatabaseSnapshot database_snapshot = DatabaseSnapshot::Unchecked)
 {
     if (opts.args.empty()) {
         std::println("Usage: sage install <PKG...>");
+        return 1;
+    }
+    if (opts.dry_run && database_snapshot == DatabaseSnapshot::Unchecked) {
+        sage::util::log_error("Dry-run install requires a synchronized database snapshot");
         return 1;
     }
 
@@ -50,21 +55,30 @@ export int cmd_install(
     }
     const auto& cfg = *cfg_res;
 
-    auto db_res = sage::db::Database::open(cfg.db_path);
-    if (!db_res) {
-        sage::util::log_error("Failed to open database at {}: {}", cfg.db_path.string(), db_res.error());
-        return 1;
+    sage::db::Database db;
+    std::vector<sage::package::PackageManifest> installed_packages;
+    if (!opts.dry_run || database_snapshot == DatabaseSnapshot::Present) {
+        auto db_res = opts.dry_run
+            ? sage::db::Database::open_existing_read_only_no_lock(cfg.db_path)
+            : sage::db::Database::open(cfg.db_path);
+        if (!db_res) {
+            sage::util::log_error(
+                "Failed to open database at {}: {}", cfg.db_path.string(), db_res.error());
+            return 1;
+        }
+        db = std::move(*db_res);
+        auto installed_res = db.list_installed_packages();
+        if (!installed_res) {
+            sage::util::log_error(
+                "Installed package database is inconsistent: {}", installed_res.error());
+            return 1;
+        }
+        installed_packages = std::move(*installed_res);
     }
-    auto& db = *db_res;
-    auto installed_res = db.list_installed_packages();
-    if (!installed_res) {
-        sage::util::log_error("Installed package database is inconsistent: {}", installed_res.error());
-        return 1;
-    }
-    auto installed_packages = std::move(*installed_res);
 
     // 1. Gather Available Package Pool from Channels and Local Repos
-    auto snapshot_res = sage::rebuild::fetch_repo_snapshot(cfg, opts.channel_filter);
+    auto snapshot_res = sage::rebuild::fetch_repo_snapshot(
+        cfg, opts.channel_filter, !opts.dry_run);
     if (!snapshot_res) {
         sage::util::log_error("{}", snapshot_res.error());
         return 1;
@@ -583,9 +597,16 @@ export int cmd_install(
 // End-to-End `sage remove <PKG...>` Implementation
 // ============================================================================
 
-export int cmd_remove(const CliOptions& opts) {
+export int cmd_remove(
+    const CliOptions& opts,
+    DatabaseSnapshot database_snapshot = DatabaseSnapshot::Unchecked)
+{
     if (opts.args.empty()) {
         std::println("Usage: sage remove [--cascade|-c] [--nodeps|-d] <PKG...>");
+        return 1;
+    }
+    if (opts.dry_run && database_snapshot == DatabaseSnapshot::Unchecked) {
+        sage::util::log_error("Dry-run remove requires a synchronized database snapshot");
         return 1;
     }
 
@@ -596,7 +617,17 @@ export int cmd_remove(const CliOptions& opts) {
     }
     const auto& cfg = *cfg_res;
 
-    auto db_res = sage::db::Database::open(cfg.db_path);
+    if (opts.dry_run && database_snapshot == DatabaseSnapshot::Absent) {
+        for (const auto& pkg_name : opts.args) {
+            sage::util::log_warn("Package '{}' is not installed, skipping", pkg_name);
+        }
+        sage::util::log_info("No matching installed packages found to remove.");
+        return 0;
+    }
+
+    auto db_res = opts.dry_run
+        ? sage::db::Database::open_existing_read_only_no_lock(cfg.db_path)
+        : sage::db::Database::open(cfg.db_path);
     if (!db_res) {
         sage::util::log_error("Failed to open database: {}", db_res.error());
         return 1;
@@ -1004,20 +1035,38 @@ export int cmd_remove(const CliOptions& opts) {
     return 0;
 }
 
-export int cmd_rebuild(const CliOptions& opts) {
+export int cmd_rebuild(
+    const CliOptions& opts,
+    DatabaseSnapshot database_snapshot = DatabaseSnapshot::Unchecked)
+{
+    if (opts.dry_run && database_snapshot == DatabaseSnapshot::Unchecked) {
+        sage::util::log_error("Dry-run rebuild requires a synchronized database snapshot");
+        return 1;
+    }
+
     auto cfg_res = sage::config::SystemConfig::load_from_root(opts.target_root);
     if (!cfg_res) {
         sage::util::log_error("Failed to load configuration: {}", cfg_res.error());
         return 1;
     }
 
-    auto db_res = sage::db::Database::open(cfg_res->db_path);
+    if (opts.dry_run && database_snapshot == DatabaseSnapshot::Absent) {
+        sage::util::log_error(
+            "Cannot calculate rebuild preview: package database '{}' is not initialized",
+            cfg_res->db_path.string());
+        return 1;
+    }
+
+    auto db_res = opts.dry_run
+        ? sage::db::Database::open_existing_read_only_no_lock(cfg_res->db_path)
+        : sage::db::Database::open(cfg_res->db_path);
     if (!db_res) {
         sage::util::log_error("Failed to open database: {}", db_res.error());
         return 1;
     }
 
-    auto plan_res = sage::rebuild::ReconcileEngine::calculate_diff(*db_res, *cfg_res);
+    auto plan_res = sage::rebuild::ReconcileEngine::calculate_diff(
+        *db_res, *cfg_res, !opts.dry_run);
     if (!plan_res) {
         sage::util::log_error("Failed to calculate reconcile plan: {}", plan_res.error());
         return 1;

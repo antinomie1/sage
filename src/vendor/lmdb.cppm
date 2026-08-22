@@ -13,6 +13,7 @@ using std::size_t;
 inline constexpr unsigned int flag_rdonly = MDB_RDONLY;
 inline constexpr unsigned int flag_create = MDB_CREATE;
 inline constexpr unsigned int flag_nosync = MDB_NOSYNC;
+inline constexpr unsigned int flag_nolock = MDB_NOLOCK;
 
 inline MDB_val to_val(std::string_view sv) noexcept {
     return MDB_val{
@@ -51,7 +52,8 @@ public:
         const std::filesystem::path& path,
         size_t map_size = 10ULL * 1024 * 1024 * 1024, // 10GB default virtual map size
         unsigned int max_dbs = 32,
-        unsigned int flags = 0) 
+        unsigned int flags = 0,
+        bool create_path = true)
     {
         MDB_env* env = nullptr;
         int rc = mdb_env_create(&env);
@@ -62,7 +64,15 @@ public:
         mdb_env_set_mapsize(env, map_size);
         mdb_env_set_maxdbs(env, max_dbs);
 
-        std::filesystem::create_directories(path);
+        if (create_path) {
+            std::error_code ec;
+            std::filesystem::create_directories(path, ec);
+            if (ec) {
+                mdb_env_close(env);
+                return std::unexpected(std::format(
+                    "cannot create LMDB directory '{}': {}", path.string(), ec.message()));
+            }
+        }
         rc = mdb_env_open(env, path.c_str(), flags, 0644);
         if (rc != 0) {
             mdb_env_close(env);

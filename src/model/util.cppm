@@ -4,6 +4,7 @@ module;
 #include <fcntl.h>
 #include <stdlib.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <cerrno>
 #include <cstring>
@@ -195,71 +196,135 @@ inline long current_pid() {
     return static_cast<long>(::getpid());
 }
 
-// Why a root lock could not be taken. Contention is the only failure a caller
-// can tell the user to wait out; everything else means the lock file itself was
-// unusable, and saying "another instance holds it" would send them looking for
-// a process that does not exist.
+struct FileMetadataSnapshot {
+    std::uintmax_t size{0};
+    std::int64_t mtime_nanoseconds{0};
+    std::int64_t ctime_nanoseconds{0};
+    bool operator==(const FileMetadataSnapshot&) const = default;
+};
+
+inline std::expected<FileMetadataSnapshot, std::string> snapshot_file_metadata(
+    const std::filesystem::path& path)
+{
+    struct stat info {};
+    if (::lstat(path.c_str(), &info) != 0) {
+        const int stat_errno = errno;
+        return std::unexpected(std::format(
+            "cannot stat '{}': {}", path.string(), std::strerror(stat_errno)));
+    }
+    return FileMetadataSnapshot{
+        .size = static_cast<std::uintmax_t>(info.st_size),
+        .mtime_nanoseconds = static_cast<std::int64_t>(info.st_mtim.tv_sec) * 1'000'000'000
+            + info.st_mtim.tv_nsec,
+        .ctime_nanoseconds = static_cast<std::int64_t>(info.st_ctim.tv_sec) * 1'000'000'000
+            + info.st_ctim.tv_nsec,
+    };
+}
+
+// Contention is the only lock failure a caller can wait out. Open and flock
+// failures retain their original cause instead of being reported as a peer.
 enum class LockFailure { Busy, Unusable };
+enum class LockMode { Shared, Exclusive };
 
 struct LockError {
     LockFailure kind{LockFailure::Unusable};
-    std::string message;  // empty for Busy: the caller reads the holder's pid
+    std::string message;
 };
 
-// Advisory exclusive lock serializing state-changing commands against a
-// second sage instance on the same target root. The flock lives on an open fd,
-// so the kernel releases it when the process dies -- no stale-lock cleanup
-// exists by construction. The holder's pid is recorded in the file purely so
-// a rejected instance can name it.
-class RootLock {
+// Host-wide operation lock. Sage flocks the existing /run/lock directory inode
+// and never creates or modifies a lock file. The fd enters this RAII owner
+// immediately after open(), so every return path releases it.
+class OperationLock {
 public:
-    static std::expected<RootLock, LockError> acquire(
-        const std::filesystem::path& path, int wait_seconds = 0) {
-        RootLock lock;
-        lock.fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    using Deadline = std::chrono::steady_clock::time_point;
+    using FlockCall = std::expected<void, int> (*)(int, int);
+
+    static Deadline deadline_after(int wait_seconds) {
+        return std::chrono::steady_clock::now()
+            + std::chrono::seconds(std::max(0, wait_seconds));
+    }
+
+    static std::expected<OperationLock, LockError> acquire(
+        const std::filesystem::path& path,
+        LockMode mode,
+        int wait_seconds = 0)
+    {
+        return acquire_until(path, mode, deadline_after(wait_seconds));
+    }
+
+    static std::expected<OperationLock, LockError> acquire_until(
+        const std::filesystem::path& path,
+        LockMode mode,
+        Deadline deadline)
+    {
+        return acquire_until(path, mode, deadline, call_flock);
+    }
+
+    // Low-level overload used by the regression suite to inject a fatal flock
+    // result and verify that it is not collapsed into contention.
+    static std::expected<OperationLock, LockError> acquire_until(
+        const std::filesystem::path& path,
+        LockMode mode,
+        Deadline deadline,
+        FlockCall flock_call)
+    {
+        OperationLock lock;
+        lock.fd_ = ::open(
+            path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
         if (lock.fd_ < 0) {
+            const int open_errno = errno;
             return std::unexpected(LockError{LockFailure::Unusable, std::format(
-                "cannot open lock file '{}': {}", path.string(), std::strerror(errno))});
+                "cannot open operation lock directory '{}': {}",
+                path.string(), std::strerror(open_errno))});
         }
 
         auto try_lock = [&]() -> std::expected<bool, LockError> {
-            if (::flock(lock.fd_, LOCK_EX | LOCK_NB) == 0) return true;
-            const int lock_errno = errno;
-            if (lock_errno == EWOULDBLOCK || lock_errno == EAGAIN) return false;
-            return std::unexpected(LockError{LockFailure::Unusable, std::format(
-                "cannot lock file '{}': {}", path.string(), std::strerror(lock_errno))});
+            const int operation = mode == LockMode::Shared ? LOCK_SH : LOCK_EX;
+            while (true) {
+                auto result = flock_call(lock.fd_, operation | LOCK_NB);
+                if (result) return true;
+                const int lock_errno = result.error();
+                if (lock_errno == EINTR) continue;
+                if (lock_errno == EWOULDBLOCK || lock_errno == EAGAIN) return false;
+                return std::unexpected(LockError{LockFailure::Unusable, std::format(
+                    "cannot lock operation directory '{}': {}",
+                    path.string(), std::strerror(lock_errno))});
+            }
         };
 
         auto locked = try_lock();
         if (!locked) return std::unexpected(std::move(locked.error()));
-        if (!*locked && wait_seconds > 0) {
-            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(wait_seconds);
-            while (!*locked && std::chrono::steady_clock::now() < deadline) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                locked = try_lock();
-                if (!locked) return std::unexpected(std::move(locked.error()));
-            }
+        while (!*locked && std::chrono::steady_clock::now() < deadline) {
+            const auto remaining = deadline - std::chrono::steady_clock::now();
+            if (remaining <= Deadline::duration::zero()) break;
+            std::this_thread::sleep_for(std::min(
+                std::chrono::duration_cast<std::chrono::milliseconds>(remaining),
+                std::chrono::milliseconds(50)));
+            locked = try_lock();
+            if (!locked) return std::unexpected(std::move(locked.error()));
         }
         if (!*locked) return std::unexpected(LockError{LockFailure::Busy, {}});
-
-        const auto pid = std::format("{}\n", static_cast<long>(getpid()));
-        (void)!::ftruncate(lock.fd_, 0);
-        (void)!::write(lock.fd_, pid.c_str(), pid.size());
         return lock;
     }
 
-    RootLock() = default;
-    RootLock(RootLock&& other) noexcept : fd_(std::exchange(other.fd_, -1)) {}
-    RootLock& operator=(RootLock&& other) noexcept {
+    OperationLock() = default;
+    OperationLock(OperationLock&& other) noexcept
+        : fd_(std::exchange(other.fd_, -1)) {}
+    OperationLock& operator=(OperationLock&& other) noexcept {
         if (fd_ >= 0) ::close(fd_);
         fd_ = std::exchange(other.fd_, -1);
         return *this;
     }
-    RootLock(const RootLock&) = delete;
-    RootLock& operator=(const RootLock&) = delete;
-    ~RootLock() { if (fd_ >= 0) ::close(fd_); }
+    OperationLock(const OperationLock&) = delete;
+    OperationLock& operator=(const OperationLock&) = delete;
+    ~OperationLock() { if (fd_ >= 0) ::close(fd_); }
 
 private:
+    static std::expected<void, int> call_flock(int fd, int operation) {
+        if (::flock(fd, operation) == 0) return {};
+        return std::unexpected(errno);
+    }
+
     int fd_{-1};
 };
 

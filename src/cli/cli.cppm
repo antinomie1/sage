@@ -110,45 +110,104 @@ inline std::optional<CliOptions> parse_args(int argc, char* argv[]) {
     return opts;
 }
 
-// Serialize state-changing commands (install/remove/rebuild) against a second
-// sage instance on the same target root: flock on <db_dir>/lock, held by the
-// returned RootLock for the command's lifetime. Read-only commands never take
-// it and are never blocked.
-inline std::expected<util::RootLock, int> acquire_root_write_lock(const CliOptions& opts) {
-    auto cfg_res = sage::config::SystemConfig::load_from_root(opts.target_root);
+enum class TargetRootSnapshot { Absent, Present };
+enum class DatabaseSnapshot { Unchecked, Absent, Present };
+
+struct OperationContext {
+    util::OperationLock lock;
+    TargetRootSnapshot target_root_snapshot{TargetRootSnapshot::Absent};
+    DatabaseSnapshot database_snapshot{DatabaseSnapshot::Absent};
+};
+
+inline std::expected<bool, std::string> classify_path_probe(
+    const std::filesystem::path& path,
+    std::filesystem::file_status status,
+    const std::error_code& ec,
+    std::filesystem::file_type expected_type,
+    std::string_view description)
+{
+    if (ec == std::errc::no_such_file_or_directory) return false;
+    if (ec) {
+        return std::unexpected(std::format(
+            "cannot inspect {} '{}': {}", description, path.string(), ec.message()));
+    }
+    if (status.type() == std::filesystem::file_type::not_found) return false;
+    if (status.type() != expected_type) {
+        return std::unexpected(std::format(
+            "{} '{}' has the wrong file type", description, path.string()));
+    }
+    return true;
+}
+
+// symlink_status observes the directory entry itself. A symlink is therefore a
+// wrong type instead of silently redirecting the synchronized probe elsewhere.
+inline std::expected<bool, std::string> probe_path_type(
+    const std::filesystem::path& path,
+    std::filesystem::file_type expected_type,
+    std::string_view description)
+{
+    std::error_code ec;
+    const auto status = std::filesystem::symlink_status(path, ec);
+    return classify_path_probe(path, status, ec, expected_type, description);
+}
+
+// install/remove/rebuild call this in main before touching package state. The
+// returned lock spans the complete command and the snapshots are the only DB
+// existence decision those command implementations consume.
+inline std::expected<OperationContext, int> acquire_operation_context(
+    const CliOptions& opts,
+    const std::filesystem::path& operation_lock_path = "/run/lock")
+{
+    const auto mode = opts.dry_run
+        ? sage::util::LockMode::Shared
+        : sage::util::LockMode::Exclusive;
+    auto lock = sage::util::OperationLock::acquire(
+        operation_lock_path, mode, opts.wait_seconds);
+    if (!lock) {
+        if (lock.error().kind == sage::util::LockFailure::Busy) {
+            sage::util::log_error(
+                "another sage package operation is running; retry once it finishes");
+        } else {
+            sage::util::log_error("cannot acquire global operation lock: {}",
+                lock.error().message);
+        }
+        return std::unexpected(1);
+    }
+
+    const auto target_root = opts.target_root.empty()
+        ? std::filesystem::path{"/"}
+        : opts.target_root;
+    auto root_exists = probe_path_type(
+        target_root, std::filesystem::file_type::directory, "target root");
+    if (!root_exists) {
+        sage::util::log_error("{}", root_exists.error());
+        return std::unexpected(1);
+    }
+
+    auto cfg_res = sage::config::SystemConfig::load_from_root(target_root);
     if (!cfg_res) {
         sage::util::log_error("Failed to load configuration: {}", cfg_res.error());
         return std::unexpected(1);
     }
-    const auto lock_path = cfg_res->db_path.parent_path() / "lock";
-
-    if (!opts.dry_run) {
-        // A real first operation will create the database in this directory;
-        // callers should not have to pre-seed Sage's internal state path.
-        std::error_code ec;
-        std::filesystem::create_directories(lock_path.parent_path(), ec);
-        if (ec) {
-            sage::util::log_error("cannot create lock directory '{}': {}",
-                lock_path.parent_path().string(), ec.message());
-            return std::unexpected(1);
-        }
-    }
-
-    auto lock = sage::util::RootLock::acquire(lock_path, opts.wait_seconds);
-    if (!lock) {
-        if (lock.error().kind != sage::util::LockFailure::Busy) {
-            sage::util::log_error("cannot lock target root '{}': {}",
-                cfg_res->root_dir.string(), lock.error().message);
-            return std::unexpected(1);
-        }
-        int holder = 0;
-        if (std::ifstream f(lock_path); f.is_open()) (void)(f >> holder);
-        sage::util::log_error("another sage instance (pid {}) is operating on '{}'; retry once it finishes",
-            holder > 0 ? std::format("{}", holder) : std::string("unknown"),
-            cfg_res->root_dir.string());
+    const auto data_path = cfg_res->db_path.extension() == ".mdb"
+        ? cfg_res->db_path
+        : cfg_res->db_path / "data.mdb";
+    auto database_exists = probe_path_type(
+        data_path, std::filesystem::file_type::regular, "package database");
+    if (!database_exists) {
+        sage::util::log_error("{}", database_exists.error());
         return std::unexpected(1);
     }
-    return std::expected<util::RootLock, int>(std::move(*lock));
+
+    return OperationContext{
+        .lock = std::move(*lock),
+        .target_root_snapshot = *root_exists
+            ? TargetRootSnapshot::Present
+            : TargetRootSnapshot::Absent,
+        .database_snapshot = *database_exists
+            ? DatabaseSnapshot::Present
+            : DatabaseSnapshot::Absent,
+    };
 }
 
 } // namespace sage::cli

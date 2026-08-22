@@ -11,10 +11,27 @@ sage [OPTIONS] <COMMAND> [ARGS...]
 
 Global Options:
   --verbose, -v        Enable detailed verbose diagnostic output
+  --dry-run            Preview install/remove/rebuild without persistent writes
+  --wait[=SECONDS]     Wait for another package-state operation
+  --root <DIR>         Operate on an alternate target root
   --quiet, -q          Suppress informational output
   --help, -h           Show help message
   --version, -V        Display Sage version
 ```
+
+For `install`, `remove`, and `rebuild`, Sage serializes package-state access on
+the existing host `/run/lock` directory inode. Dry-runs take a shared advisory
+lock and real mutations take an exclusive lock; operations for different target
+roots therefore also serialize. The lock directory is opened read-only and is
+never created or modified by Sage.
+
+A dry-run probes the target root and database exactly once after locking. An
+absent database is modeled as empty for install, is a no-op for remove, and is
+an explicit uninitialized-state error for rebuild. An existing database is
+opened with `MDB_RDONLY | MDB_NOLOCK` while the shared host lock remains held.
+Dry-run channel indexes are parsed in memory without updating the target-root
+cache, so previews do not change package files, LMDB files/tables, legacy PID
+locks, or cache state.
 
 ---
 

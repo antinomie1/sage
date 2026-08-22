@@ -2540,59 +2540,339 @@ channel = "system"
     sage::util::log_success("10. Complete Build -> Index -> Install -> Remove (Auto Orphan Cleanup) Closed-Loop OK");
     sage::util::log_success("11. Reverse Dependency Protection & Cascade Removal Safety Locks OK");
 
-    // 12. Target root write lock: a second instance is rejected while one
-    // holds the lock, and the lock frees immediately on release (the same
-    // fd-lifetime semantics that make a killed process safe).
+    // 12. Host operation lock and zero-write dry-run protocol.
     {
-        auto lock_path = temp_dir / "lock";
-        auto first = sage::util::RootLock::acquire(lock_path);
-        if (!first) {
-            sage::util::log_error("Failed to acquire an uncontended root write lock");
-            return 1;
+        const auto operation_lock_path = temp_dir / "operation-lock";
+        std::filesystem::create_directory(operation_lock_path);
+
+        // Shared previews coexist, but their directory lock excludes the first
+        // writer just as it excludes an established writer.
+        {
+            auto shared_a = sage::util::OperationLock::acquire(
+                operation_lock_path, sage::util::LockMode::Shared);
+            auto shared_b = sage::util::OperationLock::acquire(
+                operation_lock_path, sage::util::LockMode::Shared);
+            auto blocked_writer = sage::util::OperationLock::acquire(
+                operation_lock_path, sage::util::LockMode::Exclusive);
+            if (!shared_a || !shared_b || blocked_writer
+                || blocked_writer.error().kind != sage::util::LockFailure::Busy) {
+                sage::util::log_error("SH/SH coexistence or SH-to-EX exclusion failed");
+                return 1;
+            }
         }
-        auto second = sage::util::RootLock::acquire(lock_path);
-        if (second || second.error().kind != sage::util::LockFailure::Busy) {
-            sage::util::log_error("A second root write lock was granted while one is held");
-            return 1;
+
+        // An exclusive writer excludes both modes, then release of its fd makes
+        // the same inode immediately available again.
+        {
+            auto exclusive = sage::util::OperationLock::acquire(
+                operation_lock_path, sage::util::LockMode::Exclusive);
+            auto blocked_reader = sage::util::OperationLock::acquire(
+                operation_lock_path, sage::util::LockMode::Shared);
+            auto blocked_writer = sage::util::OperationLock::acquire(
+                operation_lock_path, sage::util::LockMode::Exclusive);
+            if (!exclusive || blocked_reader || blocked_writer
+                || blocked_reader.error().kind != sage::util::LockFailure::Busy
+                || blocked_writer.error().kind != sage::util::LockFailure::Busy) {
+                sage::util::log_error("EX did not exclude SH and EX contenders");
+                return 1;
+            }
         }
-        int recorded_pid = 0;
-        if (std::ifstream f(lock_path); !(f.is_open() && (f >> recorded_pid)) || recorded_pid != sage::util::current_pid()) {
-            sage::util::log_error("Lock file does not name the holding pid");
-            return 1;
-        }
-        { auto moved = std::move(*first); }  // release: fd closes here
-        auto reacquired = sage::util::RootLock::acquire(lock_path);
-        if (!reacquired) {
-            sage::util::log_error("Root write lock was not reacquirable after release");
+        if (!sage::util::OperationLock::acquire(
+                operation_lock_path, sage::util::LockMode::Shared)) {
+            sage::util::log_error("Operation lock was not reacquirable after release");
             return 1;
         }
 
-        // An unopenable lock path is not contention. Reporting it as such sends
-        // the user hunting for a process that does not exist, so the failure
-        // must carry the real reason instead of the wait-and-retry advice.
-        auto missing = sage::util::RootLock::acquire(temp_dir / "no-such-dir" / "lock");
-        if (missing || missing.error().kind != sage::util::LockFailure::Unusable) {
-            sage::util::log_error("A lock path under a missing directory was not reported as unusable");
-            return 1;
+        // The caller supplies one absolute deadline. Repeated EWOULDBLOCK
+        // results consume it instead of starting a fresh wait on each retry.
+        {
+            auto exclusive = sage::util::OperationLock::acquire(
+                operation_lock_path, sage::util::LockMode::Exclusive);
+            const auto started = std::chrono::steady_clock::now();
+            const auto deadline = started + std::chrono::milliseconds(150);
+            auto waited = sage::util::OperationLock::acquire_until(
+                operation_lock_path, sage::util::LockMode::Shared, deadline);
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - started);
+            if (!exclusive || waited
+                || waited.error().kind != sage::util::LockFailure::Busy
+                || elapsed < std::chrono::milliseconds(100)
+                || elapsed > std::chrono::milliseconds(500)) {
+                sage::util::log_error("Operation lock wait did not honor its absolute deadline");
+                return 1;
+            }
         }
-        if (missing.error().message.find("cannot open lock file") == std::string::npos) {
-            sage::util::log_error("Unusable lock error does not carry the underlying reason");
+
+        // Fatal open/flock failures keep their real classification and reason.
+        auto missing_lock = sage::util::OperationLock::acquire(
+            temp_dir / "no-such-operation-lock", sage::util::LockMode::Shared);
+        auto wrong_lock_file = temp_dir / "operation-lock-file";
+        std::ofstream(wrong_lock_file) << "not a directory\n";
+        auto wrong_lock = sage::util::OperationLock::acquire(
+            wrong_lock_file, sage::util::LockMode::Shared);
+        auto fatal_flock_call = +[](int, int) -> std::expected<void, int> {
+            return std::unexpected(static_cast<int>(std::errc::io_error));
+        };
+        auto fatal_flock = sage::util::OperationLock::acquire_until(
+            operation_lock_path,
+            sage::util::LockMode::Shared,
+            sage::util::OperationLock::deadline_after(0),
+            fatal_flock_call);
+        if (missing_lock || wrong_lock || fatal_flock
+            || missing_lock.error().kind != sage::util::LockFailure::Unusable
+            || wrong_lock.error().kind != sage::util::LockFailure::Unusable
+            || fatal_flock.error().kind != sage::util::LockFailure::Unusable
+            || fatal_flock.error().message.find("Input/output") == std::string::npos) {
+            sage::util::log_error("Fatal operation-lock errors were reported as contention");
             return 1;
         }
 
-        // A real first operation creates its own package-state directory
-        // before locking it; callers do not need to pre-seed var/lib/sage.
-        CliOptions fresh_root;
-        fresh_root.target_root = temp_dir / "fresh-lock-root";
-        auto fresh_lock = acquire_root_write_lock(fresh_root);
-        if (!fresh_lock
-            || !std::filesystem::is_regular_file(
-                fresh_root.target_root / "var/lib/sage/lock")) {
-            sage::util::log_error("A fresh target root could not initialize its write lock");
+        // Probe classification: only ENOENT is absent; permissions and wrong
+        // entry types remain errors. symlink_status also rejects redirected
+        // target roots and data.mdb entries.
+        auto absent_probe = classify_path_probe(
+            "missing", {}, std::make_error_code(std::errc::no_such_file_or_directory),
+            std::filesystem::file_type::regular, "fixture");
+        auto permission_probe = classify_path_probe(
+            "denied", {}, std::make_error_code(std::errc::permission_denied),
+            std::filesystem::file_type::regular, "fixture");
+        auto wrong_type_probe = classify_path_probe(
+            "directory", std::filesystem::file_status{std::filesystem::file_type::directory}, {},
+            std::filesystem::file_type::regular, "fixture");
+        if (!absent_probe || *absent_probe || permission_probe || wrong_type_probe
+            || permission_probe.error().find("Permission denied") == std::string::npos
+            || wrong_type_probe.error().find("wrong file type") == std::string::npos) {
+            sage::util::log_error("Database probe error classification failed");
+            return 1;
+        }
+
+        // An absent target can be previewed without creating the root. The held
+        // SH lock also excludes the first real writer.
+        const auto absent_root = temp_dir / "dry-run-absent-root";
+        {
+            CliOptions absent_opts;
+            absent_opts.target_root = absent_root;
+            absent_opts.args = {"dummy-tool"};
+            absent_opts.dry_run = true;
+            auto context = acquire_operation_context(absent_opts, operation_lock_path);
+            auto first_writer = sage::util::OperationLock::acquire(
+                operation_lock_path, sage::util::LockMode::Exclusive);
+            if (!context
+                || context->target_root_snapshot != TargetRootSnapshot::Absent
+                || context->database_snapshot != DatabaseSnapshot::Absent
+                || first_writer
+                || first_writer.error().kind != sage::util::LockFailure::Busy
+                || cmd_remove(absent_opts, context->database_snapshot) != 0
+                || cmd_rebuild(absent_opts, context->database_snapshot) == 0
+                || std::filesystem::exists(absent_root)) {
+                sage::util::log_error("Absent-root dry-run created state or admitted a writer");
+                return 1;
+            }
+        }
+        if (std::filesystem::exists(absent_root)) {
+            sage::util::log_error("Absent-root preview persisted a target path");
+            return 1;
+        }
+
+        // A present root with no DB uses an empty installed set. Install parses
+        // the channel in memory, remove is a no-op, and rebuild is explicit.
+        const auto empty_root = temp_dir / "dry-run-empty-db-root";
+        if (!write_test_channel(empty_root, local_repo)) {
+            sage::util::log_error("Failed to create empty-DB dry-run fixture");
+            return 1;
+        }
+        {
+            CliOptions dry_install;
+            dry_install.target_root = empty_root;
+            dry_install.args = {"dummy-tool"};
+            dry_install.dry_run = true;
+            auto context = acquire_operation_context(dry_install, operation_lock_path);
+            if (!context
+                || context->target_root_snapshot != TargetRootSnapshot::Present
+                || context->database_snapshot != DatabaseSnapshot::Absent
+                || cmd_install(dry_install, std::nullopt, context->database_snapshot) != 0
+                || cmd_remove(dry_install, context->database_snapshot) != 0
+                || cmd_rebuild(dry_install, context->database_snapshot) == 0) {
+                sage::util::log_error("Absent-database dry-run semantics failed");
+                return 1;
+            }
+        }
+        if (std::filesystem::exists(empty_root / "var/lib/sage")
+            || std::filesystem::exists(empty_root / "var/cache/sage")
+            || std::filesystem::exists(empty_root / "usr/bin/dummy")) {
+            sage::util::log_error("Empty-database dry-run persisted target state");
+            return 1;
+        }
+
+        // The operation context is a frozen snapshot. Even if a test bypasses
+        // the protocol and creates a directory-shaped data.mdb afterwards, an
+        // Absent command path neither re-probes nor opens it.
+        const auto frozen_root = temp_dir / "frozen-absent-snapshot-root";
+        if (!write_test_channel(frozen_root, local_repo)) return 1;
+        {
+            CliOptions frozen;
+            frozen.target_root = frozen_root;
+            frozen.args = {"dummy-tool"};
+            frozen.dry_run = true;
+            auto context = acquire_operation_context(frozen, operation_lock_path);
+            if (!context || context->database_snapshot != DatabaseSnapshot::Absent) return 1;
+            std::filesystem::create_directories(frozen_root / "var/lib/sage/data.mdb");
+            if (cmd_install(frozen, std::nullopt, context->database_snapshot) != 0
+                || cmd_remove(frozen, context->database_snapshot) != 0) {
+                sage::util::log_error("Commands re-probed a frozen Absent database snapshot");
+                return 1;
+            }
+        }
+
+        // Wrong target/data types and ENOTDIR are never treated as an empty DB.
+        const auto wrong_db_root = temp_dir / "wrong-db-type-root";
+        std::filesystem::create_directories(wrong_db_root / "var/lib/sage/data.mdb");
+        CliOptions wrong_db;
+        wrong_db.target_root = wrong_db_root;
+        wrong_db.dry_run = true;
+        if (acquire_operation_context(wrong_db, operation_lock_path)) {
+            sage::util::log_error("Directory-shaped data.mdb was treated as absent");
+            return 1;
+        }
+        const auto symlink_db_root = temp_dir / "symlink-db-root";
+        std::filesystem::create_directories(symlink_db_root / "var/lib/sage");
+        std::ofstream(temp_dir / "regular-db-decoy") << "not LMDB\n";
+        std::filesystem::create_symlink(
+            temp_dir / "regular-db-decoy", symlink_db_root / "var/lib/sage/data.mdb");
+        wrong_db.target_root = symlink_db_root;
+        if (acquire_operation_context(wrong_db, operation_lock_path)) {
+            sage::util::log_error("Symlink data.mdb was accepted by the synchronized probe");
+            return 1;
+        }
+        const auto enotdir_root = temp_dir / "enotdir-root";
+        std::filesystem::create_directory(enotdir_root);
+        std::ofstream(enotdir_root / "var") << "not a directory\n";
+        wrong_db.target_root = enotdir_root;
+        if (acquire_operation_context(wrong_db, operation_lock_path)) {
+            sage::util::log_error("ENOTDIR database path was treated as absent");
+            return 1;
+        }
+        const auto symlink_root = temp_dir / "symlink-root";
+        std::filesystem::create_directory(temp_dir / "real-root");
+        std::filesystem::create_directory_symlink(temp_dir / "real-root", symlink_root);
+        wrong_db.target_root = symlink_root;
+        if (acquire_operation_context(wrong_db, operation_lock_path)) {
+            sage::util::log_error("Symlink target root was accepted by the synchronized probe");
+            return 1;
+        }
+
+        // Seed a normal DB and package, then prove every relevant byte and
+        // size/mtime/ctime remains stable across all three previews. atime is
+        // intentionally excluded because reads may update it.
+        if (cmd_install(inst_opts) != 0) {
+            sage::util::log_error("Failed to seed present-DB dry-run fixture");
+            return 1;
+        }
+        {
+            auto fixture_cfg = sage::config::SystemConfig::load_from_root(isolated_target);
+            auto fixture_db = sage::db::Database::open(
+                isolated_target / "var/lib/sage/data.mdb");
+            if (!fixture_cfg || !fixture_db) return 1;
+            auto txn = fixture_db->begin_write_txn();
+            if (!txn) return 1;
+            for (const auto& [iface, provider] : fixture_cfg->exclusive_providers()) {
+                auto stored = fixture_db->set_system_provider(*txn, iface, provider);
+                if (!stored) return 1;
+            }
+            if (!txn->commit()) return 1;
+        }
+        const auto legacy_pid_lock = isolated_target / "var/lib/sage/lock";
+        std::ofstream(legacy_pid_lock) << "legacy-pid-sentinel\n";
+        const std::vector<std::filesystem::path> watched_files{
+            isolated_target / "var/lib/sage/data.mdb",
+            isolated_target / "var/lib/sage/lock.mdb",
+            legacy_pid_lock,
+            isolated_target / "var/cache/sage/channels/core.toml",
+            isolated_target / "usr/bin/dummy",
+        };
+        std::map<std::filesystem::path,
+            std::pair<std::string, sage::util::FileMetadataSnapshot>> before;
+        for (const auto& path : watched_files) {
+            auto metadata = sage::util::snapshot_file_metadata(path);
+            if (!metadata) {
+                sage::util::log_error("Missing present-DB dry-run fixture '{}': {}",
+                    path.string(), metadata.error());
+                return 1;
+            }
+            before.emplace(path, std::pair{read_test_file(path), *metadata});
+        }
+        {
+            CliOptions dry_install = inst_opts;
+            dry_install.dry_run = true;
+            auto context = acquire_operation_context(dry_install, operation_lock_path);
+            if (!context || context->database_snapshot != DatabaseSnapshot::Present
+                || cmd_install(dry_install, std::nullopt, context->database_snapshot) != 0) {
+                sage::util::log_error("Present-DB install preview failed");
+                return 1;
+            }
+            CliOptions dry_remove = rem_opts;
+            dry_remove.dry_run = true;
+            if (cmd_remove(dry_remove, context->database_snapshot) != 0) {
+                sage::util::log_error("Present-DB remove preview failed");
+                return 1;
+            }
+            CliOptions dry_rebuild;
+            dry_rebuild.target_root = isolated_target;
+            dry_rebuild.dry_run = true;
+            if (cmd_rebuild(dry_rebuild, context->database_snapshot) != 0) {
+                sage::util::log_error("Present-DB rebuild preview failed");
+                return 1;
+            }
+        }
+        for (const auto& [path, expected] : before) {
+            auto metadata = sage::util::snapshot_file_metadata(path);
+            if (!metadata || *metadata != expected.second
+                || read_test_file(path) != expected.first) {
+                sage::util::log_error("Dry-run modified content or metadata for '{}'", path.string());
+                return 1;
+            }
+        }
+
+        // A real EX-held operation still initializes a fresh root, and another
+        // EX-held operation mutates the established state normally.
+        const auto fresh_root = temp_dir / "fresh-operation-root";
+        CliOptions fresh_install;
+        fresh_install.target_root = fresh_root;
+        fresh_install.args = {"dummy-tool"};
+        {
+            auto context = acquire_operation_context(fresh_install, operation_lock_path);
+            if (!context
+                || context->target_root_snapshot != TargetRootSnapshot::Absent
+                || context->database_snapshot != DatabaseSnapshot::Absent
+                || !write_test_channel(fresh_root, local_repo)
+                || cmd_install(fresh_install, std::nullopt, context->database_snapshot) != 0) {
+                sage::util::log_error("Real operation failed to initialize a fresh target root");
+                return 1;
+            }
+        }
+        if (!std::filesystem::is_regular_file(fresh_root / "var/lib/sage/data.mdb")
+            || !std::filesystem::exists(fresh_root / "usr/bin/dummy")
+            || std::filesystem::exists(fresh_root / "var/lib/sage/lock")) {
+            sage::util::log_error("Fresh mutation did not create the expected package state");
+            return 1;
+        }
+        CliOptions fresh_remove;
+        fresh_remove.target_root = fresh_root;
+        fresh_remove.args = {"dummy-tool"};
+        {
+            auto context = acquire_operation_context(fresh_remove, operation_lock_path);
+            if (!context || context->database_snapshot != DatabaseSnapshot::Present
+                || cmd_remove(fresh_remove, context->database_snapshot) != 0) {
+                sage::util::log_error("Real operation failed to mutate established state");
+                return 1;
+            }
+        }
+        if (std::filesystem::exists(fresh_root / "usr/bin/dummy")) {
+            sage::util::log_error("Real remove left the installed package file behind");
             return 1;
         }
     }
-    sage::util::log_success("12. Target Root Write Lock Rejection & Release OK");
+    sage::util::log_success("12. Global Operation Lock & Zero-Write Dry-Run Protocol OK");
 
     // 13. Build configuration: global flag injection, the per-recipe [build]
     // override (which doubles as the fourth phase-command scope), and the

@@ -20,26 +20,26 @@ int main(int argc, char* argv[]) {
 
     using namespace sage::cli;
 
-    // State-changing commands take the target root's write lock first, so a
-    // second concurrent sage fails fast at the entrance instead of racing.
-    std::optional<sage::util::RootLock> mutation_lock;
+    // Package-state commands share one host operation lock. Its lifetime spans
+    // command return, so command-local LMDB environments close before unlock.
+    std::optional<OperationContext> operation;
     if (opts.command == "install" || opts.command == "remove" || opts.command == "rebuild") {
-        auto lock_res = acquire_root_write_lock(opts);
-        if (!lock_res) return lock_res.error();
-        mutation_lock = std::move(*lock_res);
+        auto operation_res = acquire_operation_context(opts);
+        if (!operation_res) return operation_res.error();
+        operation = std::move(*operation_res);
     }
 
     if (opts.command == "install") {
-        return cmd_install(opts);
+        return cmd_install(opts, std::nullopt, operation->database_snapshot);
     }
     if (opts.command == "remove") {
-        return cmd_remove(opts);
+        return cmd_remove(opts, operation->database_snapshot);
     }
     if (opts.command == "build") {
         return cmd_build(opts);
     }
     if (opts.command == "rebuild") {
-        return cmd_rebuild(opts);
+        return cmd_rebuild(opts, operation->database_snapshot);
     }
     if (opts.command == "status") {
         return cmd_status(opts);

@@ -544,7 +544,8 @@ public:
 
     static std::expected<ChannelIndex, std::string> sync_channel(
         const Channel& ch,
-        const std::filesystem::path& cache_dir) 
+        const std::filesystem::path& cache_dir,
+        bool persist_cache = true)
     {
         std::string index_url = ch.url;
         if (!index_url.ends_with('/')) index_url += '/';
@@ -558,15 +559,17 @@ public:
         auto index_res = ChannelIndex::parse_toml(*content);
         if (!index_res) return index_res;
 
-        // Cache index locally, best effort: a read-only or missing cache dir
-        // must not fail the sync itself.
-        std::filesystem::path local_idx = cache_dir / "channels" / (ch.name + ".toml");
-        std::error_code cache_ec;
-        std::filesystem::create_directories(local_idx.parent_path(), cache_ec);
-        if (!cache_ec) {
-            std::ofstream f(local_idx);
-            if (f.is_open()) {
-                f << *content;
+        if (persist_cache) {
+            // Cache index locally, best effort: a read-only or missing cache
+            // directory must not fail the sync itself.
+            std::filesystem::path local_idx = cache_dir / "channels" / (ch.name + ".toml");
+            std::error_code cache_ec;
+            std::filesystem::create_directories(local_idx.parent_path(), cache_ec);
+            if (!cache_ec) {
+                std::ofstream f(local_idx);
+                if (f.is_open()) {
+                    f << *content;
+                }
             }
         }
 
