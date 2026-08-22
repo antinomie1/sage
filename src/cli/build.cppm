@@ -71,29 +71,6 @@ std::string version_after(std::string_view text, size_t pos) {
     return {};
 }
 
-// Version stamp serialization: a lone producer keeps the plain form
-// ("22.1.8"); several producers pair each version with its owner
-// ("clang: 22.1.8, gcc: 15.3.0") so a version can never be misattributed.
-// Distinct versions from one producer join with '+' (rare: mixed inputs).
-std::string serialize_producer_versions(const Provenance& prov) {
-    std::vector<std::string> parts;
-    for (const auto& name : prov.producers) {
-        auto it = prov.producer_versions.find(name);
-        if (it == prov.producer_versions.end() || it->second.empty()) {
-            parts.push_back(name);  // listed, but no version parsed
-            continue;
-        }
-        std::string part = std::format("{}: {}", name, *it->second.begin());
-        for (auto extra = std::next(it->second.begin()); extra != it->second.end(); ++extra) {
-            part += std::format("+{}", *extra);
-        }
-        parts.push_back(std::move(part));
-    }
-    std::string out;
-    for (auto& part : parts) out += (out.empty() ? "" : ", ") + part;
-    return out;
-}
-
 // Producer fingerprints live in .comment-style strings, which sit in the
 // leading or trailing slabs of real artifacts; capping the read keeps huge
 // libraries (libLLVM) cheap to inspect without parsing section tables.
@@ -586,13 +563,23 @@ export int cmd_build(const CliOptions& opts) {
 
     // The provenance verdict, now that every payload file has been seen.
     if (provenance.compiled) {
-        if (!provenance.producers.empty()) {
-            std::string joined;
-            for (const auto& p : provenance.producers) {
-                joined += (joined.empty() ? "" : ", ") + p;
+        // One compiler, the one that actually produced the objects. Every
+        // clang- or rustc-linked binary also carries a gcc trace in its crt
+        // startup files' .comment, so a producer *set* is disambiguated by
+        // toolchain precedence rather than joined: gcc only wins when it is
+        // all there is (i.e. gcc really did build it).
+        static constexpr std::array<std::string_view, 3> PRECEDENCE{"rustc", "clang", "gcc"};
+        for (const auto& want : PRECEDENCE) {
+            if (!provenance.producers.contains(std::string{want})) continue;
+            manifest.build_compiler = std::string{want};
+            if (auto it = provenance.producer_versions.find(std::string{want});
+                it != provenance.producer_versions.end() && !it->second.empty()) {
+                std::string versions;
+                for (const auto& v : it->second)
+                    versions += (versions.empty() ? "" : "+") + v;
+                manifest.build_compiler_version = std::move(versions);
             }
-            manifest.build_compiler = std::move(joined);
-            manifest.build_compiler_version = serialize_producer_versions(provenance);
+            break;
         }
         if (!eff_cflags.empty()) manifest.build_cflags = eff_cflags;
         if (!eff_cxxflags.empty()) manifest.build_cxxflags = eff_cxxflags;
