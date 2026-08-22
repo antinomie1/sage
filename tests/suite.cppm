@@ -1468,7 +1468,10 @@ release = "10"
     const auto lmdb_lock_before = read_test_file(lmdb_lock_path);
     {
         auto dry_run_lock = acquire_root_write_lock(existing_dry_run);
-        if (!dry_run_lock || cmd_install(existing_dry_run) != 0) {
+        auto blocked_writer = sage::util::RootLock::acquire_directory(isolated_target);
+        if (!dry_run_lock || blocked_writer
+            || blocked_writer.error().kind != sage::util::LockFailure::Busy
+            || cmd_install(existing_dry_run) != 0) {
             sage::util::log_error("Existing-target dry-run failed");
             return 1;
         }
@@ -1492,10 +1495,32 @@ release = "10"
     dry_run_install.args = {"dummy-tool"};
     dry_run_install.dry_run = true;
     auto dry_run_lock = acquire_root_write_lock(dry_run_install);
-    if (!dry_run_lock
+    auto blocked_first_install = sage::util::RootLock::acquire_directory(dry_run_target);
+    if (!dry_run_lock || blocked_first_install
+        || blocked_first_install.error().kind != sage::util::LockFailure::Busy
         || cmd_install(dry_run_install) != 0
         || std::filesystem::exists(dry_run_target / "var/lib/sage")) {
         sage::util::log_error("Dry-run initialized package state under a fresh target root");
+        return 1;
+    }
+
+    // Probe failures are not equivalent to an empty database: otherwise a
+    // permission or type error would silently produce an incorrect preview.
+    auto invalid_probe_target = temp_dir / "invalid-database-probe-target";
+    if (!write_test_channel(invalid_probe_target, local_repo)) {
+        sage::util::log_error("Failed to configure invalid database probe target");
+        return 1;
+    }
+    std::filesystem::create_directories(
+        invalid_probe_target / "var/lib/sage/data.mdb");
+    CliOptions invalid_probe_remove;
+    invalid_probe_remove.target_root = invalid_probe_target;
+    invalid_probe_remove.args = {"dummy-tool"};
+    invalid_probe_remove.dry_run = true;
+    auto invalid_probe_lock = acquire_root_write_lock(invalid_probe_remove);
+    if (!invalid_probe_lock || cmd_remove(invalid_probe_remove) == 0
+        || std::filesystem::exists(invalid_probe_target / "var/lib/sage/lock")) {
+        sage::util::log_error("Invalid database probe was treated as empty state");
         return 1;
     }
 

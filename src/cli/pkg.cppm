@@ -52,7 +52,16 @@ export int cmd_install(
 
     std::optional<sage::db::Database> database;
     std::vector<sage::package::PackageManifest> installed_packages;
-    if (!opts.dry_run || package_database_exists(cfg.db_path)) {
+    bool database_exists = true;
+    if (opts.dry_run) {
+        auto exists_res = package_database_exists(cfg.db_path);
+        if (!exists_res) {
+            sage::util::log_error("{}", exists_res.error());
+            return 1;
+        }
+        database_exists = *exists_res;
+    }
+    if (!opts.dry_run || database_exists) {
         auto db_res = opts.dry_run
             ? sage::db::Database::open_read_only_externally_locked(cfg.db_path)
             : sage::db::Database::open(cfg.db_path);
@@ -604,12 +613,19 @@ export int cmd_remove(const CliOptions& opts) {
     }
     const auto& cfg = *cfg_res;
 
-    if (opts.dry_run && !package_database_exists(cfg.db_path)) {
-        for (const auto& pkg_name : opts.args) {
-            sage::util::log_warn("Package '{}' is not installed, skipping", pkg_name);
+    if (opts.dry_run) {
+        auto exists_res = package_database_exists(cfg.db_path);
+        if (!exists_res) {
+            sage::util::log_error("{}", exists_res.error());
+            return 1;
         }
-        sage::util::log_info("No matching installed packages found to remove.");
-        return 0;
+        if (!*exists_res) {
+            for (const auto& pkg_name : opts.args) {
+                sage::util::log_warn("Package '{}' is not installed, skipping", pkg_name);
+            }
+            sage::util::log_info("No matching installed packages found to remove.");
+            return 0;
+        }
     }
 
     auto db_res = opts.dry_run
@@ -1029,11 +1045,18 @@ export int cmd_rebuild(const CliOptions& opts) {
         return 1;
     }
 
-    if (opts.dry_run && !package_database_exists(cfg_res->db_path)) {
-        sage::util::log_error(
-            "Cannot calculate rebuild preview: no package database exists at {}",
-            cfg_res->db_path.string());
-        return 1;
+    if (opts.dry_run) {
+        auto exists_res = package_database_exists(cfg_res->db_path);
+        if (!exists_res) {
+            sage::util::log_error("{}", exists_res.error());
+            return 1;
+        }
+        if (!*exists_res) {
+            sage::util::log_error(
+                "Cannot calculate rebuild preview: no package database exists at {}",
+                cfg_res->db_path.string());
+            return 1;
+        }
     }
 
     auto db_res = opts.dry_run

@@ -215,12 +215,30 @@ class RootLock {
 public:
     static std::expected<RootLock, LockError> acquire(
         const std::filesystem::path& path, int wait_seconds = 0) {
-        return acquire_impl(path, wait_seconds, false);
+        return acquire_impl(path, wait_seconds, false, false);
     }
 
     static std::expected<RootLock, LockError> acquire_read_only(
         const std::filesystem::path& path, int wait_seconds = 0) {
-        return acquire_impl(path, wait_seconds, true);
+        return acquire_impl(path, wait_seconds, true, false);
+    }
+
+    static std::expected<RootLock, LockError> acquire_directory(
+        const std::filesystem::path& path,
+        int wait_seconds = 0,
+        const std::filesystem::path& pid_path = {}) {
+        auto lock = acquire_impl(path, wait_seconds, false, true);
+        if (!lock) return lock;
+        if (!pid_path.empty()) {
+            std::ofstream pid_file(pid_path, std::ios::trunc);
+            if (pid_file.is_open()) pid_file << current_pid() << '\n';
+        }
+        return lock;
+    }
+
+    static std::expected<RootLock, LockError> acquire_directory_read_only(
+        const std::filesystem::path& path, int wait_seconds = 0) {
+        return acquire_impl(path, wait_seconds, true, true);
     }
 
     RootLock() = default;
@@ -236,18 +254,22 @@ public:
 
 private:
     static std::expected<RootLock, LockError> acquire_impl(
-        const std::filesystem::path& path, int wait_seconds, bool read_only) {
-        const int open_flags = read_only
-            ? O_RDONLY | O_CLOEXEC
-            : O_RDWR | O_CREAT | O_CLOEXEC;
-        int fd = ::open(path.c_str(), open_flags, 0644);
-        if (fd < 0) {
+        const std::filesystem::path& path,
+        int wait_seconds,
+        bool read_only,
+        bool directory) {
+        int open_flags = O_RDONLY | O_CLOEXEC;
+        if (directory) open_flags |= O_DIRECTORY;
+        else if (!read_only) open_flags = O_RDWR | O_CREAT | O_CLOEXEC;
+        RootLock lock;
+        lock.fd_ = ::open(path.c_str(), open_flags, 0644);
+        if (lock.fd_ < 0) {
             return std::unexpected(LockError{LockFailure::Unusable, std::format(
                 "cannot open lock file '{}': {}", path.string(), std::strerror(errno))});
         }
 
         auto try_lock = [&]() -> std::expected<bool, LockError> {
-            if (::flock(fd, (read_only ? LOCK_SH : LOCK_EX) | LOCK_NB) == 0) return true;
+            if (::flock(lock.fd_, (read_only ? LOCK_SH : LOCK_EX) | LOCK_NB) == 0) return true;
             const int lock_errno = errno;
             if (lock_errno == EWOULDBLOCK || lock_errno == EAGAIN) return false;
             return std::unexpected(LockError{LockFailure::Unusable, std::format(
@@ -255,32 +277,21 @@ private:
         };
 
         auto locked = try_lock();
-        if (!locked) {
-            ::close(fd);
-            return std::unexpected(std::move(locked.error()));
-        }
+        if (!locked) return std::unexpected(std::move(locked.error()));
         if (!*locked && wait_seconds > 0) {
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(wait_seconds);
             while (!*locked && std::chrono::steady_clock::now() < deadline) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 locked = try_lock();
-                if (!locked) {
-                    ::close(fd);
-                    return std::unexpected(std::move(locked.error()));
-                }
+                if (!locked) return std::unexpected(std::move(locked.error()));
             }
         }
-        if (!*locked) {
-            ::close(fd);
-            return std::unexpected(LockError{LockFailure::Busy, {}});
-        }
-        if (!read_only) {
+        if (!*locked) return std::unexpected(LockError{LockFailure::Busy, {}});
+        if (!read_only && !directory) {
             const auto pid = std::format("{}\n", static_cast<long>(getpid()));
-            (void)!::ftruncate(fd, 0);
-            (void)!::write(fd, pid.c_str(), pid.size());
+            (void)!::ftruncate(lock.fd_, 0);
+            (void)!::write(lock.fd_, pid.c_str(), pid.size());
         }
-        RootLock lock;
-        lock.fd_ = fd;
         return lock;
     }
     int fd_{-1};
