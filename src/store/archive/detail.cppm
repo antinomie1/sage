@@ -385,10 +385,16 @@ inline std::expected<std::string, std::string> normalize_data_path(std::string_v
     }
 
     auto normalized = path.lexically_normal();
-    if (normalized.empty() || normalized == ".") {
+    // Directory entries arrive as "usr/" and lexically_normal preserves the
+    // trailing separator -- which would make filename() empty downstream
+    // (mkdirat(fd, "") fails with ENOENT). Strip trailing separators so a
+    // single-component directory anchors on the target root itself.
+    auto text = normalized.generic_string();
+    while (text.size() > 1 && text.back() == '/') text.pop_back();
+    if (text.empty() || text == "." || text == "/") {
         return std::unexpected("Package data path is empty");
     }
-    return normalized.generic_string();
+    return text;
 }
 inline std::expected<void, std::string> validate_target_path(
     const PackageDataEntry& entry,
