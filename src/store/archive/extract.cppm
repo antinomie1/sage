@@ -109,6 +109,11 @@ inline std::expected<void, std::string> remove_path_anchored(
         }
         return std::unexpected(std::strerror(errno));
     }
+    if (::fsync(current.get()) != 0) {
+        return std::unexpected(
+            "Cannot sync parent after removing path: "
+            + std::string(std::strerror(errno)));
+    }
     return {};
 }
 // ============================================================================
@@ -251,6 +256,11 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
                 return std::unexpected(std::format(
                     "Cannot create symlink '{}' -> '{}': {}",
                     rel_path, archive_entry.linkname, std::strerror(errno)));
+            }
+            if (::fsync(destination->directory.get()) != 0) {
+                return std::unexpected(std::format(
+                    "Cannot sync parent after creating symlink '{}': {}",
+                    rel_path, std::strerror(errno)));
             }
         } else {
             entry.type = package::FileType::Regular;
