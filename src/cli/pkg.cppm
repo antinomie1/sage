@@ -8,14 +8,6 @@ import sage.cli;
 
 namespace sage::cli {
 
-inline bool package_database_exists(const std::filesystem::path& db_path) {
-    const auto data_path = db_path.extension() == ".mdb"
-        ? db_path
-        : db_path / "data.mdb";
-    std::error_code ec;
-    return std::filesystem::is_regular_file(data_path, ec);
-}
-
 // ============================================================================
 // End-to-End `sage install <PKG...>` Implementation
 // ============================================================================
@@ -61,7 +53,9 @@ export int cmd_install(
     std::optional<sage::db::Database> database;
     std::vector<sage::package::PackageManifest> installed_packages;
     if (!opts.dry_run || package_database_exists(cfg.db_path)) {
-        auto db_res = sage::db::Database::open(cfg.db_path, opts.dry_run);
+        auto db_res = opts.dry_run
+            ? sage::db::Database::open_read_only_externally_locked(cfg.db_path)
+            : sage::db::Database::open(cfg.db_path);
         if (!db_res) {
             sage::util::log_error("Failed to open database at {}: {}", cfg.db_path.string(), db_res.error());
             return 1;
@@ -618,7 +612,9 @@ export int cmd_remove(const CliOptions& opts) {
         return 0;
     }
 
-    auto db_res = sage::db::Database::open(cfg.db_path, opts.dry_run);
+    auto db_res = opts.dry_run
+        ? sage::db::Database::open_read_only_externally_locked(cfg.db_path)
+        : sage::db::Database::open(cfg.db_path);
     if (!db_res) {
         sage::util::log_error("Failed to open database: {}", db_res.error());
         return 1;
@@ -1040,7 +1036,9 @@ export int cmd_rebuild(const CliOptions& opts) {
         return 1;
     }
 
-    auto db_res = sage::db::Database::open(cfg_res->db_path, opts.dry_run);
+    auto db_res = opts.dry_run
+        ? sage::db::Database::open_read_only_externally_locked(cfg_res->db_path)
+        : sage::db::Database::open(cfg_res->db_path);
     if (!db_res) {
         sage::util::log_error("Failed to open database: {}", db_res.error());
         return 1;

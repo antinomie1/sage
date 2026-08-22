@@ -1448,6 +1448,38 @@ release = "10"
             std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
     };
 
+    // Existing-state previews take Sage's shared lock and disable LMDB's own
+    // writable lock table. Neither lock file may change while reading the plan.
+    CliOptions existing_dry_run;
+    existing_dry_run.target_root = isolated_target;
+    existing_dry_run.args = {"dummy-tool"};
+    existing_dry_run.dry_run = true;
+    {
+        CliOptions seed_lock;
+        seed_lock.target_root = isolated_target;
+        if (!acquire_root_write_lock(seed_lock)) {
+            sage::util::log_error("Failed to create existing-target lock fixture");
+            return 1;
+        }
+    }
+    const auto sage_lock_path = isolated_target / "var/lib/sage/lock";
+    const auto lmdb_lock_path = isolated_target / "var/lib/sage/lock.mdb";
+    const auto sage_lock_before = read_test_file(sage_lock_path);
+    const auto lmdb_lock_before = read_test_file(lmdb_lock_path);
+    {
+        auto dry_run_lock = acquire_root_write_lock(existing_dry_run);
+        if (!dry_run_lock || cmd_install(existing_dry_run) != 0) {
+            sage::util::log_error("Existing-target dry-run failed");
+            return 1;
+        }
+    }
+    if (read_test_file(sage_lock_path) != sage_lock_before
+        || read_test_file(lmdb_lock_path) != lmdb_lock_before
+        || std::filesystem::exists(isolated_target / "usr/bin/dummy")) {
+        sage::util::log_error("Existing-target dry-run modified package or lock state");
+        return 1;
+    }
+
     // A preview against a fresh target must not initialize the lock or LMDB
     // hierarchy while resolving the same package plan as a real install.
     auto dry_run_target = temp_dir / "dry-run-target";
@@ -2580,9 +2612,20 @@ channel = "system"
             return 1;
         }
         { auto moved = std::move(*first); }  // release: fd closes here
-        auto reacquired = sage::util::RootLock::acquire(lock_path);
-        if (!reacquired) {
-            sage::util::log_error("Root write lock was not reacquirable after release");
+        {
+            auto reacquired = sage::util::RootLock::acquire(lock_path);
+            if (!reacquired) {
+                sage::util::log_error("Root write lock was not reacquirable after release");
+                return 1;
+            }
+        }
+
+        auto first_reader = sage::util::RootLock::acquire_read_only(lock_path);
+        auto second_reader = sage::util::RootLock::acquire_read_only(lock_path);
+        auto blocked_writer = sage::util::RootLock::acquire(lock_path);
+        if (!first_reader || !second_reader || blocked_writer
+            || blocked_writer.error().kind != sage::util::LockFailure::Busy) {
+            sage::util::log_error("Shared dry-run locks did not exclude a writer");
             return 1;
         }
 

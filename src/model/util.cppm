@@ -215,28 +215,12 @@ class RootLock {
 public:
     static std::expected<RootLock, LockError> acquire(
         const std::filesystem::path& path, int wait_seconds = 0) {
-        int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-        if (fd < 0) {
-            return std::unexpected(LockError{LockFailure::Unusable, std::format(
-                "cannot open lock file '{}': {}", path.string(), std::strerror(errno))});
-        }
-        auto locked = [&] { return ::flock(fd, LOCK_EX | LOCK_NB) == 0; };
-        if (!locked() && wait_seconds > 0) {
-            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(wait_seconds);
-            while (!locked() && std::chrono::steady_clock::now() < deadline) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-        }
-        if (!locked()) {
-            ::close(fd);
-            return std::unexpected(LockError{LockFailure::Busy, {}});
-        }
-        const auto pid = std::format("{}\n", static_cast<long>(getpid()));
-        (void)!::ftruncate(fd, 0);
-        (void)!::write(fd, pid.c_str(), pid.size());
-        RootLock lock;
-        lock.fd_ = fd;
-        return lock;
+        return acquire_impl(path, wait_seconds, false);
+    }
+
+    static std::expected<RootLock, LockError> acquire_read_only(
+        const std::filesystem::path& path, int wait_seconds = 0) {
+        return acquire_impl(path, wait_seconds, true);
     }
 
     RootLock() = default;
@@ -251,6 +235,54 @@ public:
     ~RootLock() { if (fd_ >= 0) ::close(fd_); }
 
 private:
+    static std::expected<RootLock, LockError> acquire_impl(
+        const std::filesystem::path& path, int wait_seconds, bool read_only) {
+        const int open_flags = read_only
+            ? O_RDONLY | O_CLOEXEC
+            : O_RDWR | O_CREAT | O_CLOEXEC;
+        int fd = ::open(path.c_str(), open_flags, 0644);
+        if (fd < 0) {
+            return std::unexpected(LockError{LockFailure::Unusable, std::format(
+                "cannot open lock file '{}': {}", path.string(), std::strerror(errno))});
+        }
+
+        auto try_lock = [&]() -> std::expected<bool, LockError> {
+            if (::flock(fd, (read_only ? LOCK_SH : LOCK_EX) | LOCK_NB) == 0) return true;
+            const int lock_errno = errno;
+            if (lock_errno == EWOULDBLOCK || lock_errno == EAGAIN) return false;
+            return std::unexpected(LockError{LockFailure::Unusable, std::format(
+                "cannot lock file '{}': {}", path.string(), std::strerror(lock_errno))});
+        };
+
+        auto locked = try_lock();
+        if (!locked) {
+            ::close(fd);
+            return std::unexpected(std::move(locked.error()));
+        }
+        if (!*locked && wait_seconds > 0) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(wait_seconds);
+            while (!*locked && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                locked = try_lock();
+                if (!locked) {
+                    ::close(fd);
+                    return std::unexpected(std::move(locked.error()));
+                }
+            }
+        }
+        if (!*locked) {
+            ::close(fd);
+            return std::unexpected(LockError{LockFailure::Busy, {}});
+        }
+        if (!read_only) {
+            const auto pid = std::format("{}\n", static_cast<long>(getpid()));
+            (void)!::ftruncate(fd, 0);
+            (void)!::write(fd, pid.c_str(), pid.size());
+        }
+        RootLock lock;
+        lock.fd_ = fd;
+        return lock;
+    }
     int fd_{-1};
 };
 

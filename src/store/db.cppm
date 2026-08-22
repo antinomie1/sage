@@ -47,13 +47,17 @@ public:
     Database(Database&&) noexcept = default;
     Database& operator=(Database&&) noexcept = default;
 
-    static std::expected<Database, std::string> open(
-        const std::filesystem::path& db_path, 
-        bool read_only = false,
-        size_t map_size = 10ULL * 1024 * 1024 * 1024) 
+private:
+    static std::expected<Database, std::string> open_impl(
+        const std::filesystem::path& db_path,
+        bool read_only,
+        bool use_lmdb_lock_file,
+        size_t map_size)
     {
         std::filesystem::path actual_dir = (db_path.extension() == ".mdb") ? db_path.parent_path() : db_path;
-        auto env_res = vendor::lmdb::MdbEnv::create(actual_dir, map_size, 32, read_only ? vendor::lmdb::flag_rdonly : 0);
+        unsigned int flags = read_only ? vendor::lmdb::flag_rdonly : 0;
+        if (!use_lmdb_lock_file) flags |= vendor::lmdb::flag_nolock;
+        auto env_res = vendor::lmdb::MdbEnv::create(actual_dir, map_size, 32, flags);
         if (!env_res) return std::unexpected(env_res.error());
 
         Database db;
@@ -90,6 +94,24 @@ public:
         if (!commit_res) return std::unexpected(commit_res.error());
 
         return db;
+    }
+
+public:
+    static std::expected<Database, std::string> open(
+        const std::filesystem::path& db_path,
+        bool read_only = false,
+        size_t map_size = 10ULL * 1024 * 1024 * 1024)
+    {
+        return open_impl(db_path, read_only, true, map_size);
+    }
+
+    // The caller must hold Sage's root lock for this database. MDB_NOLOCK then
+    // prevents a read-only dry-run from updating LMDB's writable lock table.
+    static std::expected<Database, std::string> open_read_only_externally_locked(
+        const std::filesystem::path& db_path,
+        size_t map_size = 10ULL * 1024 * 1024 * 1024)
+    {
+        return open_impl(db_path, true, false, map_size);
     }
 
     std::expected<vendor::lmdb::MdbTxn, std::string> begin_read_txn() {

@@ -110,15 +110,18 @@ inline std::optional<CliOptions> parse_args(int argc, char* argv[]) {
     return opts;
 }
 
-// Serialize state-changing commands (install/remove/rebuild) against a second
-// sage instance on the same target root: flock on <db_dir>/lock, held by the
-// returned RootLock for the command's lifetime. Read-only commands never take
-// it and are never blocked.
-inline std::expected<util::RootLock, int> acquire_root_write_lock(const CliOptions& opts) {
-    // A dry-run only reads state. Taking the ordinary lock would create both
-    // its parent directory and the lock file on a fresh target root.
-    if (opts.dry_run) return util::RootLock{};
+inline bool package_database_exists(const std::filesystem::path& db_path) {
+    const auto data_path = db_path.extension() == ".mdb"
+        ? db_path
+        : db_path / "data.mdb";
+    std::error_code ec;
+    return std::filesystem::is_regular_file(data_path, ec);
+}
 
+// Serialize state-changing commands (install/remove/rebuild) against a second
+// sage instance on the same target root: real mutations take an exclusive
+// flock, while dry-run readers share the existing lock without writing it.
+inline std::expected<util::RootLock, int> acquire_root_write_lock(const CliOptions& opts) {
     auto cfg_res = sage::config::SystemConfig::load_from_root(opts.target_root);
     if (!cfg_res) {
         sage::util::log_error("Failed to load configuration: {}", cfg_res.error());
@@ -126,13 +129,20 @@ inline std::expected<util::RootLock, int> acquire_root_write_lock(const CliOptio
     }
     const auto lock_path = cfg_res->db_path.parent_path() / "lock";
 
-    // A target root that has never been installed into has no <db_dir> yet, and
-    // the very commands taking this lock are about to create the database there
-    // anyway. Without this, a first `--root` install fails before it starts.
-    std::error_code ec;
-    std::filesystem::create_directories(lock_path.parent_path(), ec);
+    if (opts.dry_run && !package_database_exists(cfg_res->db_path)) {
+        return util::RootLock{};
+    }
 
-    auto lock = sage::util::RootLock::acquire(lock_path, opts.wait_seconds);
+    if (!opts.dry_run) {
+        // A target root that has never been installed into has no <db_dir> yet,
+        // and a real mutation is about to create the database there anyway.
+        std::error_code ec;
+        std::filesystem::create_directories(lock_path.parent_path(), ec);
+    }
+
+    auto lock = opts.dry_run
+        ? sage::util::RootLock::acquire_read_only(lock_path, opts.wait_seconds)
+        : sage::util::RootLock::acquire(lock_path, opts.wait_seconds);
     if (!lock) {
         if (lock.error().kind != sage::util::LockFailure::Busy) {
             sage::util::log_error("cannot lock target root '{}': {}",

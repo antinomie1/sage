@@ -13,6 +13,7 @@ using std::size_t;
 inline constexpr unsigned int flag_rdonly = MDB_RDONLY;
 inline constexpr unsigned int flag_create = MDB_CREATE;
 inline constexpr unsigned int flag_nosync = MDB_NOSYNC;
+inline constexpr unsigned int flag_nolock = MDB_NOLOCK;
 
 inline MDB_val to_val(std::string_view sv) noexcept {
     return MDB_val{
