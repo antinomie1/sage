@@ -5,6 +5,7 @@ import std;
 import sage;
 
 import sage.cli;
+import sage.vendor.zstd;
 
 namespace sage::cli {
 
@@ -96,36 +97,79 @@ std::string serialize_producer_versions(const Provenance& prov) {
 // Producer fingerprints live in .comment-style strings, which sit in the
 // leading or trailing slabs of real artifacts; capping the read keeps huge
 // libraries (libLLVM) cheap to inspect without parsing section tables.
-void fingerprint_producer(Provenance& prov, const std::filesystem::path& path) {
+constexpr std::streamoff kSlabBytes = 1 << 20;
+// Kernel modules ship zstd-compressed (.ko.zst), hiding their ELF image --
+// and its producer string -- behind one frame. Frames cannot be seeked
+// into, so framed members are proved from their decompressed lead alone;
+// modules sit far under this cap and their whole image is seen.
+constexpr size_t kFrameLead = 4u << 20;
+
+void scan_producers(Provenance& prov, std::string_view window) {
     static constexpr std::pair<std::string_view, std::string_view> SIGS[] = {
         {"clang version", "clang"}, {"GCC: (", "gcc"}, {"rustc version", "rustc"},
     };
-    std::ifstream in(path, std::ios::binary);
-    if (!in) return;
-    constexpr std::streamoff SLAB = 1 << 20;
-    in.seekg(0, std::ios::end);
-    std::streamoff size = in.tellg();
-    std::streamoff head = std::min(size, SLAB);
-    std::string window(head, '\0');
-    in.seekg(0);
-    in.read(window.data(), head);
-    if (size > SLAB) {  // tail slab too: markers often live near the end
-        std::streamoff tail = std::min(size - SLAB, SLAB);
-        window.resize(static_cast<size_t>(head + tail));
-        in.seekg(-tail, std::ios::end);
-        in.read(window.data() + head, tail);
-    }
     for (const auto& [sig, name] : SIGS) {
-        if (window.find(sig) == std::string::npos) continue;
+        const size_t at = window.find(sig);
+        if (at == std::string_view::npos) continue;
         std::string producer{name};
         prov.producers.insert(producer);
-        size_t at = window.find(sig);
-        std::string ver = version_after(window, at + sig.size());
         // "GCC: (GNU) 15.3.0" and distro variants alike carry the first
         // dotted token after the signature; a failed parse just means the
         // producer is listed without a version.
-        if (!ver.empty()) prov.producer_versions[producer].insert(std::move(ver));
+        if (auto ver = version_after(window, at + sig.size()); !ver.empty())
+            prov.producer_versions[std::move(producer)].insert(std::move(ver));
     }
+}
+
+std::string read_slabs(std::ifstream& in) {
+    in.seekg(0, std::ios::end);
+    const auto size = static_cast<std::streamoff>(in.tellg());
+    const auto head_len = std::min(size, kSlabBytes);
+    std::string window(static_cast<size_t>(head_len), '\0');
+    in.seekg(0);
+    in.read(window.data(), head_len);
+    window.resize(static_cast<size_t>(in.gcount()));
+    if (size > kSlabBytes) {  // tail slab too: markers often live near the end
+        const auto tail_len = std::min(size - kSlabBytes, kSlabBytes);
+        const auto before = window.size();
+        window.resize(before + static_cast<size_t>(tail_len));
+        in.seekg(-tail_len, std::ios::end);
+        in.read(window.data() + before, tail_len);
+        window.resize(before + static_cast<size_t>(in.gcount()));
+    }
+    return window;
+}
+
+// True when a payload file proves compilation, fingerprinting whatever
+// proves it. Plain files qualify by ELF magic or an object-archive suffix
+// and are scanned head+tail; zstd-framed ones (.ko.zst) only when the ELF
+// image inside their decompressed lead says so -- compressed data alone is
+// no evidence of anything.
+bool compiled_artifact(Provenance& prov, const std::filesystem::path& path,
+                       std::string_view base) {
+    static constexpr std::string_view ELF_MAGIC = "\x7f" "ELF";
+    static constexpr std::string_view ZSTD_FRAME = "\x28\xB5\x2F\xFD";
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    char magic[4] = {};
+    if (!in.read(magic, 4)) return false;
+    const std::string_view head(magic, 4);
+
+    if (head == ZSTD_FRAME) {
+        in.clear();
+        in.seekg(0);
+        auto lead = sage::vendor::zstd::ZstdDecompressStream{}.decompress_lead(in, kFrameLead);
+        if (!lead || lead->empty()
+            || !std::string_view(*lead).starts_with(ELF_MAGIC)) return false;
+        scan_producers(prov, *lead);
+        return true;
+    }
+
+    const bool object = base.ends_with(".o") || base.ends_with(".a")
+                     || base.find(".so") != std::string_view::npos;
+    if (head != ELF_MAGIC && !object) return false;
+    scan_producers(prov, read_slabs(in));
+    return true;
 }
 
 export int cmd_build(const CliOptions& opts) {
@@ -286,6 +330,17 @@ export int cmd_build(const CliOptions& opts) {
     std::filesystem::path src_dir = recipe_dir / "src";
     std::filesystem::path pkg_dir = recipe_dir / "pkg";
 
+    // Resume mode: keep an already-extracted (and possibly already built)
+    // tree so incremental build systems only pay for what changed. Only
+    // recipes with a primary archive have a src/ to resume on.
+    const bool resume_src = opts.reuse_src && !r.source_url.empty();
+    if (resume_src && !std::filesystem::exists(src_dir)) {
+        sage::util::log_error(
+            "--reuse-src: no extracted source tree at {} to resume from",
+            src_dir.string());
+        return 1;
+    }
+
     // 1. Source Fetch & SHA256 Verification -- the primary archive plus any
     // extra `[[source]]` entries. Extras land verbatim in distfiles/ next to
     // the primary and are staged into src/distfiles/ on every attempt below.
@@ -350,8 +405,12 @@ export int cmd_build(const CliOptions& opts) {
         std::filesystem::create_directories(pkg_dir);
         // A pristine tree per attempt: the primary archive is re-extracted and
         // the extra sources re-staged, so patches consumed during prepare are
-        // applied to an untouched tree on every retry.
-        if (!archive_path.empty() || !extra_paths.empty()) {
+        // applied to an untouched tree on every retry. --reuse-src opts out:
+        // the existing tree is kept as-is for incremental build systems.
+        if (resume_src) {
+            sage::util::log_info("Reusing existing source tree at {} (--reuse-src)",
+                                 src_dir.string());
+        } else if (!archive_path.empty() || !extra_paths.empty()) {
             std::filesystem::remove_all(src_dir, ec);
             std::filesystem::create_directories(src_dir / "distfiles");
             if (!archive_path.empty()) {
@@ -481,19 +540,11 @@ export int cmd_build(const CliOptions& opts) {
                 self_sonames.insert(base);
             }
 
-            // Compiled-artifact evidence for provenance: ELF magic or an
-            // object-archive suffix. Each candidate is fingerprinted for its
-            // producer string while we are already walking every file.
-            bool elf_magic = false;
-            {
-                std::ifstream in(entry.path(), std::ios::binary);
-                char magic[4] = {};
-                if (in.read(magic, 4)) elf_magic = std::string_view(magic, 4) == "\x7f" "ELF";
-            }
-            if (elf_magic || base.ends_with(".o") || base.ends_with(".a") || base.find(".so") != std::string::npos) {
+            // Compiled-artifact evidence for provenance, with the proving
+            // bytes fingerprinted for their producer string while we are
+            // already walking every file.
+            if (compiled_artifact(provenance, entry.path(), base))
                 provenance.compiled = true;
-                fingerprint_producer(provenance, entry.path());
-            }
 
             auto elf_res = sage::util::scan_elf(entry.path());
             if (!elf_res) continue;

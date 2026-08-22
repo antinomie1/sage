@@ -21,6 +21,7 @@ struct CliOptions {
     bool cascade{false};      // --cascade, -c
     bool no_recursive{false};  // --no-recursive
     bool no_elf_check{false};  // --no-elf-check
+    bool reuse_src{false};     // --reuse-src: resume `build` on an extracted tree
     std::string channel_filter;  // --channel <NAME>
     int wait_seconds{0};      // --wait[=SECONDS]: wait for a concurrent sage
 };
@@ -55,6 +56,8 @@ Global Options:
   --dry-run                Simulate actions without modifying filesystem
   --verbose, -v            Enable verbose diagnostics
   --no-elf-check           Skip build-time DT_NEEDED validation (bootstrap escape hatch)
+  --reuse-src              build: resume on the already-extracted src/ tree
+                           instead of re-unpacking (kbuild-style increments)
   --channel <NAME>         Restrict `install` to a single channel
   --wait[=SECONDS]         Wait for a concurrent sage on the same root (default: fail fast)
   --help, -h               Show this help message
@@ -88,6 +91,8 @@ inline std::optional<CliOptions> parse_args(int argc, char* argv[]) {
             opts.no_recursive = true;
         } else if (arg == "--no-elf-check") {
             opts.no_elf_check = true;
+        } else if (arg == "--reuse-src") {
+            opts.reuse_src = true;
         } else if (arg == "--channel" && i + 1 < argc) {
             opts.channel_filter = argv[++i];
         } else if (arg == "--wait") {

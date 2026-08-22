@@ -52,6 +52,33 @@ public:
         return ret;
     }
 
+    // Decompressed leading slice of the framed stream read from `in`,
+    // capped at `max_bytes`: consumers such as provenance stamping need
+    // only a member's first bytes, and frames cannot be seeked into.
+    // Malformed input is an error; the zstd buffer structs stay inside
+    // this module instead of leaking past the vendor boundary.
+    std::expected<std::string, std::string> decompress_lead(
+        std::istream& in, size_t max_bytes) {
+        if (!dctx_) return std::unexpected("Uninitialized ZSTD DCtx");
+        std::string out(max_bytes, '\0');
+        ZSTD_outBuffer out_buf{out.data(), out.size(), 0};
+        std::vector<char> chunk(64 << 10);
+        bool frame_done = false;
+        while (out_buf.pos < out_buf.size && !frame_done) {
+            in.read(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+            if (in.gcount() <= 0) break;
+            ZSTD_inBuffer in_buf{chunk.data(), static_cast<size_t>(in.gcount()), 0};
+            while (in_buf.pos < in_buf.size && out_buf.pos < out_buf.size && !frame_done) {
+                const size_t ret = ZSTD_decompressStream(dctx_, &out_buf, &in_buf);
+                if (ZSTD_isError(ret))
+                    return std::unexpected(ZSTD_getErrorName(ret));
+                frame_done = ret == 0;
+            }
+        }
+        out.resize(out_buf.pos);
+        return out;
+    }
+
     [[nodiscard]] explicit operator bool() const noexcept { return dctx_ != nullptr; }
 
 private:
