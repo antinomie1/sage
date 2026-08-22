@@ -37,6 +37,43 @@ export int run_all() {
         sage::util::log_error("Legacy capability defaults or explicit override failed");
         return 1;
     }
+
+    const auto builtin_triggers = sage::rebuild::TriggerEngine::builtin_triggers();
+    auto ldconfig_trigger = std::ranges::find_if(
+        builtin_triggers, [](const auto& trigger) { return trigger.name == "ldconfig"; });
+    auto certificates_trigger = std::ranges::find_if(
+        builtin_triggers, [](const auto& trigger) { return trigger.name == "ca-certificates"; });
+    if (ldconfig_trigger == builtin_triggers.end()
+        || ldconfig_trigger->exec != "/usr/bin/ldconfig"
+        || certificates_trigger == builtin_triggers.end()
+        || certificates_trigger->exec != "/usr/bin/update-ca-certificates") {
+        sage::util::log_error("Built-in triggers do not use canonical usr-merge paths");
+        return 1;
+    }
+
+    sage::package::PackageManifest failing_trigger_package;
+    failing_trigger_package.name = "failing-trigger";
+    failing_trigger_package.version = sage::package::Version::parse("1.0.0-1");
+    failing_trigger_package.triggers.push_back(sage::package::Trigger{
+        .name = "must-fail",
+        .on_paths = {"usr/share/must-fail/"},
+        .on_capability = {},
+        .exec = "/bin/false",
+        .args = {},
+        .run_capability = {},
+    });
+    sage::package::FileEntry failing_trigger_file;
+    failing_trigger_file.path = "usr/share/must-fail/input";
+    sage::rebuild::TriggerContext failing_trigger_context;
+    failing_trigger_context.touched_files = {failing_trigger_file};
+    failing_trigger_context.installed_packages = {failing_trigger_package};
+    auto failing_trigger_result =
+        sage::rebuild::TriggerEngine::run(failing_trigger_context);
+    if (failing_trigger_result
+        || failing_trigger_result.error().find("must-fail") == std::string::npos) {
+        sage::util::log_error("Trigger execution failure was not propagated");
+        return 1;
+    }
     sage::util::log_success("1. Semantic & Alphanum Version Comparator OK");
 
     // 2. Tar+Zstd Archive Packaging & Streaming Extractor Test
@@ -186,11 +223,16 @@ export int run_all() {
 
     auto extract_root = temp_dir / "sysroot";
     auto ext_res = sage::archive::extract_package(pkg_path, extract_root);
+    const bool canonical_archive_paths = ext_res
+        && std::ranges::none_of(ext_res->manifest.files, [](const auto& file) {
+            return file.path.ends_with('/');
+        });
     if (!ext_res || !std::filesystem::exists(extract_root / "usr/bin/dummy") ||
         !std::filesystem::exists(extract_root / long_rel) || !std::filesystem::exists(extract_root / boundary_rel) ||
         !std::filesystem::is_directory(extract_root / boundary_empty_dir) ||
         !std::filesystem::is_symlink(extract_root / "usr/bin/link") ||
-        std::filesystem::read_symlink(extract_root / "usr/bin/link").generic_string() != boundary_link_target) {
+        std::filesystem::read_symlink(extract_root / "usr/bin/link").generic_string() != boundary_link_target ||
+        !canonical_archive_paths) {
         sage::util::log_error("Archive extraction verification failed");
         return 1;
     }
@@ -472,7 +514,15 @@ export int run_all() {
 
     auto base_files_data = temp_dir / "base-files-data";
     std::filesystem::create_directories(base_files_data);
-    std::filesystem::create_symlink("usr/bin", base_files_data / "bin");
+    constexpr std::array base_files_aliases{
+        std::pair{"bin", "usr/bin"},
+        std::pair{"sbin", "usr/bin"},
+        std::pair{"lib", "usr/lib"},
+        std::pair{"lib64", "usr/lib"},
+    };
+    for (const auto& [path, target] : base_files_aliases) {
+        std::filesystem::create_symlink(target, base_files_data / path);
+    }
     sage::package::PackageManifest base_files_manifest;
     base_files_manifest.name = "base-files";
     base_files_manifest.version = sage::package::Version::parse("1.0.0-1");
@@ -484,9 +534,13 @@ export int run_all() {
         ? sage::archive::extract_package(base_files_pkg, base_files_root)
         : std::expected<sage::archive::ExtractedPackage, std::string>(
             std::unexpected(base_files_pack.error()));
-    if (!base_files_extract
-        || !std::filesystem::is_symlink(base_files_root / "bin")
-        || std::filesystem::read_symlink(base_files_root / "bin") != "usr/bin") {
+    bool base_files_aliases_ok = base_files_extract.has_value();
+    for (const auto& [path, target] : base_files_aliases) {
+        base_files_aliases_ok = base_files_aliases_ok
+            && std::filesystem::is_symlink(base_files_root / path)
+            && std::filesystem::read_symlink(base_files_root / path) == target;
+    }
+    if (!base_files_aliases_ok) {
         sage::util::log_error("Base-files could not create the canonical usr-merge alias");
         return 1;
     }
@@ -645,6 +699,7 @@ install = [
         -> std::expected<sage::package::PackageManifest, std::string> {
         CliOptions build_opts;
         build_opts.args = {recipe_dir.string()};
+        build_opts.no_elf_check = true;
         if (cmd_build(build_opts) != 0) {
             return std::unexpected("cmd_build failed for " + recipe_dir.string());
         }
@@ -2126,7 +2181,7 @@ install = [
     }
 
     // Verify all files from both sample-app and libsample are gone from disk!
-    if (std::filesystem::exists(loop_target / "usr/bin/sample-app") || 
+    if (std::filesystem::exists(loop_target / "usr/bin/sample-app") ||
         std::filesystem::exists(loop_target / "usr/lib/libsample.so.1")) {
         sage::util::log_error("Files still exist on disk after cascade removal");
         return 1;

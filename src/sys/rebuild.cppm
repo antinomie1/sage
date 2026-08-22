@@ -157,13 +157,13 @@ public:
         t.push_back(package::Trigger{
             .name = "ldconfig",
             .on_paths = {"usr/lib/", "lib/"},
-            .exec = "/sbin/ldconfig",
+            .exec = "/usr/bin/ldconfig",
             .priority = 10,
         });
         t.push_back(package::Trigger{
             .name = "ca-certificates",
             .on_paths = {"etc/ssl/certs/", "usr/share/ca-certificates/"},
-            .exec = "/usr/sbin/update-ca-certificates",
+            .exec = "/usr/bin/update-ca-certificates",
             .priority = 20,
         });
         t.push_back(package::Trigger{
@@ -194,7 +194,7 @@ public:
         return t;
     }
 
-    static void run(const TriggerContext& ctx) {
+    static std::expected<void, std::string> run(const TriggerContext& ctx) {
         // Capabilities brought in by this transaction, for on_capability.
         std::set<std::string> txn_capabilities;
         for (const auto& pkg : ctx.transaction_packages) {
@@ -221,8 +221,10 @@ public:
             if (!cmd) continue;
 
             if (!already_run.insert(*cmd).second) continue;
-            (void)execute(*cmd, trig.name, ctx);
+            auto result = execute(*cmd, trig.name, ctx);
+            if (!result) return result;
         }
+        return {};
     }
 
 private:
@@ -303,14 +305,14 @@ private:
     // chroot: host-side they would rebuild the HOST's caches and leave the
     // sysroot's untouched, and the host loader may not even match the target's
     // glibc. Every path here is therefore relative to the target root.
-    static bool execute(
+    static std::expected<void, std::string> execute(
         const std::string& cmd,
         std::string_view trigger_name,
         const TriggerContext& ctx)
     {
         std::string exec_path = cmd.substr(0, cmd.find(' '));
         if (!std::filesystem::exists(ctx.sysroot / std::filesystem::path(exec_path).relative_path())) {
-            return false;
+            return {};
         }
 
         std::string full = (ctx.sysroot == "/")
@@ -319,16 +321,16 @@ private:
 
         if (ctx.dry_run) {
             util::log_info("Would run trigger '{}': {}", trigger_name, full);
-            return true;
+            return {};
         }
 
         util::log_info("Running trigger '{}': {}", trigger_name, full);
         int ret = std::system(full.c_str());
         if (ret != 0) {
-            util::log_warn("Trigger '{}' failed (exit {}): {}", trigger_name, ret, full);
-            return false;
+            return std::unexpected(std::format(
+                "Trigger '{}' failed (status {}): {}", trigger_name, ret, full));
         }
-        return true;
+        return {};
     }
 };
 
@@ -643,7 +645,11 @@ public:
         for (const auto& pkg : trig_ctx.transaction_packages) {
             trig_ctx.touched_files.insert(trig_ctx.touched_files.end(), pkg.files.begin(), pkg.files.end());
         }
-        TriggerEngine::run(trig_ctx);
+        auto trigger_result = TriggerEngine::run(trig_ctx);
+        if (!trigger_result) {
+            return std::unexpected(
+                "Post-transaction trigger failed: " + trigger_result.error());
+        }
 
         util::log_success("Reconcile completed! Regenerated {} native service scripts for {}", 
             gen_count, service::to_string(plan.target_init));

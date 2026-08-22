@@ -470,10 +470,13 @@ inline std::expected<InspectedPackage, std::string> inspect_package_stream(
             usr_merge_aliases, [&](const auto& candidate) { return candidate.first == top; });
         if (alias == usr_merge_aliases.end()) continue;
 
+        const bool is_collapsed_merge_target =
+            (entry.path == "sbin" && entry.link_target == "usr/bin")
+            || (entry.path == "lib64" && entry.link_target == "usr/lib");
         const bool is_base_merge_link = result.manifest.name == "base-files"
             && entry.path == top
             && entry.typeflag == '2'
-            && entry.link_target == alias->second;
+            && (entry.link_target == alias->second || is_collapsed_merge_target);
         if (!is_base_merge_link) {
             return std::unexpected(std::format(
                 "Package '{}' must use canonical usr/ paths instead of '{}'",
