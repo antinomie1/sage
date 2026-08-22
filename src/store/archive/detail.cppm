@@ -140,8 +140,32 @@ public:
                 + std::string(std::strerror(errno)));
         }
 
-        std::array<uint8_t, 64 * 1024> buffer {};
         uint64_t remaining = static_cast<uint64_t>(source_status.st_size);
+#ifdef __linux__
+        bool use_copy_file_range = true;
+        while (remaining > 0 && use_copy_file_range) {
+            const auto requested = static_cast<size_t>(
+                std::min<uint64_t>(remaining, 1024 * 1024));
+            ssize_t count = ::copy_file_range(
+                source.get(), nullptr, destination.get(), nullptr, requested, 0);
+            if (count < 0 && errno == EINTR) continue;
+            if (count < 0 && (errno == ENOSYS || errno == EINVAL || errno == EXDEV
+                              || errno == EOPNOTSUPP)) {
+                use_copy_file_range = false;
+                break;
+            }
+            if (count < 0) {
+                return std::unexpected(
+                    "Cannot copy package archive: " + std::string(std::strerror(errno)));
+            }
+            if (count == 0) {
+                return std::unexpected(
+                    "Package archive changed while creating a private snapshot");
+            }
+            remaining -= static_cast<uint64_t>(count);
+        }
+#endif
+        std::array<uint8_t, 64 * 1024> buffer {};
         while (remaining > 0) {
             const auto requested = static_cast<size_t>(
                 std::min<uint64_t>(remaining, buffer.size()));
@@ -210,9 +234,18 @@ inline std::expected<AnchoredPath, std::string> open_anchored_parent(
 #endif
         int next = ::openat(current.get(), name.c_str(), flags);
         if (next < 0 && errno == ENOENT) {
-            if (::mkdirat(current.get(), name.c_str(), 0755) != 0 && errno != EEXIST) {
+            const bool created = ::mkdirat(current.get(), name.c_str(), 0755) == 0;
+            if (!created && errno != EEXIST) {
                 return std::unexpected(std::format(
                     "Cannot create parent directory '{}': {}", name, std::strerror(errno)));
+            }
+            // Persist the directory entry while its containing directory is
+            // still anchored.  Fsyncing the child alone does not make the
+            // parent's mkdir entry durable across power loss.
+            if (created && ::fsync(current.get()) != 0) {
+                return std::unexpected(std::format(
+                    "Cannot sync parent after creating directory '{}': {}",
+                    name, std::strerror(errno)));
             }
             next = ::openat(current.get(), name.c_str(), flags);
         }
@@ -234,7 +267,10 @@ inline std::expected<void, std::string> ensure_anchored_directory(
     std::string_view leaf)
 {
     const auto name = std::string(leaf);
-    if (::mkdirat(parent_fd, name.c_str(), 0755) == 0) return {};
+    if (::mkdirat(parent_fd, name.c_str(), 0755) == 0) {
+        if (::fsync(parent_fd) != 0) return std::unexpected(std::strerror(errno));
+        return {};
+    }
     if (errno != EEXIST) {
         return std::unexpected(std::strerror(errno));
     }
@@ -264,6 +300,7 @@ inline std::expected<void, std::string> remove_anchored_leaf(
     if (::unlinkat(parent_fd, name.c_str(), flags) != 0) {
         return std::unexpected(std::strerror(errno));
     }
+    if (::fsync(parent_fd) != 0) return std::unexpected(std::strerror(errno));
     return {};
 }
 
@@ -335,6 +372,10 @@ public:
             return std::unexpected(std::format(
                 "Cannot set mode: {}", std::strerror(errno)));
         }
+        if (::fsync(fd_) != 0) {
+            return std::unexpected(std::format(
+                "Cannot sync temporary file: {}", std::strerror(errno)));
+        }
         if (::close(fd_) != 0) {
             auto message = std::string(std::strerror(errno));
             fd_ = -1;
@@ -348,6 +389,10 @@ public:
                 "Cannot atomically install temporary file: " + std::string(std::strerror(errno)));
         }
         name_.clear();
+        if (::fsync(directory_.get()) != 0) {
+            return std::unexpected(
+                "Cannot sync destination directory: " + std::string(std::strerror(errno)));
+        }
         return {};
     }
 
