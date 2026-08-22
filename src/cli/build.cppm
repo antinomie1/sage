@@ -51,7 +51,10 @@ std::optional<std::string> probe_compiler(std::string_view cc) {
 struct Provenance {
     bool compiled = false;          // any ELF / object-like file in the payload
     std::set<std::string> producers;
-    std::string producer_version;   // of the sole producer, when unambiguous
+    // Versions per producer: linked executables embed the crt startup files'
+    // .comment too, so a clang-built package honestly carries a gcc trace --
+    // each producer keeps its own version instead of one ambiguous value.
+    std::map<std::string, std::set<std::string>> producer_versions;
 };
 
 // First dotted numeric token at/after `pos`: "clang version 22.1.8 (...)",
@@ -65,6 +68,29 @@ std::string version_after(std::string_view text, size_t pos) {
         i = j;
     }
     return {};
+}
+
+// Version stamp serialization: a lone producer keeps the plain form
+// ("22.1.8"); several producers pair each version with its owner
+// ("clang: 22.1.8, gcc: 15.3.0") so a version can never be misattributed.
+// Distinct versions from one producer join with '+' (rare: mixed inputs).
+std::string serialize_producer_versions(const Provenance& prov) {
+    std::vector<std::string> parts;
+    for (const auto& name : prov.producers) {
+        auto it = prov.producer_versions.find(name);
+        if (it == prov.producer_versions.end() || it->second.empty()) {
+            parts.push_back(name);  // listed, but no version parsed
+            continue;
+        }
+        std::string part = std::format("{}: {}", name, *it->second.begin());
+        for (auto extra = std::next(it->second.begin()); extra != it->second.end(); ++extra) {
+            part += std::format("+{}", *extra);
+        }
+        parts.push_back(std::move(part));
+    }
+    std::string out;
+    for (auto& part : parts) out += (out.empty() ? "" : ", ") + part;
+    return out;
 }
 
 // Producer fingerprints live in .comment-style strings, which sit in the
@@ -91,11 +117,14 @@ void fingerprint_producer(Provenance& prov, const std::filesystem::path& path) {
     }
     for (const auto& [sig, name] : SIGS) {
         if (window.find(sig) == std::string::npos) continue;
-        prov.producers.insert(std::string(name));
-        if (prov.producers.size() == 1 && prov.producer_version.empty()) {
-            size_t at = window.find(sig);
-            prov.producer_version = version_after(window, at + sig.size());
-        }
+        std::string producer{name};
+        prov.producers.insert(producer);
+        size_t at = window.find(sig);
+        std::string ver = version_after(window, at + sig.size());
+        // "GCC: (GNU) 15.3.0" and distro variants alike carry the first
+        // dotted token after the signature; a failed parse just means the
+        // producer is listed without a version.
+        if (!ver.empty()) prov.producer_versions[producer].insert(std::move(ver));
     }
 }
 
@@ -446,7 +475,7 @@ export int cmd_build(const CliOptions& opts) {
                 joined += (joined.empty() ? "" : ", ") + p;
             }
             manifest.build_compiler = std::move(joined);
-            manifest.build_compiler_version = provenance.producer_version;
+            manifest.build_compiler_version = serialize_producer_versions(provenance);
         }
         if (!eff_cflags.empty()) manifest.build_cflags = eff_cflags;
         if (!eff_cxxflags.empty()) manifest.build_cxxflags = eff_cxxflags;
