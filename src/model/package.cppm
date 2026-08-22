@@ -476,6 +476,11 @@ struct PackageManifest {
     std::string build_cxxflags;
     std::string build_ldflags;
 
+    // Raw universal service definition (a full service.toml document) for
+    // daemon packages: `sage rebuild` parses it and regenerates native
+    // scripts for whichever init system is active. Empty for non-daemons.
+    std::string service_toml;
+
     std::vector<Dependency> dependencies;
     std::vector<std::string> provides; // e.g. "virtual/init", "so:libz.so.1"
     // Configuration files the package ships but does not own outright: on
@@ -531,6 +536,7 @@ struct PackageManifest {
             m.build_compiler_version = (*pkg)["build_compiler_version"].value_or("");
             m.build_cflags = (*pkg)["build_cflags"].value_or("");
             m.build_cxxflags = (*pkg)["build_cxxflags"].value_or("");
+            m.service_toml = (*pkg)["service_toml"].value_or("");
             m.build_ldflags = (*pkg)["build_ldflags"].value_or("");
         } else {
             return std::unexpected("Missing [package] section in manifest");
@@ -653,6 +659,7 @@ struct PackageManifest {
         if (!build_cflags.empty()) ss << "build_cflags = \"" << quote(build_cflags) << "\"\n";
         if (!build_cxxflags.empty()) ss << "build_cxxflags = \"" << quote(build_cxxflags) << "\"\n";
         if (!build_ldflags.empty()) ss << "build_ldflags = \"" << quote(build_ldflags) << "\"\n";
+        if (!service_toml.empty()) ss << "service_toml = \"" << quote(service_toml) << "\"\n";
         ss << "installed_size = " << installed_size << "\n\n";
 
         ss << "dependencies = [\n";
@@ -794,6 +801,11 @@ struct Recipe {
     // cxxflags empty mirrors cflags, mirroring BuildConfig's own rule.
     std::string cflags;
     std::string cxxflags;
+    // A non-empty `cc` pins the toolchain: exactly this pair is used and the
+    // global fallback never runs. Core system packages (glibc, systemd) pin
+    // "gcc" because they must not silently rebuild under clang.
+    std::string cc;
+    std::string cxx;
     std::vector<CapabilityHook> capability_hooks;
     std::vector<Trigger> triggers;
 
@@ -932,10 +944,13 @@ struct Recipe {
         extract_cmds("install", r.install_cmds);
 
         // Flag overrides are presence-respecting: an explicit `cflags = ""`
-        // clears the baseline rather than falling back to it.
+        // clears the baseline rather than falling back to it. A non-empty
+        // `cc` pins the compiler pair outright.
         if (auto* bld = tbl.get_as<vendor::toml::table>("build")) {
             if (auto v = (*bld)["cflags"].value<std::string_view>()) r.cflags = std::string(*v);
             if (auto v = (*bld)["cxxflags"].value<std::string_view>()) r.cxxflags = std::string(*v);
+            if (auto v = (*bld)["cc"].value<std::string_view>()) r.cc = std::string(*v);
+            if (auto v = (*bld)["cxx"].value<std::string_view>()) r.cxx = std::string(*v);
         }
 
         parse_capability_hooks(tbl, r.capability_hooks);

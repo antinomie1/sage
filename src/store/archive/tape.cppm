@@ -193,7 +193,6 @@ inline std::vector<package::FileEntry> parse_files_idx(std::string_view content)
 
 struct ExtractedPackage {
     package::PackageManifest manifest;
-    std::optional<service::ServiceSpec> service;
     std::vector<package::FileEntry> extracted_files;
     // What .METADATA/files.idx claimed, when the archive shipped one.
     std::vector<package::FileEntry> declared_files;
@@ -201,7 +200,6 @@ struct ExtractedPackage {
 
 struct InspectedPackage {
     package::PackageManifest manifest;
-    std::optional<service::ServiceSpec> service;
     std::vector<package::FileEntry> data_files;
     std::vector<package::FileEntry> declared_files;
     std::string archive_sha256;
@@ -488,7 +486,9 @@ inline std::expected<InspectedPackage, std::string> inspect_package_stream(
         if (!service_res) {
             return std::unexpected("Failed to parse service.toml: " + service_res.error());
         }
-        result.service = std::move(*service_res);
+        // The manifest is the single carrier: the raw document rides into the
+        // LMDB record so `sage rebuild` can regenerate scripts for any init.
+        result.manifest.service_toml = std::move(service_content);
     }
 
     for (const auto& entry : data_entries) {

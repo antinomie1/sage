@@ -149,7 +149,6 @@ inline std::expected<ExtractedPackage, std::string> extract_package(
 
     ExtractedPackage result;
     result.manifest = std::move(inspect_res->manifest);
-    result.service = std::move(inspect_res->service);
     result.declared_files = std::move(inspect_res->declared_files);
 
     std::error_code root_ec;

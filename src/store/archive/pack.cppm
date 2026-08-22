@@ -29,8 +29,7 @@ using std::uint64_t;
 inline std::expected<void, std::string> create_package(
     const package::PackageManifest& manifest,
     const std::filesystem::path& data_dir,
-    const std::filesystem::path& output_path,
-    const std::optional<service::ServiceSpec>& service_spec = std::nullopt) 
+    const std::filesystem::path& output_path)
 {
     if (auto parent = output_path.parent_path(); !parent.empty()) {
         std::filesystem::create_directories(parent);
@@ -186,19 +185,11 @@ inline std::expected<void, std::string> create_package(
         if (!t_res) return t_res;
     }
 
-    // 5. Append .METADATA/service.toml if present
-    if (service_spec) {
-        std::ostringstream ss;
-        ss << "[service]\n";
-        ss << "name = \"" << service_spec->name << "\"\n";
-        ss << "description = \"" << service_spec->description << "\"\n";
-        ss << "exec_start = \"" << service_spec->exec_start << "\"\n";
-        if (!service_spec->after.empty()) {
-            ss << "after = [\n";
-            for (const auto& a : service_spec->after) ss << "    \"" << a << "\",\n";
-            ss << "]\n";
-        }
-        std::string svc_toml = ss.str();
+    // 5. Append .METADATA/service.toml verbatim when the manifest carries a
+    // universal service definition (the manifest itself is the LMDB record;
+    // this copy keeps the archive self-describing).
+    if (!manifest.service_toml.empty()) {
+        const std::string& svc_toml = manifest.service_toml;
         auto s_res = append_tar_entry(".METADATA/service.toml", std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(svc_toml.data()), svc_toml.size()), 0644);
         if (!s_res) return s_res;
     }

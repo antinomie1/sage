@@ -596,21 +596,27 @@ public:
         auto commit_res = wtxn->commit();
         if (!commit_res) return std::unexpected("Database commit failed: " + commit_res.error());
 
-        // 4. Automatically re-generate native service configurations for ALL installed daemons
+        // 4. Automatically re-generate native service configurations for all
+        // installed daemons. A daemon is a package whose manifest carries a
+        // universal service.toml; everything else owns no init scripts.
         auto installed = db.list_installed_packages();
         if (!installed) {
             return std::unexpected("Installed package database is inconsistent after reconcile: " + installed.error());
         }
         size_t gen_count = 0;
         for (const auto& pkg : *installed) {
-            // Check if package has service definition in database or package files
-            service::ServiceSpec spec;
-            spec.name = pkg.name;
-            spec.description = pkg.description;
-            spec.exec_start = "/usr/bin/" + pkg.name; // default convention
-            auto gen_res = service::generate_service(spec, plan.target_init, sysroot);
+            if (pkg.service_toml.empty()) continue;
+            auto spec = service::ServiceSpec::parse_toml(pkg.service_toml);
+            if (!spec) {
+                util::log_warn("Skipping service for '{}': {}", pkg.name, spec.error());
+                continue;
+            }
+            auto gen_res = service::generate_service(*spec, plan.target_init, sysroot);
             if (gen_res) {
                 gen_count++;
+            } else {
+                util::log_warn("Cannot generate {} script for '{}': {}",
+                    service::to_string(plan.target_init), pkg.name, gen_res.error());
             }
         }
 

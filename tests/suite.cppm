@@ -2412,6 +2412,82 @@ install = [
             return 1;
         }
 
+        // (f) A pinned compiler never falls back: an unusable pin fails the
+        // build even though the global fallback pair is alive and well.
+        auto pin_dir = temp_dir / "bcfg-pin-bad";
+        if (!write_canary_recipe(pin_dir, R"(schema_version = 1
+[package]
+name = "pinbad"
+version = "1.0.0"
+release = "1"
+description = "pinned-compiler failure canary"
+license = "MIT"
+channel = "system"
+
+[build]
+cc = "/nonexistent/sage-no-such-cc"
+install = [
+    'mkdir -p "$DESTDIR/usr/share"',
+    'printf ok > "$DESTDIR/usr/share/done.txt"',
+]
+)")) {
+            sage::util::log_error("Failed to create pinned-compiler fixture");
+            return 1;
+        }
+        {
+            CliOptions build_opts;
+            build_opts.args = {pin_dir.string()};
+            build_opts.target_root = canary_root;  // its global pair probes fine
+            if (cmd_build(build_opts) == 0) {
+                sage::util::log_error("A broken pinned compiler must fail, not fall back");
+                return 1;
+            }
+        }
+
+        // (g) A service.toml beside the recipe rides the manifest verbatim;
+        // the parse round-trip must keep the daemon definition intact for
+        // `sage rebuild` to regenerate scripts on an init switch.
+        auto svc_dir = temp_dir / "bcfg-svc";
+        if (!write_canary_recipe(svc_dir, R"(schema_version = 1
+[package]
+name = "svcanary"
+version = "1.0.0"
+release = "1"
+description = "service manifest canary"
+license = "MIT"
+channel = "system"
+install = [
+    'mkdir -p "$DESTDIR/usr/bin"',
+    'printf "#!/bin/sh\n" > "$DESTDIR/usr/bin/svcanary"',
+]
+)")) {
+            sage::util::log_error("Failed to create service canary recipe");
+            return 1;
+        }
+        {
+            std::ofstream f(svc_dir / "service.toml");
+            f << R"(schema_version = 1
+[service]
+name = "svcanary"
+description = "canary daemon"
+exec_start = "/usr/bin/svcanary --foreground"
+after = ["net"]
+)";
+        }
+        auto svcpkg = build_with_root(svc_dir, canary_root, temp_dir / "bcfg-svc-x",
+                                      "svcanary-1.0.0-1-x86_64.pkg.tar.zst");
+        if (!svcpkg || svcpkg->service_toml.empty()) {
+            sage::util::log_error("service.toml did not ride the built manifest");
+            return 1;
+        }
+        auto spec_back = sage::service::ServiceSpec::parse_toml(svcpkg->service_toml);
+        if (!spec_back || spec_back->name != "svcanary"
+            || spec_back->exec_start != "/usr/bin/svcanary --foreground"
+            || spec_back->after.size() != 1 || spec_back->after[0] != "net") {
+            sage::util::log_error("Manifest service_toml failed to round-trip through serialization");
+            return 1;
+        }
+
         sage::util::log_success("13. Build Config Injection, Recipe Override & Compiler Fallback OK");
     }
 

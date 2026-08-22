@@ -167,19 +167,38 @@ export int cmd_build(const CliOptions& opts) {
     // fallback pair second. Each is probed once up front -- `<cc> --version`
     // doubles as the existence check; what ends up stamped is derived from
     // the built artifacts themselves, not from this probe.
+    //
+    // A recipe-level [build] cc pins the toolchain outright: exactly that
+    // pair runs and the global fallback never does -- a pinned build that
+    // fails must fail the recipe rather than silently produce core system
+    // packages from the wrong compiler.
     struct Toolchain { std::string cc, cxx, version; };
     std::vector<Toolchain> candidates;
-    for (const auto& [cc_name, cxx_name] : {std::pair{bcfg.cc, bcfg.cxx},
-                                            std::pair{bcfg.fallback_cc, bcfg.fallback_cxx}}) {
+    auto try_candidate = [&](const std::string& cc_name, const std::string& cxx_name) {
         if (cc_name.empty() || std::ranges::any_of(candidates, [&](const Toolchain& t) { return t.cc == cc_name; })) {
-            continue;
+            return;
         }
         auto ver = probe_compiler(cc_name);
         if (!ver) {
             sage::util::log_warn("Compiler '{}' not usable, skipping", cc_name);
-            continue;
+            return;
         }
         candidates.push_back({cc_name, cxx_name, std::move(*ver)});
+    };
+    if (!r.cc.empty()) {
+        // Pinned: exactly this pair, no fallback. A pinned build that cannot
+        // even probe its compiler fails the recipe outright.
+        const std::string pin_cxx = r.cxx.empty() ? bcfg.cxx : r.cxx;
+        auto ver = probe_compiler(r.cc);
+        if (!ver) {
+            sage::util::log_error("Recipe pins compiler '{}' but it is not usable", r.cc);
+            return 1;
+        }
+        candidates.push_back({r.cc, pin_cxx, std::move(*ver)});
+        sage::util::log_info("Using pinned compiler: {} ({})", r.cc, candidates.front().version);
+    } else {
+        try_candidate(bcfg.cc, bcfg.cxx);
+        try_candidate(bcfg.fallback_cc, bcfg.fallback_cxx);
     }
     if (candidates.empty()) {
         // Script-only recipes must keep building on hosts without any
@@ -336,6 +355,23 @@ export int cmd_build(const CliOptions& opts) {
     manifest.arch = r.arch;
     manifest.capability_hooks = r.capability_hooks;
     manifest.triggers = r.triggers;
+
+    // A service.toml beside the recipe declares a daemon: validated here,
+    // then carried verbatim on the manifest so `sage rebuild` can regenerate
+    // native init scripts for whichever init system is active.
+    std::filesystem::path svc_path = recipe_dir / "service.toml";
+    std::error_code svc_ec;
+    if (std::filesystem::exists(svc_path, svc_ec)) {
+        std::ifstream svc_in(svc_path);
+        std::ostringstream svc_buf;
+        svc_buf << svc_in.rdbuf();
+        auto spec = sage::service::ServiceSpec::parse_toml(svc_buf.str());
+        if (!spec) {
+            sage::util::log_error("Invalid service.toml for '{}': {}", r.name, spec.error());
+            return 1;
+        }
+        manifest.service_toml = svc_buf.str();
+    }
 
     // Stamp build provenance from what the payload proves (filled below):
     // nothing compiled -> nothing claimed; compiled -> the producers the
