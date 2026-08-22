@@ -30,7 +30,8 @@ struct RepoSnapshot {
 
 inline std::expected<RepoSnapshot, std::string> fetch_repo_snapshot(
     const config::SystemConfig& cfg,
-    std::string_view channel_filter = {})
+    std::string_view channel_filter = {},
+    bool persist_cache = true)
 {
     RepoSnapshot snap;
     auto channel_configs = cfg.channels;
@@ -52,7 +53,8 @@ inline std::expected<RepoSnapshot, std::string> fetch_repo_snapshot(
         ch.scope = channel::parse_scope(ch_cfg.scope);
         ch.priority = ch_cfg.priority;
 
-        auto idx_res = channel::ProfileManager::sync_channel(ch, cfg.cache_dir);
+        auto idx_res = channel::ProfileManager::sync_channel(
+            ch, cfg.cache_dir, persist_cache);
         if (!idx_res) continue;
 
         std::filesystem::path dir_base;
@@ -373,7 +375,8 @@ class ReconcileEngine {
 public:
     static std::expected<ReconcilePlan, std::string> calculate_diff(
         db::Database& db,
-        const config::SystemConfig& desired_config)
+        const config::SystemConfig& desired_config,
+        bool persist_cache = true)
     {
         ReconcilePlan plan;
         auto current_providers = db.get_all_system_providers();
@@ -414,7 +417,8 @@ public:
         // 2. Fetch channels: the solve pool and the archives behind it. Only
         // reached when a swap is pending, so the common no-op reconcile never
         // touches the network.
-        auto snapshot_res = fetch_repo_snapshot(desired_config);
+        auto snapshot_res = fetch_repo_snapshot(
+            desired_config, {}, persist_cache);
         if (!snapshot_res) return std::unexpected(snapshot_res.error());
         plan.repos = std::move(*snapshot_res);
 

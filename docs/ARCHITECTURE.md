@@ -61,6 +61,27 @@ The state database `/var/lib/sage/data.mdb` uses dedicated named databases (tabl
 | `channels` | `channel_name` | Channel Scope, Target Root, Triplet, Priority | Channel registry |
 | `system` | `interface` (e.g. `virtual/init`) | Active provider (`openrc`) | Declarative system state lock |
 
+### Package-state operation synchronization
+
+Root-only `install`, `remove`, and `rebuild` use
+`/run/sage/operation.lock` as one host-wide advisory lock. Sage creates a
+root-owned `0700` namespace and `0600` regular file, opens them without following
+symlinks, and validates ownership, type, and mode. The namespace is directly
+beneath root-owned `/run`, so an unprivileged user cannot pre-create it; Sage
+does not create `/run` or use the public `/run/lock` hierarchy. Preview
+operations take `LOCK_SH`; real
+mutations take `LOCK_EX`. The operation lock is held by an RAII descriptor in
+the CLI entry point until the command and all of its LMDB environments have
+returned. This intentionally serializes operations for distinct target roots
+in exchange for a stable lock identity even when a target root does not exist.
+
+After locking, the target root and `data.mdb` are probed once. Existing-state
+previews open LMDB with `MDB_RDONLY | MDB_NOLOCK`; the external shared lock then
+excludes every Sage LMDB writer for the environment's complete lifetime.
+Absent-state previews do not open LMDB, and channel indexes are fetched and
+parsed without persisting cache files. Creating the root-only ephemeral host
+lock under `/run` is outside the target-root zero-write guarantee.
+
 ---
 
 ## 3. Streaming Tar + Zstd Archive Format (`*.pkg.tar.zst`)
