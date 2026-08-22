@@ -455,13 +455,19 @@ inline std::expected<InspectedPackage, std::string> inspect_package_stream(
         result.manifest.triggers = std::move(*trigger_res);
     }
 
-    constexpr std::array<std::pair<std::string_view, std::string_view>, 4> usr_merge_aliases{
+    constexpr std::array<std::pair<std::string_view, std::string_view>, 3> usr_merge_aliases{
         std::pair{"bin", "usr/bin"},
-        std::pair{"sbin", "usr/sbin"},
         std::pair{"lib", "usr/lib"},
         std::pair{"lib64", "usr/lib64"},
     };
     for (const auto& entry : data_entries) {
+        if (entry.path == "sbin" || entry.path.starts_with("sbin/")
+            || entry.path == "usr/sbin" || entry.path.starts_with("usr/sbin/")) {
+            return std::unexpected(std::format(
+                "Package '{}' must use usr/bin instead of unsupported sbin path '{}'",
+                result.manifest.name, entry.path));
+        }
+
         auto top = std::string_view(entry.path);
         if (auto slash = top.find('/'); slash != std::string_view::npos) {
             top = top.substr(0, slash);
@@ -471,8 +477,7 @@ inline std::expected<InspectedPackage, std::string> inspect_package_stream(
         if (alias == usr_merge_aliases.end()) continue;
 
         const bool is_collapsed_merge_target =
-            (entry.path == "sbin" && entry.link_target == "usr/bin")
-            || (entry.path == "lib64" && entry.link_target == "usr/lib");
+            entry.path == "lib64" && entry.link_target == "usr/lib";
         const bool is_base_merge_link = result.manifest.name == "base-files"
             && entry.path == top
             && entry.typeflag == '2'

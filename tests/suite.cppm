@@ -74,6 +74,15 @@ export int run_all() {
         sage::util::log_error("Trigger execution failure was not propagated");
         return 1;
     }
+    failing_trigger_package.triggers.front().name = "missing-trigger";
+    failing_trigger_package.triggers.front().exec = "/usr/bin/sage-missing-trigger";
+    failing_trigger_context.installed_packages = {failing_trigger_package};
+    auto missing_trigger_result = sage::rebuild::TriggerEngine::run(failing_trigger_context);
+    if (missing_trigger_result
+        || missing_trigger_result.error().find("Required executable") == std::string::npos) {
+        sage::util::log_error("Missing required trigger executable was treated as success");
+        return 1;
+    }
     sage::util::log_success("1. Semantic & Alphanum Version Comparator OK");
 
     // 2. Tar+Zstd Archive Packaging & Streaming Extractor Test
@@ -516,7 +525,6 @@ export int run_all() {
     std::filesystem::create_directories(base_files_data);
     constexpr std::array base_files_aliases{
         std::pair{"bin", "usr/bin"},
-        std::pair{"sbin", "usr/bin"},
         std::pair{"lib", "usr/lib"},
         std::pair{"lib64", "usr/lib"},
     };
@@ -542,6 +550,43 @@ export int run_all() {
     }
     if (!base_files_aliases_ok) {
         sage::util::log_error("Base-files could not create the canonical usr-merge alias");
+        return 1;
+    }
+
+    for (const auto& [target, label] : std::array{
+             std::pair{"usr/bin", "collapsed"}, std::pair{"usr/sbin", "standard"}}) {
+        auto sbin_data = temp_dir / std::format("base-files-{}-data", label);
+        std::filesystem::create_directories(sbin_data);
+        std::filesystem::create_symlink(target, sbin_data / "sbin");
+        auto sbin_pkg = malformed_archive_dir
+            / std::format("base-files-{}.pkg.tar.zst", label);
+        if (!sage::archive::create_package(base_files_manifest, sbin_data, sbin_pkg)) {
+            sage::util::log_error("Failed to create base-files sbin fixture");
+            return 1;
+        }
+        auto sbin_extract = sage::archive::extract_package(
+            sbin_pkg, temp_dir / std::format("base-files-{}-root", label));
+        if (sbin_extract
+            || sbin_extract.error().find("unsupported sbin path") == std::string::npos) {
+            sage::util::log_error("Base-files accepted an sbin compatibility alias");
+            return 1;
+        }
+    }
+
+    auto usr_sbin_bytes = raw_tar_bytes;
+    if (!rename_tar_entry(
+            usr_sbin_bytes, "data/usr/bin/dummy", "data/usr/sbin/dummy")) {
+        sage::util::log_error("Failed to create usr/sbin package fixture");
+        return 1;
+    }
+    auto usr_sbin_pkg = write_mutated_package(usr_sbin_bytes, "usr-sbin-path");
+    auto usr_sbin_result = usr_sbin_pkg
+        ? sage::archive::inspect_package(*usr_sbin_pkg)
+        : std::expected<sage::archive::InspectedPackage, std::string>(
+            std::unexpected("fixture failed"));
+    if (usr_sbin_result
+        || usr_sbin_result.error().find("unsupported sbin path") == std::string::npos) {
+        sage::util::log_error("Package accepted an usr/sbin payload path");
         return 1;
     }
 
@@ -784,11 +829,18 @@ install = [
     sage::service::ServiceSpec svc;
     svc.name = "sshd";
     svc.description = "OpenSSH Server";
-    svc.exec_start = "/usr/sbin/sshd -D";
+    svc.exec_start = "/usr/bin/sshd -D";
     auto gen_openrc = sage::service::generate_service(svc, sage::service::InitType::OpenRC, extract_root);
     auto gen_sysd = sage::service::generate_service(svc, sage::service::InitType::Systemd, extract_root);
     if (!gen_openrc || !gen_sysd) {
         sage::util::log_error("Service generation test failed");
+        return 1;
+    }
+    std::ifstream openrc_script(extract_root / "etc/init.d/sshd");
+    std::string openrc_shebang;
+    std::getline(openrc_script, openrc_shebang);
+    if (openrc_shebang != "#!/usr/bin/openrc-run") {
+        sage::util::log_error("OpenRC service uses a non-canonical interpreter path");
         return 1;
     }
     sage::util::log_success("4. Universal Multi-Init Service Generator (OpenRC/Systemd/Runit/Dinit/s6) OK");

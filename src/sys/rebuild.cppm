@@ -312,7 +312,9 @@ private:
     {
         std::string exec_path = cmd.substr(0, cmd.find(' '));
         if (!std::filesystem::exists(ctx.sysroot / std::filesystem::path(exec_path).relative_path())) {
-            return {};
+            return std::unexpected(std::format(
+                "Required executable '{}' for trigger '{}' is missing",
+                exec_path, trigger_name));
         }
 
         std::string full = (ctx.sysroot == "/")

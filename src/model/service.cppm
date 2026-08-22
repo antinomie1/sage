@@ -104,7 +104,7 @@ struct ServiceSpec {
 
     [[nodiscard]] std::string render_openrc() const {
         std::ostringstream ss;
-        ss << "#!/sbin/openrc-run\n";
+        ss << "#!/usr/bin/openrc-run\n";
         ss << "# Generated automatically by Sage Package Manager\n";
         ss << "description=\"" << (description.empty() ? name : description) << "\"\n\n";
 
