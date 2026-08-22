@@ -161,9 +161,9 @@ struct ChannelIndex {
                     m.name = (*ptab)["name"].value_or("");
                     std::string ver_str = std::string((*ptab)["version"].value_or(""));
                     m.version = package::Version::parse(ver_str);
-                    if (auto release = (*ptab)["release"].value<std::string_view>()) {
-                        m.version.rel = std::string(*release);
-                    }
+                    auto release = package::parse_release_field(*ptab, m.version.rel);
+                    if (!release) return std::unexpected(release.error());
+                    m.version.rel = std::move(*release);
                     if (auto epoch = (*ptab)["epoch"].value<long long>()) {
                         if (*epoch < 0
                             || static_cast<unsigned long long>(*epoch)

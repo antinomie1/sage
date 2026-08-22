@@ -157,13 +157,13 @@ public:
         t.push_back(package::Trigger{
             .name = "ldconfig",
             .on_paths = {"usr/lib/", "lib/"},
-            .exec = "/sbin/ldconfig",
+            .exec = "/usr/bin/ldconfig",
             .priority = 10,
         });
         t.push_back(package::Trigger{
             .name = "ca-certificates",
             .on_paths = {"etc/ssl/certs/", "usr/share/ca-certificates/"},
-            .exec = "/usr/sbin/update-ca-certificates",
+            .exec = "/usr/bin/update-ca-certificates",
             .priority = 20,
         });
         t.push_back(package::Trigger{
@@ -194,7 +194,7 @@ public:
         return t;
     }
 
-    static void run(const TriggerContext& ctx) {
+    static std::expected<void, std::string> run(const TriggerContext& ctx) {
         // Capabilities brought in by this transaction, for on_capability.
         std::set<std::string> txn_capabilities;
         for (const auto& pkg : ctx.transaction_packages) {
@@ -221,8 +221,10 @@ public:
             if (!cmd) continue;
 
             if (!already_run.insert(*cmd).second) continue;
-            (void)execute(*cmd, trig.name, ctx);
+            auto result = execute(*cmd, trig.name, ctx);
+            if (!result) return result;
         }
+        return {};
     }
 
 private:
@@ -303,14 +305,49 @@ private:
     // chroot: host-side they would rebuild the HOST's caches and leave the
     // sysroot's untouched, and the host loader may not even match the target's
     // glibc. Every path here is therefore relative to the target root.
-    static bool execute(
+    static std::expected<void, std::string> execute(
         const std::string& cmd,
         std::string_view trigger_name,
         const TriggerContext& ctx)
     {
         std::string exec_path = cmd.substr(0, cmd.find(' '));
-        if (!std::filesystem::exists(ctx.sysroot / std::filesystem::path(exec_path).relative_path())) {
+        auto within_root = [&](std::filesystem::path path) {
+            path = (std::filesystem::path("/") / path.relative_path())
+                       .lexically_normal().relative_path();
+            for (unsigned links = 0; links < 40; ++links) {
+                std::filesystem::path resolved;
+                bool followed = false;
+                for (auto component = path.begin(); component != path.end(); ++component) {
+                    resolved /= *component;
+                    std::error_code ec;
+                    auto status = std::filesystem::symlink_status(ctx.sysroot / resolved, ec);
+                    if (ec || status.type() == std::filesystem::file_type::not_found) return false;
+                    if (status.type() != std::filesystem::file_type::symlink) continue;
+                    auto target = std::filesystem::read_symlink(ctx.sysroot / resolved, ec);
+                    if (ec) return false;
+                    std::filesystem::path remainder;
+                    for (auto rest = std::next(component); rest != path.end(); ++rest) {
+                        remainder /= *rest;
+                    }
+                    path = target.is_absolute() ? target.relative_path()
+                                                : resolved.parent_path() / target;
+                    if (!remainder.empty()) path /= remainder;
+                    path = (std::filesystem::path("/") / path)
+                               .lexically_normal().relative_path();
+                    followed = true;
+                    break;
+                }
+                if (!followed) return true;
+            }
             return false;
+        };
+        const bool executable_exists = ctx.sysroot == "/"
+            ? std::filesystem::exists(exec_path)
+            : within_root(exec_path);
+        if (!executable_exists) {
+            return std::unexpected(std::format(
+                "Required executable '{}' for trigger '{}' is missing",
+                exec_path, trigger_name));
         }
 
         std::string full = (ctx.sysroot == "/")
@@ -319,16 +356,16 @@ private:
 
         if (ctx.dry_run) {
             util::log_info("Would run trigger '{}': {}", trigger_name, full);
-            return true;
+            return {};
         }
 
         util::log_info("Running trigger '{}': {}", trigger_name, full);
         int ret = std::system(full.c_str());
         if (ret != 0) {
-            util::log_warn("Trigger '{}' failed (exit {}): {}", trigger_name, ret, full);
-            return false;
+            return std::unexpected(std::format(
+                "Trigger '{}' failed (status {}): {}", trigger_name, ret, full));
         }
-        return true;
+        return {};
     }
 };
 
@@ -442,7 +479,7 @@ public:
         }
 
         auto wtxn = db.begin_write_txn();
-        if (!wtxn) return std::unexpected("Failed to open database write transaction");
+        if (!wtxn) return std::unexpected(std::string("Failed to open database write transaction"));
 
         // The plan was computed before taking the writer lock. Validate every
         // provider binding before changing any of them so a stale reconcile
@@ -643,7 +680,11 @@ public:
         for (const auto& pkg : trig_ctx.transaction_packages) {
             trig_ctx.touched_files.insert(trig_ctx.touched_files.end(), pkg.files.begin(), pkg.files.end());
         }
-        TriggerEngine::run(trig_ctx);
+        auto trigger_result = TriggerEngine::run(trig_ctx);
+        if (!trigger_result) {
+            return std::unexpected(
+                "Post-transaction trigger failed: " + trigger_result.error());
+        }
 
         util::log_success("Reconcile completed! Regenerated {} native service scripts for {}", 
             gen_count, service::to_string(plan.target_init));

@@ -314,7 +314,12 @@ export int cmd_install(
         trig_ctx.installed_packages = std::move(*current_packages);
         trig_ctx.providers = cfg.providers;
         trig_ctx.dry_run = opts.dry_run;
-        sage::rebuild::TriggerEngine::run(trig_ctx);
+        auto trigger_result = sage::rebuild::TriggerEngine::run(trig_ctx);
+        if (!trigger_result) {
+            sage::util::log_error(
+                "Aggregate post-install trigger failed: {}", trigger_result.error());
+            return false;
+        }
         return true;
     };
 
@@ -956,7 +961,12 @@ export int cmd_remove(const CliOptions& opts) {
     for (const auto& [name, pkg] : installed_map) {
         if (to_remove_set.contains(name)) trig_ctx.transaction_packages.push_back(pkg);
     }
-    sage::rebuild::TriggerEngine::run(trig_ctx);
+    auto trigger_result = sage::rebuild::TriggerEngine::run(trig_ctx);
+    if (!trigger_result) {
+        sage::util::log_error(
+            "Post-remove trigger failed: {}", trigger_result.error());
+        return 1;
+    }
     std::vector<sage::channel::Channel> active_channels;
     for (const auto& ch_cfg : cfg.channels) {
         sage::channel::Channel ch;
@@ -967,7 +977,7 @@ export int cmd_remove(const CliOptions& opts) {
     }
     (void)sage::channel::ProfileManager::regenerate_fhs_profile(opts.target_root, active_channels);
 
-    sage::util::log_success("Successfully removed {} packages (including orphaned dependencies) from {}", 
+    sage::util::log_success("Successfully removed {} packages (including orphaned dependencies) from {}",
         to_remove_set.size(), opts.target_root.string());
     return 0;
 }

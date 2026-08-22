@@ -165,17 +165,61 @@ export int cmd_build(const CliOptions& opts) {
         sage::util::log_error("Failed to parse recipe: {}", recipe_res.error());
         return 1;
     }
-    const auto& r = *recipe_res;
-    sage::util::log_info("Building package '{}' version {} (channel: {})...", r.name, r.version.to_string(), r.channel);
+    auto r = std::move(*recipe_res);
 
-    // Load the build configuration up front: the phases need the compiler
-    // and flags, and the DT_NEEDED check below reuses the same handle.
+    // Load configuration before choosing the identity: configured channel
+    // indexes are Recipedia's published state and therefore the authority for
+    // releases. Local build artifacts are deliberately irrelevant -- a clean
+    // builder and a dirty builder must choose the same release.
     auto cfg_res = sage::config::SystemConfig::load_from_root(opts.target_root);
     if (!cfg_res) {
         sage::util::log_error("Failed to load configuration: {}", cfg_res.error());
         return 1;
     }
-    const sage::config::BuildConfig& bcfg = cfg_res->build;
+    const auto& cfg = *cfg_res;
+    std::uint64_t highest_published_release = 0;
+    bool has_published_release = false;
+    for (const auto& configured : cfg.channels) {
+        if (!configured.enabled || configured.url.empty()) continue;
+        sage::channel::Channel channel;
+        channel.name = configured.name;
+        channel.url = configured.url;
+        channel.scope = sage::channel::parse_scope(configured.scope);
+        channel.priority = configured.priority;
+        channel.enabled = true;
+        auto published = sage::channel::ProfileManager::sync_channel(channel, cfg.cache_dir);
+        if (!published) {
+            sage::util::log_error("Cannot determine published releases from Recipedia channel '{}': {}",
+                                  configured.name, published.error());
+            return 1;
+        }
+        for (const auto& package : published->available_packages) {
+            if (package.name != r.name
+                || package.channel != r.channel
+                || package.version.epoch != r.version.epoch
+                || package.version.ver != r.version.ver) continue;
+            auto release = sage::package::parse_release(package.version.rel);
+            if (!release) continue;  // Channel parsing already rejects this; defensive for constructed indexes.
+            highest_published_release = std::max(highest_published_release, *release);
+            has_published_release = true;
+        }
+    }
+    if (has_published_release) {
+        if (highest_published_release == std::numeric_limits<std::uint64_t>::max()) {
+            sage::util::log_error(
+                "Published release range exhausted for package '{}' in channel '{}' at epoch {} version '{}': highest published release is UINT64_MAX",
+                r.name, r.channel, r.version.epoch, r.version.ver);
+            return 1;
+        }
+        auto declared_release = sage::package::parse_release(r.version.rel);
+        r.version.rel = std::format("{}", std::max(
+            *declared_release, highest_published_release + 1));
+    }
+    sage::util::log_info("Building package '{}' version {} (channel: {})...", r.name, r.version.to_string(), r.channel);
+
+    // Load the build configuration up front: the phases need the compiler
+    // and flags, and the DT_NEEDED check below reuses the same handle.
+    const sage::config::BuildConfig& bcfg = cfg.build;
 
     // Per-recipe [build] overrides replace the global baseline; cxxflags
     // mirror cflags at whichever level does not spell them out.

@@ -17,7 +17,7 @@ export int cmd_toolchain(const CliOptions& opts) {
             return 0;
         }
         for (const auto& sc : list) {
-            std::println("  • {:<12} slot: {:<10} scope: {:<10} path: {}", 
+            std::println("  • {:<12} slot: {:<10} scope: {:<10} path: {}",
                 sc.category, sc.slot, sage::channel::to_string(sc.scope), sc.path.string());
         }
         return 0;

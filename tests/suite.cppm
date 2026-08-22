@@ -37,11 +37,98 @@ export int run_all() {
         sage::util::log_error("Legacy capability defaults or explicit override failed");
         return 1;
     }
+
+    const auto builtin_triggers = sage::rebuild::TriggerEngine::builtin_triggers();
+    auto ldconfig_trigger = std::ranges::find_if(
+        builtin_triggers, [](const auto& trigger) { return trigger.name == "ldconfig"; });
+    auto certificates_trigger = std::ranges::find_if(
+        builtin_triggers, [](const auto& trigger) { return trigger.name == "ca-certificates"; });
+    if (ldconfig_trigger == builtin_triggers.end()
+        || ldconfig_trigger->exec != "/usr/bin/ldconfig"
+        || certificates_trigger == builtin_triggers.end()
+        || certificates_trigger->exec != "/usr/bin/update-ca-certificates") {
+        sage::util::log_error("Built-in triggers do not use canonical usr-merge paths");
+        return 1;
+    }
+
+    sage::package::PackageManifest failing_trigger_package;
+    failing_trigger_package.name = "failing-trigger";
+    failing_trigger_package.version = sage::package::Version::parse("1.0.0-1");
+    failing_trigger_package.triggers.push_back(sage::package::Trigger{
+        .name = "must-fail",
+        .on_paths = {"usr/share/must-fail/"},
+        .on_capability = {},
+        .exec = "/bin/false",
+        .args = {},
+        .run_capability = {},
+    });
+    sage::package::FileEntry failing_trigger_file;
+    failing_trigger_file.path = "usr/share/must-fail/input";
+    sage::rebuild::TriggerContext failing_trigger_context;
+    failing_trigger_context.touched_files = {failing_trigger_file};
+    failing_trigger_context.installed_packages = {failing_trigger_package};
+    auto failing_trigger_result =
+        sage::rebuild::TriggerEngine::run(failing_trigger_context);
+    if (failing_trigger_result
+        || failing_trigger_result.error().find("must-fail") == std::string::npos) {
+        sage::util::log_error("Trigger execution failure was not propagated");
+        return 1;
+    }
+    failing_trigger_package.triggers.front().name = "missing-trigger";
+    failing_trigger_package.triggers.front().exec = "/usr/bin/sage-missing-trigger";
+    failing_trigger_context.installed_packages = {failing_trigger_package};
+    auto missing_trigger_result = sage::rebuild::TriggerEngine::run(failing_trigger_context);
+    if (missing_trigger_result
+        || missing_trigger_result.error().find("Required executable") == std::string::npos) {
+        sage::util::log_error("Missing required trigger executable was treated as success");
+        return 1;
+    }
+
+    auto trigger_sysroot = std::filesystem::temp_directory_path() / "sage_trigger_symlink_test";
+    std::filesystem::remove_all(trigger_sysroot);
+    std::filesystem::create_directories(trigger_sysroot / "usr/bin");
+    std::filesystem::create_directories(trigger_sysroot / "usr/libexec");
+    std::ofstream(trigger_sysroot / "usr/libexec/real-trigger") << "fixture\n";
+    std::filesystem::create_symlink(
+        "/usr/libexec/real-trigger", trigger_sysroot / "usr/bin/absolute-trigger");
+    std::filesystem::create_symlink(
+        "../libexec/real-trigger", trigger_sysroot / "usr/bin/relative-trigger");
+    std::filesystem::create_symlink(
+        "../../../usr/libexec/real-trigger", trigger_sysroot / "usr/bin/clamped-trigger");
+    std::filesystem::create_symlink(
+        "/usr/libexec/missing-trigger", trigger_sysroot / "usr/bin/dangling-trigger");
+    failing_trigger_context.sysroot = trigger_sysroot;
+    failing_trigger_context.dry_run = true;
+    for (std::string_view executable : {
+             "/usr/bin/absolute-trigger", "/usr/bin/relative-trigger",
+             "/usr/bin/clamped-trigger"}) {
+        failing_trigger_package.triggers.front().name = "sysroot-symlink-trigger";
+        failing_trigger_package.triggers.front().exec = executable;
+        failing_trigger_context.installed_packages = {failing_trigger_package};
+        if (auto result = sage::rebuild::TriggerEngine::run(failing_trigger_context); !result) {
+            sage::util::log_error(
+                "Target-root trigger symlink '{}' was not resolved: {}", executable, result.error());
+            return 1;
+        }
+    }
+    failing_trigger_package.triggers.front().name = "dangling-sysroot-trigger";
+    failing_trigger_package.triggers.front().exec = "/usr/bin/dangling-trigger";
+    failing_trigger_context.installed_packages = {failing_trigger_package};
+    auto dangling_trigger_result = sage::rebuild::TriggerEngine::run(failing_trigger_context);
+    if (dangling_trigger_result
+        || dangling_trigger_result.error().find("Required executable") == std::string::npos) {
+        sage::util::log_error("Dangling target-root trigger symlink was treated as executable");
+        return 1;
+    }
+    std::filesystem::remove_all(trigger_sysroot);
     sage::util::log_success("1. Semantic & Alphanum Version Comparator OK");
 
     // 2. Tar+Zstd Archive Packaging & Streaming Extractor Test
     auto temp_dir = std::filesystem::temp_directory_path() / "sage_archive_test";
     std::filesystem::remove_all(temp_dir);
+    auto unpublished_build_root = temp_dir / "unpublished-build-root";
+    std::filesystem::create_directories(unpublished_build_root / "etc/sage");
+    std::ofstream(unpublished_build_root / "etc/sage/system.toml") << "schema_version = 1\n";
     const auto long_rel = std::filesystem::path(std::string(110, 'a')) / std::string(80, 'b');
     const auto boundary_rel = std::filesystem::path(std::string(100, 'e')) / std::string(49, 'f') / std::string(100, 'g');
     const auto boundary_empty_dir = std::filesystem::path(std::string(100, 'i'));
@@ -186,11 +273,16 @@ export int run_all() {
 
     auto extract_root = temp_dir / "sysroot";
     auto ext_res = sage::archive::extract_package(pkg_path, extract_root);
+    const bool canonical_archive_paths = ext_res
+        && std::ranges::none_of(ext_res->manifest.files, [](const auto& file) {
+            return file.path.ends_with('/');
+        });
     if (!ext_res || !std::filesystem::exists(extract_root / "usr/bin/dummy") ||
         !std::filesystem::exists(extract_root / long_rel) || !std::filesystem::exists(extract_root / boundary_rel) ||
         !std::filesystem::is_directory(extract_root / boundary_empty_dir) ||
         !std::filesystem::is_symlink(extract_root / "usr/bin/link") ||
-        std::filesystem::read_symlink(extract_root / "usr/bin/link").generic_string() != boundary_link_target) {
+        std::filesystem::read_symlink(extract_root / "usr/bin/link").generic_string() != boundary_link_target ||
+        !canonical_archive_paths) {
         sage::util::log_error("Archive extraction verification failed");
         return 1;
     }
@@ -471,8 +563,18 @@ export int run_all() {
     }
 
     auto base_files_data = temp_dir / "base-files-data";
-    std::filesystem::create_directories(base_files_data);
-    std::filesystem::create_symlink("usr/bin", base_files_data / "bin");
+    std::filesystem::create_directories(base_files_data / "usr");
+    constexpr std::array base_files_aliases{
+        std::pair{"bin", "usr/bin"},
+        std::pair{"sbin", "usr/bin"},
+        std::pair{"lib", "usr/lib"},
+        std::pair{"lib64", "usr/lib"},
+        std::pair{"usr/sbin", "bin"},
+        std::pair{"usr/lib64", "lib"},
+    };
+    for (const auto& [path, target] : base_files_aliases) {
+        std::filesystem::create_symlink(target, base_files_data / path);
+    }
     sage::package::PackageManifest base_files_manifest;
     base_files_manifest.name = "base-files";
     base_files_manifest.version = sage::package::Version::parse("1.0.0-1");
@@ -484,10 +586,48 @@ export int run_all() {
         ? sage::archive::extract_package(base_files_pkg, base_files_root)
         : std::expected<sage::archive::ExtractedPackage, std::string>(
             std::unexpected(base_files_pack.error()));
-    if (!base_files_extract
-        || !std::filesystem::is_symlink(base_files_root / "bin")
-        || std::filesystem::read_symlink(base_files_root / "bin") != "usr/bin") {
+    bool base_files_aliases_ok = base_files_extract.has_value();
+    for (const auto& [path, target] : base_files_aliases) {
+        base_files_aliases_ok = base_files_aliases_ok
+            && std::filesystem::is_symlink(base_files_root / path)
+            && std::filesystem::read_symlink(base_files_root / path) == target;
+    }
+    if (!base_files_aliases_ok) {
         sage::util::log_error("Base-files could not create the canonical usr-merge alias");
+        return 1;
+    }
+
+    auto usr_sbin_bytes = raw_tar_bytes;
+    if (!rename_tar_entry(
+            usr_sbin_bytes, "data/usr/bin/dummy", "data/usr/sbin/dummy")) {
+        sage::util::log_error("Failed to create usr/sbin package fixture");
+        return 1;
+    }
+    auto usr_sbin_pkg = write_mutated_package(usr_sbin_bytes, "usr-sbin-path");
+    auto usr_sbin_result = usr_sbin_pkg
+        ? sage::archive::inspect_package(*usr_sbin_pkg)
+        : std::expected<sage::archive::InspectedPackage, std::string>(
+            std::unexpected("fixture failed"));
+    if (usr_sbin_result
+        || usr_sbin_result.error().find("compatibility path") == std::string::npos) {
+        sage::util::log_error("Package accepted an usr/sbin payload path");
+        return 1;
+    }
+
+    auto usr_lib64_bytes = raw_tar_bytes;
+    if (!rename_tar_entry(
+            usr_lib64_bytes, "data/usr/bin/dummy", "data/usr/lib64/dummy")) {
+        sage::util::log_error("Failed to create usr/lib64 package fixture");
+        return 1;
+    }
+    auto usr_lib64_pkg = write_mutated_package(usr_lib64_bytes, "usr-lib64-path");
+    auto usr_lib64_result = usr_lib64_pkg
+        ? sage::archive::inspect_package(*usr_lib64_pkg)
+        : std::expected<sage::archive::InspectedPackage, std::string>(
+            std::unexpected("fixture failed"));
+    if (usr_lib64_result
+        || usr_lib64_result.error().find("compatibility path") == std::string::npos) {
+        sage::util::log_error("Package accepted an usr/lib64 payload path");
         return 1;
     }
 
@@ -645,6 +785,8 @@ install = [
         -> std::expected<sage::package::PackageManifest, std::string> {
         CliOptions build_opts;
         build_opts.args = {recipe_dir.string()};
+        build_opts.target_root = unpublished_build_root;
+        build_opts.no_elf_check = true;
         if (cmd_build(build_opts) != 0) {
             return std::unexpected("cmd_build failed for " + recipe_dir.string());
         }
@@ -729,11 +871,18 @@ install = [
     sage::service::ServiceSpec svc;
     svc.name = "sshd";
     svc.description = "OpenSSH Server";
-    svc.exec_start = "/usr/sbin/sshd -D";
+    svc.exec_start = "/usr/bin/sshd -D";
     auto gen_openrc = sage::service::generate_service(svc, sage::service::InitType::OpenRC, extract_root);
     auto gen_sysd = sage::service::generate_service(svc, sage::service::InitType::Systemd, extract_root);
     if (!gen_openrc || !gen_sysd) {
         sage::util::log_error("Service generation test failed");
+        return 1;
+    }
+    std::ifstream openrc_script(extract_root / "etc/init.d/sshd");
+    std::string openrc_shebang;
+    std::getline(openrc_script, openrc_shebang);
+    if (openrc_shebang != "#!/usr/bin/openrc-run") {
+        sage::util::log_error("OpenRC service uses a non-canonical interpreter path");
         return 1;
     }
     sage::util::log_success("4. Universal Multi-Init Service Generator (OpenRC/Systemd/Runit/Dinit/s6) OK");
@@ -785,6 +934,106 @@ version = "1:2.0-3"
         || embedded_epoch_index->available_packages.front().version.epoch != 1
         || embedded_epoch_index->available_packages.front().version.rel != "3") {
         sage::util::log_error("Embedded version epoch/release was not preserved");
+        return 1;
+    }
+
+    auto absent_release_manifest = sage::package::PackageManifest::parse_toml(R"(
+schema_version = 1
+[package]
+name = "absent-release"
+version = "1.0"
+)");
+    auto absent_release_recipe = sage::package::Recipe::parse_toml(R"(
+schema_version = 1
+[package]
+name = "absent-release"
+version = "1.0"
+)");
+    auto absent_release_index = sage::channel::ChannelIndex::parse_toml(R"(
+schema_version = 1
+[channel]
+name = "core"
+[[packages]]
+name = "absent-release"
+version = "1.0"
+)");
+    if (!absent_release_manifest || absent_release_manifest->version.rel != "1"
+        || !absent_release_recipe || absent_release_recipe->version.rel != "1"
+        || !absent_release_index || absent_release_index->available_packages.size() != 1
+        || absent_release_index->available_packages.front().version.rel != "1") {
+        sage::util::log_error("Absent release did not default to one");
+        return 1;
+    }
+
+    for (std::string_view wrong_type : {"0", "1", "false"}) {
+        auto manifest = sage::package::PackageManifest::parse_toml(std::format(R"(
+schema_version = 1
+[package]
+name = "wrong-release-type"
+version = "1.0"
+release = {}
+)", wrong_type));
+        auto recipe = sage::package::Recipe::parse_toml(std::format(R"(
+schema_version = 1
+[package]
+name = "wrong-release-type"
+version = "1.0"
+release = {}
+)", wrong_type));
+        auto index = sage::channel::ChannelIndex::parse_toml(std::format(R"(
+schema_version = 1
+[channel]
+name = "core"
+[[packages]]
+name = "wrong-release-type"
+version = "1.0"
+release = {}
+)", wrong_type));
+        if (manifest || recipe || index) {
+            sage::util::log_error(
+                "Package, recipe, or channel parser accepted wrong-typed release {}", wrong_type);
+            return 1;
+        }
+    }
+
+    for (std::string_view invalid : {"0", "alpha", "1x", "-1"}) {
+        auto manifest = sage::package::PackageManifest::parse_toml(std::format(R"(
+schema_version = 1
+[package]
+name = "bad-release"
+version = "1.0"
+release = "{}"
+)", invalid));
+        auto recipe = sage::package::Recipe::parse_toml(std::format(R"(
+schema_version = 1
+[package]
+name = "bad-release"
+version = "1.0"
+release = "{}"
+)", invalid));
+        auto index = sage::channel::ChannelIndex::parse_toml(std::format(R"(
+schema_version = 1
+[channel]
+name = "core"
+[[packages]]
+name = "bad-release"
+version = "1.0"
+release = "{}"
+)", invalid));
+        if (manifest || recipe || index) {
+            sage::util::log_error("Package, recipe, or channel parser accepted invalid release '{}'", invalid);
+            return 1;
+        }
+    }
+    auto positive_release_recipe = sage::package::Recipe::parse_toml(R"(
+schema_version = 1
+[package]
+name = "positive-release"
+version = "1.0"
+release = "10"
+)");
+    if (!positive_release_recipe || positive_release_recipe->version.rel != "10") {
+        sage::util::log_error("Recipe parser rejected a positive decimal release");
         return 1;
     }
 
@@ -1241,6 +1490,7 @@ version = "1:2.0-3"
     version_1.triggers = {version_trigger};
     sage::package::PackageManifest version_2 = version_1;
     version_2.version = sage::package::Version::parse("2.0.0-1");
+    version_2.triggers.clear();
     auto version_1_pkg = version_repo / "versioned-package-1.0.0-1-x86_64.pkg.tar.zst";
     auto version_2_pkg = version_repo / "versioned-package-2.0.0-1-x86_64.pkg.tar.zst";
     if (!sage::archive::create_package(version_1, version_1_data, version_1_pkg)
@@ -1258,7 +1508,7 @@ version = "1:2.0-3"
     CliOptions version_install;
     version_install.target_root = version_target;
     version_install.args = {"versioned-package"};
-    if (cmd_install(version_install) != 0
+    if (cmd_install(version_install, "/") != 0
         || read_test_file(version_target / "usr/bin/versioned") != "version 2\n") {
         sage::util::log_error("Solver selection did not install the selected archive version");
         return 1;
@@ -2004,7 +2254,7 @@ version = "1:2.0-3"
     lib_recipe << R"(schema_version = 1
 [package]
 name = "libsample"
-version = "1.2.0"
+version = "2:2.0"
 release = "1"
 description = "Sample dynamic library"
 license = "MIT"
@@ -2013,8 +2263,8 @@ channel = "system"
 provides = ["libsample", "so:libsample.so.1"]
 
 install = [
-    'mkdir -p "$DESTDIR/usr/lib"',
-    'printf "/* libsample binary */\n" > "$DESTDIR/usr/lib/libsample.so.1"',
+    'mkdir -p "$DESTDIR/usr/share/libsample"',
+    'printf "/* libsample fixture */\n" > "$DESTDIR/usr/share/libsample/payload"',
 ]
 )";
     lib_recipe.close();
@@ -2041,15 +2291,133 @@ install = [
     app_recipe.close();
 
     // 3. Execute `sage build` on both packages
+    auto recipedia = build_test_dir / "recipedia";
+    auto recipedia_root = build_test_dir / "builder-root";
+    std::filesystem::create_directories(recipedia);
+    std::filesystem::create_directories(recipedia_root / "etc/sage");
+    auto publish_index = [&](std::string_view packages) {
+        std::ofstream index(recipedia / "index.toml");
+        index << "schema_version = 1\n[channel]\nname = \"core\"\n" << packages;
+        return index.good();
+    };
+    std::ofstream(recipedia_root / "etc/sage/channels.toml")
+        << "schema_version = 1\n[[channels]]\nname = \"core\"\nurl = \"file://"
+        << recipedia.string() << "\"\nenabled = true\n";
+    if (!publish_index(R"(
+[[packages]]
+name = "libsample"
+version = "2.0"
+release = "20"
+epoch = 2
+channel = "toolchain/foo"
+)")) {
+        sage::util::log_error("Failed to create cross-channel Recipedia fixture");
+        return 1;
+    }
     CliOptions build_lib_opts;
     build_lib_opts.args = {(build_test_dir / "libsample").string()};
+    build_lib_opts.target_root = recipedia_root;
     if (cmd_build(build_lib_opts) != 0) {
         sage::util::log_error("Failed to build libsample");
+        return 1;
+    }
+    // A package published in another package channel is not this identity,
+    // and the local artifact is not a publication. Rebuilding must therefore
+    // retain the recipe's release and may replace the local archive.
+    if (cmd_build(build_lib_opts) != 0) {
+        sage::util::log_error("Failed to rebuild unpublished local libsample");
+        return 1;
+    }
+    auto local_rebuild = sage::archive::inspect_package(
+        build_test_dir / "libsample/libsample-2.0-1-x86_64.pkg.tar.zst");
+    if (!local_rebuild || local_rebuild->manifest.version.rel != "1") {
+        sage::util::log_error("Local or cross-channel publication incorrectly advanced the system release");
+        return 1;
+    }
+    if (!publish_index(R"(
+[[packages]]
+name = "libsample"
+version = "2.0"
+release = "1"
+epoch = 2
+channel = "system"
+[[packages]]
+name = "libsample"
+version = "2.0"
+release = "3"
+epoch = 2
+channel = "system"
+[[packages]]
+name = "libsample"
+version = "2.0"
+release = "2"
+epoch = 2
+channel = "system"
+[[packages]]
+name = "libsample"
+version = "2.0"
+release = "99"
+epoch = 1
+channel = "system"
+)")) {
+        sage::util::log_error("Failed to publish Recipedia release fixtures");
+        return 1;
+    }
+    if (cmd_build(build_lib_opts) != 0) {
+        sage::util::log_error("Failed to rebuild published libsample");
+        return 1;
+    }
+    auto rebuilt_lib = sage::archive::inspect_package(
+        build_test_dir / "libsample/libsample-2.0-4-x86_64.pkg.tar.zst");
+    if (!rebuilt_lib || rebuilt_lib->manifest.version.rel != "4") {
+        sage::util::log_error("Rebuild did not advance beyond the highest published release");
+        return 1;
+    }
+
+    // A packager may intentionally skip releases. Published 2:2.0-1..3 must
+    // not pull an explicitly declared 2:2.0-10 backwards to release 4.
+    {
+        std::ifstream recipe_in(build_test_dir / "libsample/recipe.toml");
+        std::stringstream recipe_text;
+        recipe_text << recipe_in.rdbuf();
+        auto updated = recipe_text.str();
+        auto release = updated.find("release = \"1\"");
+        if (release == std::string::npos) {
+            sage::util::log_error("Failed to locate declared release in libsample fixture");
+            return 1;
+        }
+        updated.replace(release, std::string_view("release = \"1\"").size(), "release = \"10\"");
+        std::ofstream(build_test_dir / "libsample/recipe.toml") << updated;
+    }
+    if (cmd_build(build_lib_opts) != 0) {
+        sage::util::log_error("Failed to build explicitly higher libsample release");
+        return 1;
+    }
+    auto declared_lib = sage::archive::inspect_package(
+        build_test_dir / "libsample/libsample-2.0-10-x86_64.pkg.tar.zst");
+    if (!declared_lib || declared_lib->manifest.version.rel != "10") {
+        sage::util::log_error("Published release lookup regressed an explicitly higher recipe release");
+        return 1;
+    }
+    if (!publish_index(R"(
+[[packages]]
+name = "libsample"
+version = "2.0"
+release = "18446744073709551615"
+epoch = 2
+channel = "system"
+)")) {
+        sage::util::log_error("Failed to publish exhausted release fixture");
+        return 1;
+    }
+    if (cmd_build(build_lib_opts) == 0) {
+        sage::util::log_error("UINT64_MAX published release wrapped or reused a package identity");
         return 1;
     }
 
     CliOptions build_app_opts;
     build_app_opts.args = {(build_test_dir / "sample-app").string()};
+    build_app_opts.target_root = recipedia_root;
     if (cmd_build(build_app_opts) != 0) {
         sage::util::log_error("Failed to build sample-app");
         return 1;
@@ -2070,8 +2438,8 @@ install = [
         return true;
     };
 
-    if (!stage_package(build_test_dir / "libsample/libsample-1.2.0-1-x86_64.pkg.tar.zst",
-                       build_test_dir / "repo/libsample-1.2.0-1-x86_64.pkg.tar.zst")) {
+    if (!stage_package(build_test_dir / "libsample/libsample-2.0-1-x86_64.pkg.tar.zst",
+                       build_test_dir / "repo/libsample-2.0-1-x86_64.pkg.tar.zst")) {
         return 1;
     }
     if (!stage_package(build_test_dir / "sample-app/sample-app-2.0.0-1-x86_64.pkg.tar.zst",
@@ -2097,14 +2465,14 @@ install = [
     CliOptions loop_inst_opts;
     loop_inst_opts.target_root = loop_target;
     loop_inst_opts.args = {"sample-app"};
-    if (cmd_install(loop_inst_opts) != 0) {
+    if (cmd_install(loop_inst_opts, "/") != 0) {
         sage::util::log_error("Failed to install built sample-app");
         return 1;
     }
 
     // Verify files on disk and packages in LMDB
     if (!std::filesystem::exists(loop_target / "usr/bin/sample-app") || 
-        !std::filesystem::exists(loop_target / "usr/lib/libsample.so.1")) {
+        !std::filesystem::exists(loop_target / "usr/share/libsample/payload")) {
         sage::util::log_error("Files from sample-app and libsample were not properly installed to target root");
         return 1;
     }
@@ -2126,8 +2494,8 @@ install = [
     }
 
     // Verify all files from both sample-app and libsample are gone from disk!
-    if (std::filesystem::exists(loop_target / "usr/bin/sample-app") || 
-        std::filesystem::exists(loop_target / "usr/lib/libsample.so.1")) {
+    if (std::filesystem::exists(loop_target / "usr/bin/sample-app") ||
+        std::filesystem::exists(loop_target / "usr/share/libsample/payload")) {
         sage::util::log_error("Files still exist on disk after cascade removal");
         return 1;
     }
@@ -2207,6 +2575,7 @@ cflags = "-O3 -march=x86-64-v3"
 
         auto write_build_toml = [&](const std::filesystem::path& root, std::string_view body) {
             std::filesystem::create_directories(root / "etc/sage");
+            std::ofstream(root / "etc/sage/system.toml") << "schema_version = 1\n";
             std::ofstream f(root / "etc/sage/build.toml");
             f << body;
             return f.good();
@@ -2495,6 +2864,8 @@ after = ["net"]
     {
         auto temp_dir = std::filesystem::temp_directory_path() / "sage_conffile_test";
         std::filesystem::remove_all(temp_dir);
+        std::filesystem::create_directories(temp_dir / "etc/sage");
+        std::ofstream(temp_dir / "etc/sage/system.toml") << "schema_version = 1\n";
         auto conf_dir = temp_dir / "confpkg";
         std::filesystem::create_directories(conf_dir);
         auto read_text = [](const std::filesystem::path& p) {
@@ -2603,6 +2974,8 @@ install = [
     {
         auto temp_dir = std::filesystem::temp_directory_path() / "sage_multisrc_test";
         std::filesystem::remove_all(temp_dir);
+        std::filesystem::create_directories(temp_dir / "target/etc/sage");
+        std::ofstream(temp_dir / "target/etc/sage/system.toml") << "schema_version = 1\n";
 
         // Model level: the first [[source]] fills the primary slot, the rest
         // become extras, and trailing keys still land in host_deps/provides --
