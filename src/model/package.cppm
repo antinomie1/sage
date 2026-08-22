@@ -759,6 +759,14 @@ inline PackageIdentity package_identity(const PackageManifest& manifest) {
 // Recipe Model for Package Building (`recipe.toml`)
 // ============================================================================
 
+// A secondary `[[source]]` entry: downloaded and sha256-verified beside the
+// primary archive, then staged at src/distfiles/<filename> so prepare/build
+// can consume patches and auxiliary tarballs alongside the unpacked tree.
+struct ExtraSource {
+    std::string url;
+    std::string sha256;
+};
+
 struct Recipe {
     uint32_t schema_version{1};
     std::string name;
@@ -770,6 +778,7 @@ struct Recipe {
     std::string arch{"x86_64"};
     std::string source_url;
     std::string source_sha256;
+    std::vector<ExtraSource> extra_sources;
     std::vector<std::string> build_deps;
     std::vector<Dependency> host_deps;
     std::vector<std::string> provides;
@@ -809,9 +818,31 @@ struct Recipe {
             return std::unexpected("Missing [package] section in recipe");
         }
 
-        if (auto* src = tbl.get_as<vendor::toml::table>("source")) {
+        // [source] is either one table (a single download) or an array of
+        // tables (`[[source]]`): the first element is the primary archive that
+        // gets unpacked to src/, any further elements are extra downloads.
+        // TOML keys written after a [[source]] block land inside the last
+        // element, so every scope-sensitive collector below must see all of
+        // them -- src_scopes is the shared third layer.
+        std::vector<const vendor::toml::table*> src_scopes;
+        if (auto* arr = tbl.get_as<vendor::toml::array>("source")) {
+            for (auto&& el : *arr) {
+                const vendor::toml::table* t = el.as_table();
+                if (!t) return std::unexpected("[[source]] entries must be tables");
+                std::string url = (*t)["url"].value_or("");
+                std::string sha = (*t)["sha256"].value_or("");
+                if (!r.source_url.empty() || !src_scopes.empty()) {
+                    r.extra_sources.push_back({std::move(url), std::move(sha)});
+                } else {
+                    r.source_url = std::move(url);
+                    r.source_sha256 = std::move(sha);
+                }
+                src_scopes.push_back(t);
+            }
+        } else if (auto* src = tbl.get_as<vendor::toml::table>("source")) {
             r.source_url = (*src)["url"].value_or("");
             r.source_sha256 = (*src)["sha256"].value_or("");
+            src_scopes.push_back(src);
         }
 
         auto parse_deps = [&](const vendor::toml::table& t, const char* key, std::vector<Dependency>& target) {
@@ -846,7 +877,7 @@ struct Recipe {
             parse_strings(*pkg, "conffiles", r.conffiles);
         }
 
-        if (auto* src = tbl.get_as<vendor::toml::table>("source")) {
+        for (const auto* src : src_scopes) {
             parse_deps(*src, "dependencies", r.host_deps);
             parse_strings(*src, "build_dependencies", r.build_deps);
             parse_strings(*src, "provides", r.provides);
@@ -870,7 +901,7 @@ struct Recipe {
                     }
                 }
             }
-            if (auto* src = tbl.get_as<vendor::toml::table>("source")) {
+            for (const auto* src : src_scopes) {
                 if (auto* arr = src->get_as<vendor::toml::array>(key)) {
                     for (auto&& c : *arr) {
                         if (auto str = c.value<std::string_view>()) {

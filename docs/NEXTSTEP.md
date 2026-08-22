@@ -128,6 +128,19 @@ arch = "x86_64"
 url = "https://github.com/BurntSushi/ripgrep/archive/14.1.0.tar.gz"
 sha256 = "33c616959def5f80a763a51cf1feed8c8ea9db583556862e3c6a84fa42f95499"
 
+# Multi-source: a recipe needing more than one download must express ALL of
+# them as [[source]] entries (TOML forbids mixing the [source] table with a
+# [[source]] array). The first entry is the primary archive unpacked to src/;
+# every further entry is downloaded and sha256-verified beside it, then
+# staged at src/distfiles/<filename> for the prepare/build phases.
+[[source]]
+url = "https://github.com/BurntSushi/ripgrep/archive/14.1.0.tar.gz"
+sha256 = "33c616959def5f80a763a51cf1feed8c8ea9db583556862e3c6a84fa42f95499"
+
+[[source]]
+url = "https://example.com/ripgrep-14.1.0-fixes.patch"
+sha256 = "<sha256-of-patch>"
+
 [build_requirements]
 # Toolchain requirements with semantic version constraints
 channels = [

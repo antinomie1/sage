@@ -187,36 +187,47 @@ export int cmd_build(const CliOptions& opts) {
     std::filesystem::path src_dir = recipe_dir / "src";
     std::filesystem::path pkg_dir = recipe_dir / "pkg";
 
-    // 1. Source Fetch & SHA256 Verification
+    // 1. Source Fetch & SHA256 Verification -- the primary archive plus any
+    // extra `[[source]]` entries. Extras land verbatim in distfiles/ next to
+    // the primary and are staged into src/distfiles/ on every attempt below.
     std::filesystem::path archive_path;  // hoisted: the attempt loop re-extracts per candidate
-    if (!r.source_url.empty()) {
+    std::vector<std::filesystem::path> extra_paths;  // parallel to r.extra_sources
+    auto fetch_source = [&](std::string_view url, std::string_view sha256,
+                            std::filesystem::path& out_path) -> bool {
+        if (url.empty()) return true;
         std::filesystem::create_directories(dist_dir);
-        std::string filename = std::filesystem::path(r.source_url).filename().string();
+        std::string filename = std::filesystem::path(url).filename().string();
         if (filename.empty()) filename = "source.tar.gz";
-        archive_path = dist_dir / filename;
+        out_path = dist_dir / filename;
 
-        if (!std::filesystem::exists(archive_path)) {
-            sage::util::log_info("Fetching source archive from {}...", r.source_url);
-            auto dl_res = sage::vendor::curl::download_file(r.source_url, archive_path);
+        if (!std::filesystem::exists(out_path)) {
+            sage::util::log_info("Fetching source from {}...", url);
+            auto dl_res = sage::vendor::curl::download_file(url, out_path);
             if (!dl_res) {
                 sage::util::log_error("Failed to download source: {}", dl_res.error());
-                return 1;
+                return false;
             }
         }
 
         // Verify SHA256
-        if (!r.source_sha256.empty()) {
-            auto hash_res = sage::util::compute_file_sha256(archive_path);
+        if (!sha256.empty()) {
+            auto hash_res = sage::util::compute_file_sha256(out_path);
             if (!hash_res) {
                 sage::util::log_error("Failed to compute SHA256 for source: {}", hash_res.error());
-                return 1;
+                return false;
             }
-            if (*hash_res != r.source_sha256) {
-                sage::util::log_error("SHA256 checksum mismatch!\n  Expected: {}\n  Actual:   {}", r.source_sha256, *hash_res);
-                return 1;
+            if (*hash_res != sha256) {
+                sage::util::log_error("SHA256 checksum mismatch!\n  Expected: {}\n  Actual:   {}", sha256, *hash_res);
+                return false;
             }
             sage::util::log_success("Source SHA256 checksum verified: {}", *hash_res);
         }
+        return true;
+    };
+    if (!fetch_source(r.source_url, r.source_sha256, archive_path)) return 1;
+    for (const auto& extra : r.extra_sources) {
+        auto& path = extra_paths.emplace_back();
+        if (!fetch_source(extra.url, extra.sha256, path)) return 1;
     }
 
     // 2. Prepare, Build & Install Phases -- retried whole-hog per candidate
@@ -234,17 +245,32 @@ export int cmd_build(const CliOptions& opts) {
         std::error_code ec;
         std::filesystem::remove_all(pkg_dir, ec);
         std::filesystem::create_directories(pkg_dir);
-        if (!r.source_url.empty()) {
+        // A pristine tree per attempt: the primary archive is re-extracted and
+        // the extra sources re-staged, so patches consumed during prepare are
+        // applied to an untouched tree on every retry.
+        if (!archive_path.empty() || !extra_paths.empty()) {
             std::filesystem::remove_all(src_dir, ec);
-            std::filesystem::create_directories(src_dir);
-            sage::util::log_info("Unpacking source to {}...", src_dir.string());
-            std::string cmd = std::format("tar -xf \"{}\" -C \"{}\" --strip-components=1 2>/dev/null || tar -xf \"{}\" -C \"{}\"",
-                archive_path.string(), src_dir.string(), archive_path.string(), src_dir.string());
-            if (std::system(cmd.c_str()) != 0) {
-                sage::util::log_error("Failed to unpack source archive! Archive may be corrupted. Cleaning up...");
-                std::filesystem::remove(archive_path, ec);
-                std::filesystem::remove_all(src_dir, ec);
-                return 1;
+            std::filesystem::create_directories(src_dir / "distfiles");
+            if (!archive_path.empty()) {
+                sage::util::log_info("Unpacking source to {}...", src_dir.string());
+                std::string cmd = std::format("tar -xf \"{}\" -C \"{}\" --strip-components=1 2>/dev/null || tar -xf \"{}\" -C \"{}\"",
+                    archive_path.string(), src_dir.string(), archive_path.string(), src_dir.string());
+                if (std::system(cmd.c_str()) != 0) {
+                    sage::util::log_error("Failed to unpack source archive! Archive may be corrupted. Cleaning up...");
+                    std::filesystem::remove(archive_path, ec);
+                    std::filesystem::remove_all(src_dir, ec);
+                    return 1;
+                }
+            }
+            for (const auto& path : extra_paths) {
+                std::error_code copy_ec;
+                std::filesystem::copy_file(path, src_dir / "distfiles" / path.filename(),
+                                           std::filesystem::copy_options::overwrite_existing, copy_ec);
+                if (copy_ec) {
+                    sage::util::log_error("Failed to stage extra source {}: {}",
+                        path.filename().string(), copy_ec.message());
+                    return 1;
+                }
             }
         }
         std::filesystem::path work_dir = std::filesystem::exists(src_dir) ? src_dir : recipe_dir;

@@ -2484,6 +2484,166 @@ install = [
         sage::util::log_success("14. Conffile Protection on Reinstall OK");
     }
 
+    // 15. Multi-source recipes: `[[source]]` arrays fetch every entry beside
+    // the primary archive and stage the extras at src/distfiles/, while the
+    // scope collectors keep seeing keys written after the last block.
+    {
+        auto temp_dir = std::filesystem::temp_directory_path() / "sage_multisrc_test";
+        std::filesystem::remove_all(temp_dir);
+
+        // Model level: the first [[source]] fills the primary slot, the rest
+        // become extras, and trailing keys still land in host_deps/provides --
+        // they live inside the last array element's TOML table.
+        auto multi = sage::package::Recipe::parse_toml(R"(schema_version = 1
+[package]
+name = "m"
+version = "1.0.0"
+release = "1"
+
+[[source]]
+url = "https://a.example/main.tar.gz"
+sha256 = "aaaa"
+
+[[source]]
+url = "https://b.example/fix.patch"
+sha256 = "bbbb"
+
+dependencies = ["zlib >= 1.3"]
+provides = ["virtual/m"]
+)");
+        if (!multi || multi->source_url != "https://a.example/main.tar.gz"
+            || multi->source_sha256 != "aaaa"
+            || multi->extra_sources.size() != 1
+            || multi->extra_sources[0].url != "https://b.example/fix.patch"
+            || multi->extra_sources[0].sha256 != "bbbb"
+            || multi->host_deps.size() != 1 || multi->host_deps[0].name != "zlib"
+            || multi->provides.size() != 1 || multi->provides[0] != "virtual/m") {
+            sage::util::log_error("Multi-source recipe parse dropped an entry or a trailing scope key");
+            return 1;
+        }
+        // Backward compat: the single [source] table yields no extras.
+        auto single = sage::package::Recipe::parse_toml(R"(schema_version = 1
+[package]
+name = "s"
+version = "1.0.0"
+release = "1"
+
+[source]
+url = "https://a.example/main.tar.gz"
+sha256 = "aaaa"
+)");
+        if (!single || single->source_url.empty() || !single->extra_sources.empty()) {
+            sage::util::log_error("Single-source recipe parse regressed");
+            return 1;
+        }
+
+        // End to end over file:// URLs: a primary tarball unpacked to src/ and
+        // one plain extra file staged at src/distfiles/, both consumed by the
+        // install phase relative to the work directory.
+        auto dist_dir = temp_dir / "dist";
+        std::filesystem::create_directories(dist_dir / "main-1.0");
+        {
+            std::ofstream f(dist_dir / "main-1.0/payload.txt");
+            f << "primary payload\n";
+        }
+        {
+            std::ofstream f(dist_dir / "extra.txt");
+            f << "extra payload\n";
+        }
+        if (std::system(std::format("tar -czf \"{}\" -C \"{}\" main-1.0",
+                (dist_dir / "main.tar.gz").string(), dist_dir.string()).c_str()) != 0) {
+            sage::util::log_error("Failed to pack multi-source fixture tarball");
+            return 1;
+        }
+        auto sha_of = [](const std::filesystem::path& p) -> std::string {
+            auto h = sage::util::compute_file_sha256(p);
+            return h ? *h : "";
+        };
+        const std::string main_sha = sha_of(dist_dir / "main.tar.gz");
+        const std::string extra_sha = sha_of(dist_dir / "extra.txt");
+
+        auto write_recipe = [&](const std::filesystem::path& dir, std::string_view name,
+                                const std::string& extra_hash) {
+            std::filesystem::create_directories(dir);
+            std::ofstream recipe(dir / "recipe.toml");
+            recipe << std::format(R"(schema_version = 1
+[package]
+name = "{}"
+version = "1.0.0"
+release = "1"
+description = "multi-source canary"
+license = "MIT"
+channel = "system"
+
+[[source]]
+url = "file://{}/main.tar.gz"
+sha256 = "{}"
+
+[[source]]
+url = "file://{}/extra.txt"
+sha256 = "{}"
+
+install = [
+    'mkdir -p "$DESTDIR/usr/share"',
+    'cp payload.txt "$DESTDIR/usr/share/primary.txt"',
+    'cp distfiles/extra.txt "$DESTDIR/usr/share/extra.txt"',
+]
+)", name, dist_dir.string(), main_sha, dist_dir.string(), extra_hash);
+            return recipe.good();
+        };
+
+        auto ms_dir = temp_dir / "multisrc";
+        if (!write_recipe(ms_dir, "multisrc", extra_sha)) {
+            sage::util::log_error("Failed to write multi-source fixture recipe");
+            return 1;
+        }
+        CliOptions build_ok;
+        build_ok.args = {ms_dir.string()};
+        build_ok.target_root = temp_dir / "target";
+        if (cmd_build(build_ok) != 0) {
+            sage::util::log_error("Failed to build a multi-source recipe");
+            return 1;
+        }
+        auto unpacked = sage::archive::extract_package(
+            ms_dir / "multisrc-1.0.0-1-x86_64.pkg.tar.zst", temp_dir / "unpacked");
+        auto read_text = [](const std::filesystem::path& p) {
+            std::ifstream f(p);
+            std::stringstream ss;
+            ss << f.rdbuf();
+            return ss.str();
+        };
+        if (!unpacked
+            || read_text(temp_dir / "unpacked/usr/share/primary.txt") != "primary payload\n"
+            || read_text(temp_dir / "unpacked/usr/share/extra.txt") != "extra payload\n") {
+            sage::util::log_error("Extra sources did not reach src/distfiles/ during build");
+            return 1;
+        }
+        // The staged copies are consumed, not shipped: no distfiles leak into
+        // the package payload or the installed tree.
+        if (std::filesystem::exists(temp_dir / "unpacked/usr/share/distfiles")) {
+            sage::util::log_error("distfiles staging leaked into the package payload");
+            return 1;
+        }
+
+        // A wrong hash on any entry -- including extras -- is fatal.
+        auto bad_dir = temp_dir / "multisrc-bad";
+        if (!write_recipe(bad_dir, "multisrcbad",
+                          std::string(extra_sha.size(), 'f'))) {
+            sage::util::log_error("Failed to write bad-hash fixture recipe");
+            return 1;
+        }
+        CliOptions build_bad;
+        build_bad.args = {bad_dir.string()};
+        build_bad.target_root = temp_dir / "target";
+        if (cmd_build(build_bad) == 0) {
+            sage::util::log_error("A bad sha256 on an extra source was not fatal");
+            return 1;
+        }
+
+        std::filesystem::remove_all(temp_dir);
+        sage::util::log_success("15. Multi-Source Fetch, Verification & Staging OK");
+    }
+
     std::filesystem::remove_all(temp_dir);
     sage::util::log_success("🎉 All Sage Master Architecture & Subsystem Integration Tests Passed Successfully!");
     return 0;
