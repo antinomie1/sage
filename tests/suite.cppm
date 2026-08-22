@@ -88,6 +88,9 @@ export int run_all() {
     // 2. Tar+Zstd Archive Packaging & Streaming Extractor Test
     auto temp_dir = std::filesystem::temp_directory_path() / "sage_archive_test";
     std::filesystem::remove_all(temp_dir);
+    auto unpublished_build_root = temp_dir / "unpublished-build-root";
+    std::filesystem::create_directories(unpublished_build_root / "etc/sage");
+    std::ofstream(unpublished_build_root / "etc/sage/system.toml") << "schema_version = 1\n";
     const auto long_rel = std::filesystem::path(std::string(110, 'a')) / std::string(80, 'b');
     const auto boundary_rel = std::filesystem::path(std::string(100, 'e')) / std::string(49, 'f') / std::string(100, 'g');
     const auto boundary_empty_dir = std::filesystem::path(std::string(100, 'i'));
@@ -744,6 +747,7 @@ install = [
         -> std::expected<sage::package::PackageManifest, std::string> {
         CliOptions build_opts;
         build_opts.args = {recipe_dir.string()};
+        build_opts.target_root = unpublished_build_root;
         build_opts.no_elf_check = true;
         if (cmd_build(build_opts) != 0) {
             return std::unexpected("cmd_build failed for " + recipe_dir.string());
@@ -2149,25 +2153,72 @@ install = [
     app_recipe.close();
 
     // 3. Execute `sage build` on both packages
+    auto recipedia = build_test_dir / "recipedia";
+    auto recipedia_root = build_test_dir / "builder-root";
+    std::filesystem::create_directories(recipedia);
+    std::filesystem::create_directories(recipedia_root / "etc/sage");
+    auto publish_index = [&](std::string_view packages) {
+        std::ofstream index(recipedia / "index.toml");
+        index << "schema_version = 1\n[channel]\nname = \"core\"\n" << packages;
+        return index.good();
+    };
+    std::ofstream(recipedia_root / "etc/sage/channels.toml")
+        << "schema_version = 1\n[[channels]]\nname = \"core\"\nurl = \"file://"
+        << recipedia.string() << "\"\nenabled = true\n";
+    if (!publish_index("")) {
+        sage::util::log_error("Failed to create empty Recipedia fixture");
+        return 1;
+    }
     CliOptions build_lib_opts;
     build_lib_opts.args = {(build_test_dir / "libsample").string()};
+    build_lib_opts.target_root = recipedia_root;
     if (cmd_build(build_lib_opts) != 0) {
         sage::util::log_error("Failed to build libsample");
         return 1;
     }
+    // A local artifact is not a publication. Rebuilding against an empty
+    // Recipedia index must retain the recipe's release and may replace it.
     if (cmd_build(build_lib_opts) != 0) {
-        sage::util::log_error("Failed to rebuild an already published libsample");
+        sage::util::log_error("Failed to rebuild unpublished local libsample");
+        return 1;
+    }
+    auto local_rebuild = sage::archive::inspect_package(
+        build_test_dir / "libsample/libsample-1.2.0-1-x86_64.pkg.tar.zst");
+    if (!local_rebuild || local_rebuild->manifest.version.rel != "1") {
+        sage::util::log_error("Local archive incorrectly advanced an unpublished release");
+        return 1;
+    }
+    if (!publish_index(R"(
+[[packages]]
+name = "libsample"
+version = "1.2.0"
+release = "1"
+[[packages]]
+name = "libsample"
+version = "1.2.0"
+release = "3"
+[[packages]]
+name = "libsample"
+version = "1.2.0"
+release = "2"
+)")) {
+        sage::util::log_error("Failed to publish Recipedia release fixtures");
+        return 1;
+    }
+    if (cmd_build(build_lib_opts) != 0) {
+        sage::util::log_error("Failed to rebuild published libsample");
         return 1;
     }
     auto rebuilt_lib = sage::archive::inspect_package(
-        build_test_dir / "libsample/libsample-1.2.0-2-x86_64.pkg.tar.zst");
-    if (!rebuilt_lib || rebuilt_lib->manifest.version.rel != "2") {
+        build_test_dir / "libsample/libsample-1.2.0-4-x86_64.pkg.tar.zst");
+    if (!rebuilt_lib || rebuilt_lib->manifest.version.rel != "4") {
         sage::util::log_error("Rebuild did not advance beyond the highest published release");
         return 1;
     }
 
     CliOptions build_app_opts;
     build_app_opts.args = {(build_test_dir / "sample-app").string()};
+    build_app_opts.target_root = recipedia_root;
     if (cmd_build(build_app_opts) != 0) {
         sage::util::log_error("Failed to build sample-app");
         return 1;
@@ -2325,6 +2376,7 @@ cflags = "-O3 -march=x86-64-v3"
 
         auto write_build_toml = [&](const std::filesystem::path& root, std::string_view body) {
             std::filesystem::create_directories(root / "etc/sage");
+            std::ofstream(root / "etc/sage/system.toml") << "schema_version = 1\n";
             std::ofstream f(root / "etc/sage/build.toml");
             f << body;
             return f.good();
@@ -2613,6 +2665,8 @@ after = ["net"]
     {
         auto temp_dir = std::filesystem::temp_directory_path() / "sage_conffile_test";
         std::filesystem::remove_all(temp_dir);
+        std::filesystem::create_directories(temp_dir / "etc/sage");
+        std::ofstream(temp_dir / "etc/sage/system.toml") << "schema_version = 1\n";
         auto conf_dir = temp_dir / "confpkg";
         std::filesystem::create_directories(conf_dir);
         auto read_text = [](const std::filesystem::path& p) {
@@ -2721,6 +2775,8 @@ install = [
     {
         auto temp_dir = std::filesystem::temp_directory_path() / "sage_multisrc_test";
         std::filesystem::remove_all(temp_dir);
+        std::filesystem::create_directories(temp_dir / "target/etc/sage");
+        std::ofstream(temp_dir / "target/etc/sage/system.toml") << "schema_version = 1\n";
 
         // Model level: the first [[source]] fills the primary slot, the rest
         // become extras, and trailing keys still land in host_deps/provides --

@@ -138,23 +138,41 @@ export int cmd_build(const CliOptions& opts) {
     }
     auto r = std::move(*recipe_res);
 
-    // A published identity is immutable. Recipedia keeps built archives next
-    // to their recipe, so a rebuild of the same upstream version advances to
-    // one beyond the highest numeric release already present instead of
-    // overwriting an earlier publication.
+    // Load configuration before choosing the identity: configured channel
+    // indexes are Recipedia's published state and therefore the authority for
+    // releases. Local build artifacts are deliberately irrelevant -- a clean
+    // builder and a dirty builder must choose the same release.
+    auto cfg_res = sage::config::SystemConfig::load_from_root(opts.target_root);
+    if (!cfg_res) {
+        sage::util::log_error("Failed to load configuration: {}", cfg_res.error());
+        return 1;
+    }
+    const auto& cfg = *cfg_res;
     std::uint64_t highest_published_release = 0;
     bool has_published_release = false;
-    for (const auto& entry : std::filesystem::directory_iterator(recipe_dir)) {
-        if (!entry.is_regular_file() || !entry.path().filename().string().ends_with(".pkg.tar.zst")) continue;
-        auto published = sage::archive::inspect_package(entry.path());
-        if (!published || published->manifest.name != r.name
-            || published->manifest.version.ver != r.version.ver) continue;
-        std::uint64_t release = 0;
-        auto text = std::string_view(published->manifest.version.rel);
-        auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), release);
-        if (error != std::errc{} || end != text.data() + text.size()) continue;
-        highest_published_release = std::max(highest_published_release, release);
-        has_published_release = true;
+    for (const auto& configured : cfg.channels) {
+        if (!configured.enabled || configured.url.empty()) continue;
+        sage::channel::Channel channel;
+        channel.name = configured.name;
+        channel.url = configured.url;
+        channel.scope = sage::channel::parse_scope(configured.scope);
+        channel.priority = configured.priority;
+        channel.enabled = true;
+        auto published = sage::channel::ProfileManager::sync_channel(channel, cfg.cache_dir);
+        if (!published) {
+            sage::util::log_error("Cannot determine published releases from Recipedia channel '{}': {}",
+                                  configured.name, published.error());
+            return 1;
+        }
+        for (const auto& package : published->available_packages) {
+            if (package.name != r.name || package.version.ver != r.version.ver) continue;
+            std::uint64_t release = 0;
+            auto text = std::string_view(package.version.rel);
+            auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), release);
+            if (error != std::errc{} || end != text.data() + text.size()) continue;
+            highest_published_release = std::max(highest_published_release, release);
+            has_published_release = true;
+        }
     }
     if (has_published_release) {
         r.version.rel = std::format("{}", highest_published_release + 1);
@@ -163,12 +181,7 @@ export int cmd_build(const CliOptions& opts) {
 
     // Load the build configuration up front: the phases need the compiler
     // and flags, and the DT_NEEDED check below reuses the same handle.
-    auto cfg_res = sage::config::SystemConfig::load_from_root(opts.target_root);
-    if (!cfg_res) {
-        sage::util::log_error("Failed to load configuration: {}", cfg_res.error());
-        return 1;
-    }
-    const sage::config::BuildConfig& bcfg = cfg_res->build;
+    const sage::config::BuildConfig& bcfg = cfg.build;
 
     // Per-recipe [build] overrides replace the global baseline; cxxflags
     // mirror cflags at whichever level does not spell them out.
